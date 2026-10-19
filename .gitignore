@@ -1,0 +1,90 @@
+# Python environments, bytecode, and build outputs
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.pem
+
+# Local databases and SQLite journals
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+
+# Candidate records, job results, and application history
+candidate_profile.json
+user_preferences.json
+discovered_jobs.json
+matched_jobs.json
+matching_results.json
+application_answers.json
+application_history.json
+candidate_profile*.json
+user_preferences*.json
+discovered_jobs*.json
+matched_jobs*.json
+matching_results*.json
+application_*.json
+profile*.json
+resume*.json
+private_resumes/
+private_application_artifacts/
+application_artifacts/
+uploads/
+
+# Generated verification and expansion reports/checkpoints
+employer-verification-*.json
+employer-expansion-*.json
+employer-discovery-checkpoint*.json
+*.checkpoint.json
+
+# Browser state and authentication material
+playwright/.auth/
+browser-profile/
+browser_profiles/
+storageState.json
+storage-state.json
+cookies.json
+auth.json
+
+# Private screenshots and generated image files
+screenshots/
+private_screenshots/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.pdf
+*.doc
+*.docx
+
+# Logs, temporary files, OS/editor state, and dependency caches
+*.log
+*.tmp
+*.temp
+*.bak
+.DS_Store
+.vscode/
+.cache/
+node_modules/
