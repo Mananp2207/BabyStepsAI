@@ -91,11 +91,30 @@ class CandidateImportTests(unittest.TestCase):
 
     def test_wikidata_importer_rejects_private_url_and_bad_limit(self):
         with self.assertRaises(ValueError): candidate_importers.import_wikidata_candidates(0)
+        with self.assertRaises(ValueError): candidate_importers.import_wikidata_candidates(501)
         class Response:
             status_code=200; headers={}; content=b'{}'
             def raise_for_status(self): pass
             def json(self): return {"results":{"bindings":[{"company":{"value":"https://www.wikidata.org/entity/Q1"},"companyLabel":{"value":"Bad"},"website":{"value":"https://127.0.0.1/"}}]}}
-        with self.assertRaises(ValueError): candidate_importers.import_wikidata_candidates(1,getter=lambda *_a,**_kw:Response())
+        diagnostics={}
+        # The request is mocked and the unsafe record must be rejected as data,
+        # without making the entire directory import fail.
+        original_validate=job_connectors.validate_public_https_url
+        with patch.object(candidate_importers.job_connectors,"validate_public_https_url",
+                          side_effect=lambda value,**kw:original_validate(value,resolve=False)):
+            rows,_=candidate_importers.fetch_wikidata_candidate_batch(
+                1,getter=lambda *_a,**_kw:Response(),diagnostics=diagnostics)
+        self.assertEqual(rows,[])
+        self.assertEqual(diagnostics["records_rejected"],1)
+        self.assertEqual(diagnostics["rejection_reasons"],{"malformed_or_unsafe_record":1})
+
+    def test_wikidata_candidate_import_rejects_private_ranges_and_localhost(self):
+        original_validate=job_connectors.validate_public_https_url
+        for website in ("https://127.0.0.1/", "https://10.2.3.4/", "https://192.168.1.10/",
+                        "https://[::1]/", "https://localhost/", "https://service.localhost/"):
+            with self.subTest(website=website):
+                with self.assertRaises(ValueError):
+                    original_validate(website,resolve=False)
 
     def test_wikidata_rate_limit_stops_and_never_treats_records_as_verified(self):
         class Response:

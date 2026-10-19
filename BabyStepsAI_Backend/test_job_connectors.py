@@ -229,10 +229,13 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(getter.call_count, 2)
 
     def test_redirect_destination_is_revalidated(self):
-        redirect = Mock(status_code=302, headers={"Location": "http://127.0.0.1/private"})
-        with patch.object(connectors, "validate_public_https_url", side_effect=lambda url, **kwargs: url if "127.0.0.1" not in url else (_ for _ in ()).throw(ValueError("private"))):
-            with self.assertRaises(ValueError):
-                connectors._safe_get("https://public.example.test/start", getter=Mock(return_value=redirect), trusted_initial=True)
+        redirect = Mock(status_code=302, headers={"Location": "https://10.0.0.7/private"})
+        getter = Mock(return_value=redirect)
+        with self.assertRaises(ValueError):
+            connectors._safe_get("https://public.example.test/start", getter=getter, trusted_initial=True)
+        # Only the public initial URL was requested; the private redirect target
+        # is rejected before any request is sent to it.
+        getter.assert_called_once()
 
     def test_rss_atom_parsing_normalizes_public_job_entries(self):
         source = connectors.EmployerSource("Example", "rss", "feed", "https://jobs.example.org/feed.xml")
@@ -418,7 +421,9 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(count, 2)
 
     def test_ssrf_destinations_rejected(self):
-        for url in ("http://example.org", "https://127.0.0.1/private", "https://metadata.google.internal/latest"):
+        for url in ("http://example.org", "https://127.0.0.1/private", "https://10.0.0.2/",
+                    "https://192.168.1.2/", "https://[::1]/", "https://localhost/",
+                    "https://metadata.google.internal/latest"):
             with self.assertRaises(ValueError):
                 connectors.validate_public_https_url(url, resolve=False)
 

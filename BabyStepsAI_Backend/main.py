@@ -14,7 +14,7 @@ from threading import Lock
 import json
 import sqlite3
 import urllib.request
-import pymupdf
+from io import BytesIO
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import HTMLResponse
 
@@ -55,6 +55,18 @@ PROFILE_FIELDS = [
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def extract_pdf_text(data):
+    """Extract selectable text from an in-memory PDF using pypdf."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(data), strict=False)
+    if reader.is_encrypted:
+        raise ValueError("Password-protected PDF.")
+    if len(reader.pages) > 30:
+        raise OverflowError("Maximum 30 pages.")
+    return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -284,27 +296,13 @@ async def upload_resume(file: UploadFile = File(...)):
         )
 
     try:
-        with pymupdf.open(
-            stream=data, filetype="pdf"
-        ) as pdf:
-
-            if pdf.needs_pass:
-                raise HTTPException(
-                    400, "Password-protected PDF."
-                )
-
-            if len(pdf) > 30:
-                raise HTTPException(
-                    400, "Maximum 30 pages."
-                )
-
-            text = "\n".join(
-                page.get_text() for page in pdf
-            ).strip()
-
-    except HTTPException:
-        raise
-
+        text = extract_pdf_text(data)
+    except ValueError as error:
+        if str(error) == "Password-protected PDF.":
+            raise HTTPException(400, str(error))
+        raise HTTPException(400, "Could not read PDF.")
+    except OverflowError as error:
+        raise HTTPException(400, str(error))
     except Exception:
         raise HTTPException(
             400, "Could not read PDF."

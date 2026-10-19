@@ -17,7 +17,7 @@ BabyStepsAI is a local-first job discovery and application preparation prototype
 
 ## Technology
 
-Python 3.11 or newer, FastAPI, SQLite, Playwright, PyMuPDF, Requests, and Ollama (`qwen2.5:3b` by default). The frontend is served by the FastAPI application.
+Python 3.11 or newer, FastAPI, SQLite, Playwright, pypdf, Requests, and Ollama (`qwen2.5:3b` by default). The frontend is served by the FastAPI application.
 
 ## Architecture
 

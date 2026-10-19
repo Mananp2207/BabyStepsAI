@@ -145,7 +145,6 @@ class CandidateVerificationTests(unittest.TestCase):
 
     def test_resume_replacement_keeps_previous_file_and_profile_record(self):
         import main
-        import pymupdf
         from fastapi import UploadFile
         old_main_db,old_storage=main.DB,main.STORAGE
         old_enqueue=main.enqueue
@@ -158,11 +157,10 @@ class CandidateVerificationTests(unittest.TestCase):
             db.execute("CREATE TABLE resume_profiles(resume_id TEXT PRIMARY KEY,status TEXT,profile_json TEXT,error TEXT,updated_at TEXT)")
             db.execute("INSERT INTO resumes VALUES('old',?,'old.pdf','old-version.pdf','2026-01-01',1,'old text')",(USER,))
             db.execute("INSERT INTO resume_profiles VALUES('old','user_reviewed','{}',NULL,'2026-01-01')")
-        pdf=pymupdf.open(); page=pdf.new_page(); page.insert_text((72,72),"A test resume with selectable content")
-        data=pdf.tobytes(); pdf.close()
         main.enqueue=lambda _resume_id:{"status":"queued"}
         try:
-            result=asyncio.run(main.upload_resume(UploadFile(filename="replacement.pdf",file=BytesIO(data))))
+            with patch.object(main,"extract_pdf_text",return_value="A test resume with selectable content"):
+                result=asyncio.run(main.upload_resume(UploadFile(filename="replacement.pdf",file=BytesIO(b"%PDF test fixture"))))
             self.assertTrue(old_file.exists())
             with main.connect() as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM resumes").fetchone()[0],2)

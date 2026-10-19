@@ -1,7 +1,6 @@
 
 import json
 import re
-import pymupdf
 
 RESUME = "resume.pdf"
 PROFILE = "candidate_profile.json"
@@ -39,10 +38,13 @@ def extract_education(text):
 
 
 def main():
-    with pymupdf.open(RESUME) as doc:
-        text = "\n".join(
-            page.get_text() for page in doc
-        )
+    from pypdf import PdfReader
+
+    with open(RESUME, "rb") as source:
+        reader = PdfReader(source, strict=False)
+        if reader.is_encrypted:
+            raise ValueError("Password-protected PDF.")
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
 
     with open(PROFILE) as file:
         profile = json.load(file)
