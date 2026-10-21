@@ -9,6 +9,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from typing import Literal
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -19,6 +20,7 @@ from candidate_verification import verified_profile_facts
 from job_search_agent import DB, USER, fetch_board
 from ollama_runtime import OLLAMA_LOCK
 from ui_theme import apply_ui_theme
+from candidate_verification import verified_values_from_json
 
 router = APIRouter()
 MODEL = "qwen2.5:3b"
@@ -33,8 +35,10 @@ except ValueError: MAX_ANSWER_CHARS = 700
 DEFAULT_SETTINGS = {
     "allow_automatic_discovery": False,
     "allow_ai_matching": False,
+    "matching_provider": "ollama",
     "allow_automated_form_preparation": False,
     "allow_auto_use_confirmed_answers": False,
+    "allow_demographic_reuse": False,
     "allow_ai_drafting": False,
     "require_review_uncertain_answers": True,
     "max_applications_per_24_hours": 20,
@@ -88,14 +92,19 @@ def get_authorization():
     except (TypeError, json.JSONDecodeError):
         settings = dict(DEFAULT_SETTINGS)
     settings["live_submission_enabled"] = False
+    settings["gemini_configured"] = bool(os.getenv("GEMINI_API_KEY", "").strip())
+    if settings.get("matching_provider") not in {"ollama", "gemini"}:
+        settings["matching_provider"] = "ollama"
     return {"version": row["version"], "settings": settings, "updated_at": row["updated_at"]}
 
 
 class AuthorizationUpdate(BaseModel):
     allow_automatic_discovery: bool = False
     allow_ai_matching: bool = False
+    matching_provider: Literal["ollama", "gemini"] = "ollama"
     allow_automated_form_preparation: bool = False
     allow_auto_use_confirmed_answers: bool = False
+    allow_demographic_reuse: bool = False
     allow_ai_drafting: bool = False
     require_review_uncertain_answers: bool = True
     max_applications_per_24_hours: int = Field(default=20, ge=1, le=200)
@@ -125,7 +134,9 @@ def update_authorization(payload: AuthorizationUpdate):
                        (settings["max_applications_per_24_hours"], stamp, USER))
         except sqlite3.OperationalError:
             pass
-    return {"version": version, "settings": settings, "updated_at": stamp, "saved": True}
+    public_settings=dict(settings)
+    public_settings["gemini_configured"]=bool(os.getenv("GEMINI_API_KEY","").strip())
+    return {"version": version, "settings": public_settings, "updated_at": stamp, "saved": True}
 
 
 @router.get("/api/application-answer-jobs")
@@ -165,7 +176,7 @@ def _verified_context():
     if not row:
         raise HTTPException(409, "Confirm candidate profile facts before drafting answers.")
     try:
-        facts = verified_profile_facts(json.loads(row["values_json"] or "{}"), json.loads(row["confirmed_json"] or "{}"))
+        facts = verified_profile_facts(verified_values_from_json(row["values_json"]), json.loads(row["confirmed_json"] or "{}"))
     except (TypeError, json.JSONDecodeError):
         raise HTTPException(409, "Candidate verification data is invalid.")
     preferences = {}
@@ -371,7 +382,8 @@ def draft_application_answer(payload: DraftRequest):
 
 @router.get("/onboarding", response_class=HTMLResponse)
 def onboarding_page():
-    return HTMLResponse(apply_ui_theme(ONBOARDING_PAGE))
+    from onboarding import ONBOARDING_PAGE as WIZARD_PAGE
+    return HTMLResponse(apply_ui_theme(WIZARD_PAGE))
 
 
 @router.get("/application-settings", response_class=HTMLResponse)
@@ -392,4 +404,4 @@ ONBOARDING_PAGE = ONBOARDING_PAGE.replace(
 
 
 SETTINGS_PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Application settings — BabyStepsAI</title>
-<style>body{margin:0;background:#f4f7fb;color:#17263b;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:36px auto;padding:0 18px}.panel{background:white;border:1px solid #dfe7f1;border-radius:15px;padding:22px;margin:16px 0}label{display:block;padding:9px 0}input[type=checkbox]{margin-right:9px}input[type=number]{font:inherit;padding:8px;border:1px solid #cbd6e4;border-radius:7px}button{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #cbd6e4;background:#2563eb;color:white;cursor:pointer}a{color:#2455a5}#status{min-height:25px}.warning{background:#fff7e7;padding:12px;border-radius:8px}</style><main class="wrap"><nav><a href="/onboarding">Onboarding</a> · <a href="/candidate-profile">Candidate profile</a> · <a href="/applications">Applications</a></nav><h1>Application authorization</h1><p>Permissions are versioned and can be changed or revoked at any time. Employer requirements still apply.</p><section class="panel"><form id="settings"><label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label><label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label><label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label><label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label><label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label><label><input type="checkbox" name="require_review_uncertain_answers">Require review for uncertain answers</label><label>Maximum applications per rolling 24 hours <input name="max_applications_per_24_hours" type="number" min="1" max="200"></label><p class="warning"><strong>Live submission is disabled.</strong> These permissions do not override legal declarations, employer restrictions, CAPTCHA, login challenges, or human verification.</p><button>Save permissions</button></form><p id="status" role="status" aria-live="polite"></p></section></main><script>async function req(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}const form=document.querySelector('#settings'),status=document.querySelector('#status');async function load(){const d=await req('/api/application-authorization');for(const [k,v] of Object.entries(d.settings)){const el=form.elements[k];if(el)el.type==='checkbox'?el.checked=!!v:el.value=v}status.textContent='Authorization version '+d.version+' · updated '+(d.updated_at||'not yet')};form.onsubmit=async e=>{e.preventDefault();try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:Number(el.value);const d=await req('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});status.textContent='Saved. Authorization version '+d.version+'. Live submission remains disabled.'}catch(e){status.textContent=e.message}};load().catch(e=>status.textContent=e.message)</script></html>'''
+<style>body{margin:0;background:#f4f7fb;color:#17263b;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:36px auto;padding:0 18px}.panel{background:white;border:1px solid #dfe7f1;border-radius:15px;padding:22px;margin:16px 0}label{display:block;padding:9px 0}input[type=checkbox]{margin-right:9px}input[type=number]{font:inherit;padding:8px;border:1px solid #cbd6e4;border-radius:7px}button{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #cbd6e4;background:#2563eb;color:white;cursor:pointer}a{color:#2455a5}#status{min-height:25px}.warning{background:#fff7e7;padding:12px;border-radius:8px}</style><main class="wrap"><nav><a href="/onboarding">Onboarding</a> · <a href="/candidate-profile">Candidate profile</a> · <a href="/applications">Applications</a></nav><h1>Application authorization</h1><p>Permissions are versioned and can be changed or revoked at any time. Employer requirements still apply.</p><section class="panel"><form id="settings"><label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label><label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label><label for="matching-provider">Matching provider<select id="matching-provider" name="matching_provider"><option value="ollama">Ollama (local)</option><option value="gemini">Google Gemini (API key required)</option></select></label><p id="provider-status" class="muted">Ollama runs locally.</p><label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label><label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label><label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label><label><input type="checkbox" name="require_review_uncertain_answers">Require review for uncertain answers</label><label>Maximum applications per rolling 24 hours <input name="max_applications_per_24_hours" type="number" min="1" max="200"></label><p class="warning"><strong>Live submission is disabled.</strong> These permissions do not override legal declarations, employer restrictions, CAPTCHA, login challenges, or human verification.</p><button>Save permissions</button></form><p id="status" role="status" aria-live="polite"></p></section></main><script>async function req(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}const form=document.querySelector('#settings'),status=document.querySelector('#status'),providerStatus=document.querySelector('#provider-status'),provider=form.elements.matching_provider;function updateProviderStatus(configured){providerStatus.textContent=provider.value==='gemini'?(configured?'Google Gemini selected: confirmed profile and job text are sent to Google. GEMINI_API_KEY remains on this server.':'Google Gemini sends confirmed profile and job text to Google and requires GEMINI_API_KEY on this server; the key is never stored in settings.'):'Matching requests will use the local Ollama service.'}provider.onchange=()=>updateProviderStatus(window.geminiConfigured);async function load(){const d=await req('/api/application-authorization');window.geminiConfigured=!!d.settings.gemini_configured;for(const [k,v] of Object.entries(d.settings)){const el=form.elements[k];if(el)el.type==='checkbox'?el.checked=!!v:el.value=v}updateProviderStatus(window.geminiConfigured);status.textContent='Authorization version '+d.version+' · updated '+(d.updated_at||'not yet')};form.onsubmit=async e=>{e.preventDefault();try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value);const d=await req('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});window.geminiConfigured=!!d.settings.gemini_configured;updateProviderStatus(window.geminiConfigured);status.textContent='Saved. Authorization version '+d.version+'. Live submission remains disabled.'}catch(e){status.textContent=e.message}};load().catch(e=>status.textContent=e.message)</script></html>'''

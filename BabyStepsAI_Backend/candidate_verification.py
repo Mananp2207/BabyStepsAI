@@ -2,6 +2,8 @@
 import json
 import re
 import sqlite3
+import ipaddress
+from urllib.parse import urlparse
 from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from job_search_agent import USER
 from ui_theme import apply_ui_theme
+from secure_data import EncryptionUnavailable, decrypt_text, encrypt_text
 
 DB = Path(__file__).resolve().parent / "babysteps.db"
 router = APIRouter()
@@ -35,8 +38,13 @@ FIELDS = {
     "country_work_authorizations": ("Sensitive application answers", "Work authorization by country", "objects", True),
     "sponsorship_by_country": ("Sensitive application answers", "Sponsorship needs by country", "objects", True),
     "work_arrangement_preferences": ("Preferences", "Remote / hybrid / on-site preferences (one per line)", "list", False),
+    "preferred_countries": ("Preferences", "Preferred countries (one per line)", "list", False),
+    "other_professional_links": ("Links", "Other professional profile URLs (one per line)", "list", False),
     "salary_currency": ("Application answers", "Salary currency", "text", False),
     "earliest_available_date": ("Application answers", "Earliest available start date", "date", False),
+    "notice_period": ("Availability", "Notice period", "text", False),
+    "full_time_availability": ("Availability", "Full-time availability", "text", False),
+    "internship_availability": ("Availability", "Internship availability", "text", False),
     "willingness_to_travel": ("Application answers", "Willingness to travel", "text", False),
     "education_entries": ("Education", "Education history", "objects", False),
     "experience_entries": ("Professional experience", "Employment history", "objects", False),
@@ -105,11 +113,71 @@ def initialize():
         existing = {row[1] for row in db.execute("PRAGMA table_info(application_answers)")}
         for name,declaration in (("question_text","TEXT NOT NULL DEFAULT ''"),("answer_type","TEXT NOT NULL DEFAULT 'factual'"),
                                  ("jurisdiction","TEXT NOT NULL DEFAULT ''"),("auto_reuse","INTEGER NOT NULL DEFAULT 0"),
-                                 ("source","TEXT NOT NULL DEFAULT 'user_confirmed'")):
+                                 ("source","TEXT NOT NULL DEFAULT 'user_confirmed'"),
+                                 ("answer_encrypted","TEXT NOT NULL DEFAULT ''"),
+                                 ("question_category","TEXT NOT NULL DEFAULT 'other'"),
+                                 ("sensitivity_classification","TEXT NOT NULL DEFAULT 'ordinary'"),
+                                 ("confirmation_at","TEXT")):
             if name not in existing: db.execute(f"ALTER TABLE application_answers ADD COLUMN {name} {declaration}")
 
 
 initialize()
+
+
+SENSITIVE_PROFILE_FIELDS = {key for key, (_, _, _, sensitive) in FIELDS.items() if sensitive}
+ENCRYPTED_MARKER = "__babysteps_fernet_v1__"
+
+
+def _encode_profile_values(values):
+    saved=dict(values)
+    for key in SENSITIVE_PROFILE_FIELDS:
+        value=saved.get(key)
+        if value in (None,"",[],{}):
+            continue
+        if isinstance(value,dict) and set(value)=={ENCRYPTED_MARKER}:
+            continue
+        saved[key]={ENCRYPTED_MARKER:encrypt_text(json.dumps(value,ensure_ascii=False,separators=(",",":")))}
+    return saved
+
+
+def _decode_profile_values(values):
+    decoded=dict(values); encrypted=dict(values); migrated=False
+    for key in SENSITIVE_PROFILE_FIELDS:
+        value=decoded.get(key)
+        if isinstance(value,dict) and set(value)=={ENCRYPTED_MARKER}:
+            decoded[key]=json.loads(decrypt_text(value[ENCRYPTED_MARKER]))
+        elif value not in (None,"",[],{}):
+            # Additive lazy migration keeps the original confirmed fact while
+            # replacing its plaintext representation with authenticated ciphertext.
+            encrypted[key]={ENCRYPTED_MARKER:encrypt_text(json.dumps(value,ensure_ascii=False,separators=(",",":")))}
+            migrated=True
+    return decoded,encrypted,migrated
+
+
+def verified_values_from_json(values_json):
+    """Decode profile JSON at the controlled application boundary."""
+    values=json.loads(values_json or "{}")
+    if not isinstance(values,dict): raise ValueError("Profile values must be a JSON object.")
+    return _decode_profile_values(values)[0]
+
+
+def encode_answer_for_storage(answer, sensitive):
+    """Return plaintext/ciphertext columns for the information bank."""
+    text=str(answer or "")
+    return ("" if sensitive else text, encrypt_text(text) if sensitive and text else "")
+
+
+def _answer_plaintext(row,db=None):
+    if not row["sensitive"]:
+        return row["answer"]
+    encrypted=row["answer_encrypted"] if "answer_encrypted" in row.keys() else ""
+    if encrypted:
+        return decrypt_text(encrypted)
+    legacy=row["answer"] or ""
+    if legacy and db is not None:
+        db.execute("UPDATE application_answers SET answer='',answer_encrypted=? WHERE id=?",
+                   (encrypt_text(legacy),row["id"]))
+    return legacy
 
 
 def _active(db):
@@ -315,10 +383,16 @@ def get_verification():
         if row:
             try:
                 saved_values=json.loads(row["values_json"]); saved_flags=json.loads(row["confirmed_json"])
-                saved_keys=set(saved_values); values.update(saved_values)
+                plain_values,encoded_values,migrated=_decode_profile_values(saved_values)
+                if migrated:
+                    db.execute("UPDATE candidate_verifications SET values_json=? WHERE resume_id=? AND user_id=?",
+                               (json.dumps(encoded_values,ensure_ascii=False),resume["id"],USER))
+                saved_keys=set(saved_values); values.update(plain_values)
                 confirmed.update(saved_flags)
             except (TypeError, json.JSONDecodeError):
                 raise HTTPException(500, "Saved verification data is invalid.")
+            except EncryptionUnavailable as error:
+                raise HTTPException(503,str(error)) from error
         # Migrate old separately-confirmed month/year values for display while
         # preserving their original rows and verification flags.
         if not values.get("graduation_date"):
@@ -364,6 +438,19 @@ class AnswerUpdate(BaseModel):
     auto_reuse: bool = False
 
 
+def _validate_profile_url(value,label):
+    parsed=urlparse(value)
+    if parsed.scheme!="https" or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(400,f"{label} must be a public HTTPS URL.")
+    host=parsed.hostname.casefold().rstrip(".")
+    if host in {"localhost","metadata.google.internal"} or host.endswith((".local",".localhost",".internal")):
+        raise HTTPException(400,f"{label} cannot point to a local or private destination.")
+    try:
+        if not ipaddress.ip_address(host).is_global:
+            raise HTTPException(400,f"{label} cannot point to a local or private destination.")
+    except ValueError:pass
+
+
 @router.put("/api/application-answers/{question_key}")
 def save_application_answer(question_key: str, payload: AnswerUpdate):
     import re
@@ -376,16 +463,25 @@ def save_application_answer(question_key: str, payload: AnswerUpdate):
     stamp = now()
     with connect() as db:
         resume = _active(db)
+        is_sensitive=bool(payload.sensitive)
+        answer=payload.answer.strip()
+        try:cipher=encrypt_text(answer) if is_sensitive and answer else ""
+        except EncryptionUnavailable as error:raise HTTPException(503,str(error)) from error
         db.execute("""INSERT INTO application_answers
-            (user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at,revoked_at,answer_type,jurisdiction,auto_reuse,source)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,resume_id,question_key) DO UPDATE SET
+            (user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at,revoked_at,answer_type,jurisdiction,auto_reuse,source,answer_encrypted,confirmation_at,sensitivity_classification)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,resume_id,question_key) DO UPDATE SET
             question_text=excluded.question_text,answer=excluded.answer,sensitive=excluded.sensitive,
             confirmed=excluded.confirmed,updated_at=excluded.updated_at,revoked_at=excluded.revoked_at,
-            answer_type=excluded.answer_type,jurisdiction=excluded.jurisdiction,auto_reuse=excluded.auto_reuse,source=excluded.source""",
-                   (USER, resume["id"], "custom:" + question_key, payload.question.strip(), payload.answer.strip(),
-                    int(payload.sensitive), int(payload.confirmed and bool(payload.answer.strip())), stamp, stamp,
-                    None if payload.confirmed and payload.answer.strip() else stamp,payload.answer_type,payload.jurisdiction.strip(),
-                    int(payload.auto_reuse and payload.confirmed and bool(payload.answer.strip()) and not payload.sensitive),"user_confirmed"))
+            answer_type=excluded.answer_type,jurisdiction=excluded.jurisdiction,auto_reuse=excluded.auto_reuse,source=excluded.source,
+            answer_encrypted=excluded.answer_encrypted,confirmation_at=excluded.confirmation_at,
+            sensitivity_classification=excluded.sensitivity_classification""",
+                   (USER, resume["id"], "custom:" + question_key, payload.question.strip(), "" if is_sensitive else answer,
+                    int(is_sensitive), int(payload.confirmed and bool(answer)), stamp, stamp,
+                    None if payload.confirmed and answer else stamp,payload.answer_type,payload.jurisdiction.strip(),
+                    int(payload.auto_reuse and payload.confirmed and bool(answer) and not is_sensitive),"user_confirmed",
+                    cipher,stamp if payload.confirmed and answer else None,"sensitive" if is_sensitive else "ordinary"))
+        if question_key in {"graduation_date","technical_skills","professional_experience","location","availability","employment_type"}:
+            db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND status='completed'",(USER,resume["id"]))
     return {"saved": True, "confirmed": bool(payload.confirmed and payload.answer.strip()),
             "auto_reuse":bool(payload.auto_reuse and payload.confirmed and payload.answer.strip() and not payload.sensitive)}
 
@@ -453,6 +549,10 @@ def update_verification(payload: VerificationUpdate):
             if not isinstance(value, str) or len(value) > 4000:
                 raise HTTPException(400, f"{key} must be text up to 4000 characters.")
             values[key] = value.strip()
+        if key in {"linkedin","github","portfolio","website"} and values.get(key):
+            _validate_profile_url(values[key],FIELDS[key][1])
+        if key in {"other_professional_links"}:
+            for link in values.get(key,[]):_validate_profile_url(link,FIELDS[key][1])
     for token in entry_tokens:
         key,index=token.rsplit(":",1)
         if key not in values or FIELDS[key][2]!="objects" or int(index)>=len(values[key]):
@@ -480,12 +580,14 @@ def update_verification(payload: VerificationUpdate):
         if key in FIELDS and not values.get(key):
             confirmed[key] = False
     stamp = now()
+    try:encoded_profile=json.dumps(_encode_profile_values(values),ensure_ascii=False)
+    except EncryptionUnavailable as error:raise HTTPException(503,str(error)) from error
     with connect() as db:
         resume = _active(db)
         db.execute("""INSERT INTO candidate_verifications(resume_id,user_id,values_json,confirmed_json,updated_at)
             VALUES(?,?,?,?,?) ON CONFLICT(resume_id) DO UPDATE SET
             values_json=excluded.values_json,confirmed_json=excluded.confirmed_json,updated_at=excluded.updated_at""",
-                   (resume["id"], USER, json.dumps(values), json.dumps(confirmed), stamp))
+                   (resume["id"], USER, encoded_profile, json.dumps(confirmed), stamp))
         match_table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
         if match_table:
             match_columns={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")}
@@ -498,14 +600,20 @@ def update_verification(payload: VerificationUpdate):
             value = values.get(key)
             answer = "\n".join(value) if isinstance(value, list) else str(value or "")
             if confirmed[key] and answer:
-                db.execute("""INSERT INTO application_answers(user_id,resume_id,question_key,answer,sensitive,confirmed,created_at,updated_at,revoked_at,answer_type,auto_reuse,source)
-                    VALUES(?,?,?,?,?,1,?,?,NULL,?,?,?) ON CONFLICT(user_id,resume_id,question_key) DO UPDATE SET
+                try:cipher=encrypt_text(answer) if sensitive else ""
+                except EncryptionUnavailable as error:raise HTTPException(503,str(error)) from error
+                category="work_authorization" if key in {"country_work_authorizations","work_authorization"} else "sponsorship" if key in {"sponsorship_by_country","requires_sponsorship"} else "profile_fact"
+                db.execute("""INSERT INTO application_answers(user_id,resume_id,question_key,answer,sensitive,confirmed,created_at,updated_at,revoked_at,answer_type,auto_reuse,source,answer_encrypted,confirmation_at,question_category,sensitivity_classification)
+                    VALUES(?,?,?,?,?,1,?,?,NULL,?,?,?,?,?,?,?) ON CONFLICT(user_id,resume_id,question_key) DO UPDATE SET
                     answer=excluded.answer,sensitive=excluded.sensitive,confirmed=1,updated_at=excluded.updated_at,revoked_at=NULL,
-                    answer_type=excluded.answer_type,auto_reuse=excluded.auto_reuse,source=excluded.source""",
-                           (USER, resume["id"], key, answer, int(sensitive), stamp, stamp,
-                            "sensitive" if sensitive else "factual",int(not sensitive),"user_confirmed_profile"))
+                    answer_type=excluded.answer_type,auto_reuse=excluded.auto_reuse,source=excluded.source,
+                    answer_encrypted=excluded.answer_encrypted,confirmation_at=excluded.confirmation_at,
+                    question_category=excluded.question_category,sensitivity_classification=excluded.sensitivity_classification""",
+                           (USER, resume["id"], key, "" if sensitive else answer, int(sensitive), stamp, stamp,
+                            "sensitive" if sensitive else "factual",int(not sensitive),"user_confirmed_profile",cipher,stamp,
+                            category,"sensitive" if sensitive else "ordinary"))
             else:
-                db.execute("UPDATE application_answers SET confirmed=0,revoked_at=?,updated_at=? WHERE user_id=? AND resume_id=? AND question_key=?",
+                db.execute("UPDATE application_answers SET confirmed=0,revoked_at=?,updated_at=?,answer=CASE WHEN sensitive=1 THEN '' ELSE answer END,answer_encrypted=CASE WHEN sensitive=1 THEN '' ELSE answer_encrypted END,auto_reuse=0 WHERE user_id=? AND resume_id=? AND question_key=?",
                            (stamp, stamp, USER, resume["id"], key))
     return {"saved": True, "confirmed_fields": sum(confirmed.values()), "resume_name": resume["original_name"]}
 
@@ -536,12 +644,19 @@ def profile_completeness():
 def list_answers():
     with connect() as db:
         resume = _active(db)
-        rows = db.execute("SELECT question_key,question_text,answer,sensitive,confirmed,updated_at,answer_type,jurisdiction,auto_reuse,source FROM application_answers WHERE user_id=? AND resume_id=? AND revoked_at IS NULL ORDER BY question_key", (USER, resume["id"])).fetchall()
-    # Never echo potentially sensitive answers unless explicitly requested in the private editor.
-    return [{"key": row["question_key"], "question": row["question_text"],
-             "sensitive": bool(row["sensitive"]), "confirmed": bool(row["confirmed"]),
-             "answer": row["answer"] if row["confirmed"] else "", "updated_at": row["updated_at"],
-             "answer_type":row["answer_type"],"jurisdiction":row["jurisdiction"],"auto_reuse":bool(row["auto_reuse"]),"source":row["source"]} for row in rows]
+        rows = db.execute("SELECT id,question_key,question_text,answer,answer_encrypted,sensitive,confirmed,updated_at,answer_type,jurisdiction,auto_reuse,source,question_category,sensitivity_classification,confirmation_at FROM application_answers WHERE user_id=? AND resume_id=? AND revoked_at IS NULL ORDER BY question_key", (USER, resume["id"])).fetchall()
+        # Decrypt/lazily migrate while this connection is still open. Never
+        # echo sensitive content in the normal answer-bank list response.
+        output=[]
+        for row in rows:
+            answer=_answer_plaintext(row,db)
+            output.append({"key":row["question_key"],"question":row["question_text"],
+                "sensitive":bool(row["sensitive"]),"confirmed":bool(row["confirmed"]),
+                "answer":answer if row["confirmed"] and not row["sensitive"] else "","updated_at":row["updated_at"],
+                "answer_type":row["answer_type"],"jurisdiction":row["jurisdiction"],"auto_reuse":bool(row["auto_reuse"]),
+                "source":row["source"],"category":row["question_category"],
+                "sensitivity_classification":row["sensitivity_classification"],"confirmed_at":row["confirmation_at"]})
+    return output
 
 
 @router.get("/candidate-profile", response_class=HTMLResponse)

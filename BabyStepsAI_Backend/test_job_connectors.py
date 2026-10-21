@@ -23,6 +23,10 @@ class ConnectorTests(unittest.TestCase):
                 "roles": ["Software Engineer"], "categories": [], "levels": [], "employment_types": [],
                 "location": "United States", "work_arrangement": "Any", "instructions": ""})))
             db.execute("INSERT INTO application_authorizations VALUES(?,?)", (discovery.USER, json.dumps({"allow_automatic_discovery": True})))
+            stamp=discovery.datetime.now(discovery.timezone.utc).isoformat()
+            db.execute("UPDATE employers SET active=1,connector_status='healthy',discovery_status='verified',last_success_at=? WHERE source_type='greenhouse'",(stamp,))
+            for row in db.execute("SELECT * FROM employers WHERE source_type='greenhouse'").fetchall():
+                db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",(discovery._source_fingerprint(dict(row)),row["employer_id"]))
         connectors.clear_cache()
 
     @staticmethod
@@ -32,7 +36,10 @@ class ConnectorTests(unittest.TestCase):
     def register_and_activate(self, sources):
         discovery.import_employers(discovery.EmployerImportRequest(sources=sources), self.local_request())
         with discovery.database() as db:
-            db.execute("UPDATE employers SET active=1,connector_status='healthy' WHERE active=0 AND source_type!='workday'")
+            stamp=discovery.datetime.now(discovery.timezone.utc).isoformat()
+            db.execute("UPDATE employers SET active=1,connector_status='healthy',discovery_status='verified',last_success_at=? WHERE source_type!='workday'",(stamp,))
+            for row in db.execute("SELECT * FROM employers WHERE source_type!='workday'").fetchall():
+                db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",(discovery._source_fingerprint(dict(row)),row["employer_id"]))
 
     def tearDown(self):
         discovery.DB = self.old_db
@@ -211,7 +218,7 @@ class ConnectorTests(unittest.TestCase):
             status = db.execute("SELECT connector_status,last_success_at FROM employers WHERE source_token='cloudflare'").fetchone()
         self.assertEqual(active,1)
         self.assertEqual(status["connector_status"],"temporarily_unavailable")
-        self.assertIsNone(status["last_success_at"])
+        self.assertTrue(status["last_success_at"],"A transient failure must retain the prior successful verification timestamp.")
 
     def test_server_error_gets_bounded_retry_and_recovers(self):
         import requests

@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import sys
 import concurrent.futures
@@ -12,6 +13,7 @@ import main
 import application_agent as app_agent
 import candidate_verification as profile
 import application_answer_assistant as answer_assistant
+import resume_job_matcher as matcher
 from job_search_agent import USER
 
 
@@ -158,6 +160,7 @@ class FakePlaywrightContext:
 class ApplicationAgentTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); root=Path(self.temp.name)
+        self.old_key_path=os.environ.get("BABYSTEPSAI_KEY_PATH"); os.environ["BABYSTEPSAI_KEY_PATH"]=str(root/"encryption.key")
         self.db=root/"application.sqlite3"; self.storage=root/"resumes"; self.storage.mkdir()
         self.old_db,self.old_storage=app_agent.DB,app_agent.STORAGE
         self.old_profile_db=profile.DB
@@ -186,7 +189,7 @@ class ApplicationAgentTests(unittest.TestCase):
             "university":"Example University","degree":"B.S.","graduation_year":"2026",
             "work_experience":["Intern, Example Co."],"technical_skills":["Python"],"relocation_willingness":"Yes",
         },confirmed_fields=["full_name","email","phone","linkedin","github","university","degree","graduation_year","work_experience","technical_skills","relocation_willingness"]))
-        with app_agent.connect() as db: db.execute("UPDATE job_match_results SET updated_at=?,freshness_status='current' WHERE user_id=?",(app_agent.now(),USER))
+        with app_agent.connect() as db: db.execute("UPDATE job_match_results SET updated_at=?,freshness_status='current',matching_model_version=? WHERE user_id=?",(app_agent.now(),matcher.MATCHING_ENGINE_VERSION,USER))
         self.client=self
         self.launch_options=[]
         self.sync_api=types.ModuleType("playwright.sync_api")
@@ -199,6 +202,8 @@ class ApplicationAgentTests(unittest.TestCase):
     def tearDown(self):
         self.submit_patch.stop(); self.patch_playwright.stop()
         app_agent.DB=self.old_db; app_agent.STORAGE=self.old_storage; profile.DB=self.old_profile_db; answer_assistant.DB=self.old_assistant_db
+        if self.old_key_path is None: os.environ.pop("BABYSTEPSAI_KEY_PATH",None)
+        else: os.environ["BABYSTEPSAI_KEY_PATH"]=self.old_key_path
         self.temp.cleanup()
 
     def post(self, path, json=None):
@@ -220,11 +225,87 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(app["diagnostic"]["steps"],1)
         self.assertEqual(sum(x["result"]=="filled" for x in app["diagnostic"]["filled_fields"]),6)
 
+    def test_private_transcript_is_selected_only_for_matching_upload_question(self):
+        candidate={"__application_documents":[{"document_type":"transcript","path":"/private/transcript.pdf"}]}
+        self.assertEqual(app_agent._answer({"type":"file","label":"Upload your academic transcript"},candidate,{}),
+                         ("__DOCUMENT__:/private/transcript.pdf","document"))
+        ambiguous={"__application_documents":[*candidate["__application_documents"],
+            {"document_type":"transcript","path":"/private/transcript-2.pdf"}]}
+        self.assertEqual(app_agent._answer({"type":"file","label":"Upload your academic transcript"},ambiguous,{}),(None,None))
+
+    def test_workflow_discovery_matching_queue_and_mock_preparation_end_to_end(self):
+        import workflow_orchestrator as workflow
+        import job_search_agent as jobs
+        import resume_job_matcher as matcher
+        import career_preferences
+        old_workflow_db,old_jobs_db,old_preferences_db=workflow.DB,jobs.DB,career_preferences.DB
+        workflow.DB=jobs.DB=career_preferences.DB=app_agent.DB
+        try:
+            jobs.initialize();matcher.initialize();workflow.initialize()
+            prefs={"roles":["Software Engineer"],"categories":["Software Development"],
+                   "levels":["New Graduate","Entry Level"],"employment_types":["Full-time"],
+                   "location":"United States","work_arrangement":"Any","instructions":""}
+            with jobs.database() as db:
+                db.execute("CREATE TABLE IF NOT EXISTS career_preferences(user_id TEXT PRIMARY KEY,preferences_json TEXT NOT NULL,preference_version INTEGER NOT NULL DEFAULT 1,preferences_fingerprint TEXT NOT NULL DEFAULT '')")
+                db.execute("INSERT OR REPLACE INTO career_preferences(user_id,preferences_json,preference_version,preferences_fingerprint) VALUES(?,?,1,'test')",(USER,json.dumps(prefs)))
+                stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+                db.execute("INSERT OR IGNORE INTO employers(employer_id,name,careers_url,source_type,source_token,connector_status,active,created_at,updated_at,last_success_at,discovery_status) VALUES('greenhouse:workflow-mock','Workflow Mock','https://boards.greenhouse.io/workflow-mock','greenhouse','workflow-mock','healthy',1,?,?,?,'verified')",(stamp,stamp,stamp))
+                row=db.execute("SELECT * FROM employers WHERE employer_id='greenhouse:workflow-mock'").fetchone()
+                db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id='greenhouse:workflow-mock'",(jobs._source_fingerprint(dict(row)),))
+            with workflow.database() as db:
+                db.execute("INSERT OR REPLACE INTO user_workflows(workflow_id,user_id,prompt,status,current_stage,resume_id,resume_version,profile_version,preferences_version,created_at,updated_at) VALUES('wf-e2e',?,'software engineering new grad jobs','queued','queued','r1','rv1','pv1',1,?,?)",(USER,app_agent.now(),app_agent.now()))
+            posting={"id":9001,"title":"Software Engineer New Grad","absolute_url":"https://boards.greenhouse.io/workflow-mock/jobs/9001",
+                     "location":{"name":"United States"},"metadata":[{"name":"Employment Type","value":"Full-time"}],
+                     "content":"Build software with Python. New graduates are welcome."}
+            original_discover=jobs.discover
+            def discover_and_route_to_local_mock(prompt,saved_prefs,run_id=None,workflow_id=None):
+                result=original_discover(prompt,saved_prefs,run_id=run_id,workflow_id=workflow_id)
+                with jobs.database() as db:
+                    db.execute("UPDATE discovered_openings SET url='http://127.0.0.1:8000/mock-apps/simple' WHERE job_key='greenhouse:workflow-mock:9001'")
+                return result
+            def mocked_ollama_result(request):
+                for key in request.job_keys:
+                    with jobs.database() as db:
+                        opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+                    resume_id,_,candidate=matcher.active_candidate()
+                    stamp=matcher.now()
+                    result={"classification":"potential_match","missing_information":[],"required_skills":[],"required_experience":[],"education_requirements":[]}
+                    with jobs.database() as db:
+                        db.execute("""INSERT OR REPLACE INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                            VALUES(?,?,?,'completed','potential_match',90,?,?,?,?,?,?,?,'current')""",
+                            (USER,key,resume_id,json.dumps(result),stamp,stamp,matcher.profile_fingerprint(candidate,resume_id),
+                             matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
+                return {"status":"completed"}
+            queue_calls=[]
+            def queue_request(request):
+                result=app_agent.enqueue_saved_jobs(request)
+                queue_calls.append((request.job_keys,result))
+                return result
+            with patch.object(jobs,"_employer_sources",return_value=[jobs.EmployerSource("Workflow Mock","greenhouse","workflow-mock","https://boards.greenhouse.io/workflow-mock")]), \
+                 patch.object(jobs,"fetch_board",return_value=([posting],None)), \
+                 patch.object(workflow,"_authorization",return_value={"allow_automated_form_preparation":True}), \
+                 patch.object(workflow,"_versions",return_value=("r1","rv1","pv1",1,prefs)):
+                workflow.run_workflow("wf-e2e",discover_fn=discover_and_route_to_local_mock,match_fn=mocked_ollama_result,
+                                      queue_fn=queue_request)
+            state=workflow._row("wf-e2e")
+            applications=app_agent.list_applications()
+            self.assertEqual(state["status"],"completed")
+            self.assertEqual(state["discovered_count"],1)
+            self.assertEqual(state["potential_match_count"],1)
+            self.assertEqual(state["queued_count"],1,json.dumps({"state":state,"applications":applications,"queue_calls":queue_calls},default=str))
+            self.assertEqual(state["prepared_count"],1)
+            self.assertEqual(len(applications),1)
+            self.assertEqual(applications[0]["state"],"ready_for_review")
+            self.assertFalse(applications[0]["diagnostic"]["submission_performed"])
+            self.assertFalse(json.loads(state["diagnostics_json"])["submission_enabled"])
+        finally:
+            workflow.DB, jobs.DB, career_preferences.DB=old_workflow_db,old_jobs_db,old_preferences_db
+
     def test_queue_continues_after_one_application_needs_user_input(self):
         with app_agent.connect() as db:
             db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(USER,"saved-uncertain","Example Co","Engineer","Austin, TX","http://127.0.0.1:8000/mock-apps/uncertain","2026-01-04","Full time","eligible","","","Company Careers Page"))
             stamp=app_agent.now()
-            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at) VALUES(?,?,?,'completed','potential_match',99,'{}',NULL,?,?)",(USER,"saved-uncertain","r1",stamp,stamp))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at,freshness_status,matching_model_version) VALUES(?,?,?,'completed','potential_match',99,'{}',NULL,?,?,'current',?)",(USER,"saved-uncertain","r1",stamp,stamp,matcher.MATCHING_ENGINE_VERSION))
         result=self.post("/api/applications/queue",{"job_keys":["saved-uncertain","saved-simple"]})
         self.assertEqual(result["queued"],2)
         with app_agent.connect() as db:
@@ -405,7 +486,7 @@ class ApplicationAgentTests(unittest.TestCase):
             db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(USER,"saved-unmatched","Example Co","Unmatched","Austin","http://127.0.0.1:8000/mock-apps/simple","2026-01-05","Full time","eligible","","","Company Careers Page"))
             db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(USER,"saved-review","Example Co","Review needed","Austin","http://127.0.0.1:8000/mock-apps/multi-step","2026-01-05","Full time","eligible","","","Company Careers Page"))
             stamp=app_agent.now()
-            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at) VALUES(?,?,?,'completed','needs_review',91,'{}',NULL,?,?)",(USER,"saved-review","r1",stamp,stamp))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at,freshness_status,matching_model_version) VALUES(?,?,?,'completed','needs_review',91,'{}',NULL,?,?,'current',?)",(USER,"saved-review","r1",stamp,stamp,matcher.MATCHING_ENGINE_VERSION))
         with self.assertRaises(HTTPException) as caught:
             app_agent.prepare_saved_job(app_agent.DryRunRequest(job_key="saved-unmatched"))
         self.assertEqual(caught.exception.status_code,409)
@@ -421,14 +502,26 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertTrue(next(x for x in app_agent.list_saved_application_jobs()["results"] if x["job_key"]=="saved-review")["preparation_allowed"])
         queue=app_agent.enqueue_saved_jobs(app_agent.ApplicationQueueRequest(job_keys=["saved-review"]))
         self.assertEqual(queue["queued"],1)
+        app_agent.record_eligibility_decision("saved-review","rejected")
+        with app_agent.connect() as db:
+            self.assertEqual(app_agent._eligibility_gate(db,"saved-review","r1")[0],"rejected")
+        app_agent.review_saved_job_eligibility("saved-review",app_agent.EligibilityReviewRequest(reviewed=True))
+        with app_agent.connect() as db:
+            self.assertEqual(app_agent._eligibility_gate(db,"saved-review","r1")[0],"needs_review")
 
     def test_potential_match_with_unresolved_mandatory_evidence_requires_review(self):
         from fastapi import HTTPException
         with app_agent.connect() as db:
             db.execute("UPDATE job_match_results SET result_json=? WHERE user_id=? AND job_key='saved-simple' AND resume_id='r1'",(json.dumps({"required_experience":[{"requirement":"3 years","status":"unclear"}]}),USER))
         with self.assertRaises(HTTPException): app_agent.prepare_saved_job(app_agent.DryRunRequest(job_key="saved-simple"))
-        app_agent.review_saved_job_eligibility("saved-simple",app_agent.EligibilityReviewRequest(reviewed=True))
-        self.assertTrue(next(x for x in app_agent.list_saved_application_jobs()["results"] if x["job_key"]=="saved-simple")["preparation_allowed"])
+        with self.assertRaises(HTTPException):app_agent.review_saved_job_eligibility("saved-simple",app_agent.EligibilityReviewRequest(reviewed=True))
+        self.assertFalse(next(x for x in app_agent.list_saved_application_jobs()["results"] if x["job_key"]=="saved-simple")["preparation_allowed"])
+
+    def test_source_backed_year_requirement_cannot_be_reviewed_away_without_matching_evidence(self):
+        description="THE SKILLSET YOU'LL BRING 6+ years of professional engineering experience."
+        self.assertTrue(app_agent._unresolved_mandatory("{}",description))
+        met={"required_experience":[{"requirement":"6+ years professional experience","status":"met","candidate_evidence":["Confirmed work experience dates"]}]}
+        self.assertFalse(app_agent._unresolved_mandatory(json.dumps(met),description))
 
     def test_missing_questions_are_deduplicated_and_confirmed_answers_saved(self):
         resume,_,_=app_agent._candidate()

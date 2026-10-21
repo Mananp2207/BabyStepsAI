@@ -1,6 +1,7 @@
 """Platform-independent normalization and relevance checks for job records."""
 
 import re
+from datetime import datetime, timezone
 
 
 ROLE_FAMILIES = {
@@ -339,22 +340,188 @@ def extract_experience_requirements(description):
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
     pattern = re.compile(
         r"(?P<years>\b\d{1,2}(?:\s*[-–]\s*\d{1,2})?\+?)\s+years?\s+(?:of\s+)?"
-        r"(?:(?:professional|industry|relevant|related|work)\s+)?experience\b", re.I)
+        r"(?:(?:professional|industry|relevant|related|work|software|engineering|technical|development)\s+){0,3}experience\b", re.I)
     output = {"required": [], "preferred": [], "unclear": []}
+    headings=re.compile(r"\b(?:nice to have|bonus points|preferred qualifications|preferred experience|the skillset you(?:'|’)ll bring|what you(?:'|’)ll bring|requirements|required qualifications|minimum qualifications)\b",re.I)
+    preferred_headings={"nice to have","bonus points","preferred qualifications","preferred experience"}
+    required_headings={"requirements","required qualifications","minimum qualifications"}
     for match in pattern.finditer(text):
         start = max(0, text.rfind(".", 0, match.start()) + 1)
         end = text.find(".", match.end())
         if end < 0:
             end = min(len(text), match.end() + 180)
         sentence = text[start:end].strip()
-        context = sentence.casefold()
-        if re.search(r"\b(preferred|preferably|ideally|nice to have|bonus|desirable)\b", context):
-            category = "preferred"
-        elif re.search(r"\b(must|required|requires?|minimum|at least|requirement)\b", context):
-            category = "required"
+        preceding=[heading.group(0).casefold().replace("’","'") for heading in headings.finditer(text,0,match.start())]
+        section=preceding[-1] if preceding else ""
+        section=section.replace("’","'")
+        if section in preferred_headings:
+            category="preferred"
+        elif section in required_headings or "skillset you" in section or "what you" in section:
+            category="required"
         else:
-            category = "unclear"
-        item = {"requirement": sentence[:400], "years": match.group("years"), "status": category}
+            before=text[max(0,match.start()-100):match.start()].casefold()
+            after=text[match.end():min(len(text),match.end()+100)].casefold()
+            if re.search(r"\b(?:must|required|requires?|minimum|at least)\b[^.;]{0,80}$",before):
+                category="required"
+            elif re.search(r"^\s*(?:(?:of\s+professional\s+)?experience\s+)?(?:is\s+)?(?:preferred|desired)\b",after) or re.search(r"\b(?:preferred|desired)\s+experience\b",after):
+                category="preferred"
+            elif re.search(r"\b(?:preferred|nice to have|bonus|desirable)\b",before[-70:]):
+                category="preferred"
+            else:
+                category="unclear"
+        item = {"requirement": match.group(0), "years": match.group("years"), "status": category}
         if item not in output[category]:
             output[category].append(item)
     return output
+
+
+def extract_graduation_windows(description):
+    """Return explicit employer graduation windows as evidence, without inferring eligibility."""
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
+    patterns = (
+        re.compile(r"\b(?:class(?:es)? of|graduat(?:e|ing) in)\s+(20\d{2})(?:\s*(?:-|–|to|or)\s*(20\d{2}))?\b", re.I),
+        re.compile(r"\bmust (?:have )?graduat(?:e|ed) between\s+(20\d{2})\s+and\s+(20\d{2})\b", re.I),
+    )
+    windows = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            start, end = match.group(1), match.group(2) or match.group(1)
+            item = {"start_year": int(start), "end_year": int(end), "requirement": match.group(0)}
+            if item not in windows:
+                windows.append(item)
+    return windows
+
+
+def extract_education_requirements(description):
+    """Extract degree evidence into required/preferred/unclear buckets."""
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
+    degree = re.compile(r"\b(?:bachelor(?:'s)?|master(?:'s)?|doctoral?|ph\.?d\.?|b\.?s\.?|b\.?a\.?|m\.?s\.?|m\.?a\.?|degree)\b", re.I)
+    headings = re.compile(r"\b(?:nice to have|bonus points|preferred qualifications|preferred experience|requirements|required qualifications|minimum qualifications|basic qualifications)", re.I)
+    preferred = {"nice to have", "bonus points", "preferred qualifications", "preferred experience"}
+    output = {"required": [], "preferred": [], "unclear": []}
+    for match in degree.finditer(text):
+        start = max(0, text.rfind(".", 0, match.start()) + 1)
+        end = text.find(".", match.end())
+        if end < 0:
+            end = min(len(text), match.end() + 180)
+        sentence = text[start:end].strip()
+        if not sentence:
+            continue
+        sections = [item.group(0).casefold() for item in headings.finditer(text, 0, match.start())]
+        section = sections[-1] if sections else ""
+        if section in preferred:
+            bucket = "preferred"
+        elif section in {"requirements", "required qualifications", "minimum qualifications", "basic qualifications"}:
+            bucket = "required"
+        elif re.search(r"\b(?:required|must have|minimum)\b", sentence, re.I):
+            bucket = "required"
+        elif re.search(r"\b(?:preferred|nice to have|bonus|desired)\b", sentence, re.I):
+            bucket = "preferred"
+        else:
+            bucket = "unclear"
+        normalized = sentence[:300]
+        if normalized not in output[bucket]:
+            output[bucket].append(normalized)
+    return output
+
+
+def classify_career_category(title, preferences=None):
+    """Return the matching saved category when title evidence supports one."""
+    title_norm = normalize_text(title)
+    selected = category_names(preferences or {})
+    categories = list(dict.fromkeys(selected + list(ROLE_FAMILIES)))
+    for category in categories:
+        aliases = ROLE_FAMILIES.get(category, ())
+        if any(normalize_text(alias) and normalize_text(alias) in title_norm for alias in aliases):
+            return category.title()
+    return None
+
+
+def classify_experience_level(title, description="", employment_type=""):
+    """Classify posting seniority from explicit posting evidence; return level and rationale."""
+    title_text = str(title or "")
+    combined = f"{title_text} {employment_type or ''}"
+    requirements = extract_experience_requirements(description)
+    reasons = []
+    if re.search(r"\b(intern|internship)\b", combined, re.I):
+        return "Internship", ["Title or employment metadata identifies an internship."]
+    if re.search(r"\b(new\s*grad|new graduate|university graduate|graduate program|rotational)\b", combined, re.I):
+        reasons.append("Title identifies a new graduate or graduate program.")
+        return "New Graduate", reasons
+    if re.search(r"\b(entry[- ]level|junior|associate|early career|graduate software engineer|software engineer i)\b", combined, re.I):
+        reasons.append("Title identifies an entry-level or early-career role.")
+        return "Early Career", reasons
+    if re.search(r"\b(senior|staff|principal|lead|director|manager|vp|head of)\b", title_text, re.I):
+        reasons.append("Title identifies a senior or leadership role.")
+        return "Senior", reasons
+    required = requirements["required"]
+    if required:
+        lower_bounds = [int(re.match(r"\d+", item["years"]).group()) for item in required]
+        if max(lower_bounds) >= 5:
+            reasons.append("Required qualifications specify at least 5 years of experience.")
+            return "Experienced", reasons
+        if any("–" in item["years"] or "-" in item["years"] for item in required):
+            reasons.append("Required experience spans a range; seniority is ambiguous.")
+            return "Ambiguous", reasons
+        if max(lower_bounds) >= 3:
+            reasons.append("Required qualifications specify multiple years of experience; the title is not level-specific.")
+            return "Mid-Level", reasons
+    if extract_graduation_windows(description):
+        reasons.append("Description includes a graduation eligibility window.")
+        return "Graduate Eligible", reasons
+    return "Ambiguous", ["Neither the title nor required qualifications establish an experience level."]
+
+
+def discovery_relevance_score(job, preferences, confirmed_skills=()):
+    """Transparent ranking score; this score never decides eligibility."""
+    score = 50
+    explanations = ["Role passed the selected role and deterministic preference filters."]
+    level, level_reasons = classify_experience_level(
+        job.get("title"), job.get("description"), job.get("employment_type"))
+    requested = {str(item).casefold() for item in preferences.get("levels", []) if isinstance(item, str)}
+    early = {"new graduate", "entry level", "junior", "associate", "early career", "internship"}
+    if requested and level.casefold() in requested:
+        score += 20
+        explanations.append("Posting level matches a saved experience-level preference (+20).")
+    elif requested & early and level in {"New Graduate", "Early Career", "Internship", "Graduate Eligible"}:
+        score += 15
+        explanations.append("Posting has explicit early-career evidence (+15).")
+    elif requested & early and level in {"Experienced", "Senior"}:
+        score -= 15
+        explanations.append("Posting has experienced or senior requirements; ranked lower for an early-career search (-15).")
+    title_description = f"{job.get('title', '')} {job.get('description', '')}".casefold()
+    aliases = role_aliases(preferences)
+    if aliases and any(re.search(r"(?<![a-z0-9])" + re.escape(alias.casefold()) + r"(?![a-z0-9])", str(job.get("title", "")).casefold()) for alias in aliases):
+        score += 10
+        explanations.append("Title evidence matches a saved career category or role (+10).")
+    skill_hits = [str(skill).strip() for skill in confirmed_skills if isinstance(skill, str) and len(skill.strip()) >= 2
+                  and re.search(r"(?<![a-z0-9])" + re.escape(skill.strip().casefold()) + r"(?![a-z0-9])", title_description)]
+    if skill_hits:
+        skill_points = min(15, 5 * len(skill_hits))
+        score += skill_points
+        explanations.append(f"{len(skill_hits)} confirmed candidate skill(s) appear in the posting (+{skill_points}).")
+    if job.get("location_status") == "eligible":
+        score += 12
+        explanations.append("Posting location matches the saved location (+12).")
+    if preferences.get("employment_types"):
+        wanted = [str(value).casefold() for value in preferences["employment_types"]]
+        observed = str(job.get("employment_type") or "").casefold()
+        if observed and any(value in observed for value in wanted):
+            score += 8
+            explanations.append("Employment type matches a saved preference (+8).")
+    posted = job.get("posting_date")
+    if posted:
+        try:
+            parsed = datetime.fromisoformat(str(posted).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - parsed).days
+            if 0 <= age <= 7:
+                score += 10
+                explanations.append("Posting is less than one week old (+10).")
+            elif 0 <= age <= 30:
+                score += 6
+                explanations.append("Posting is less than one month old (+6).")
+        except (TypeError, ValueError):
+            pass
+    return max(0, min(100, score)), explanations, level, level_reasons

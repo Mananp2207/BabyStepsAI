@@ -6,6 +6,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 import job_search_agent as jobs
+from job_connectors import EmployerSource
 from job_relevance import evaluate_location, extract_experience_requirements, infer_prompt_preferences
 
 
@@ -31,6 +32,10 @@ class DiscoveryTests(unittest.TestCase):
         with jobs.database() as db:
             db.execute("CREATE TABLE career_preferences (user_id TEXT PRIMARY KEY, preferences_json TEXT NOT NULL)")
             db.execute("INSERT INTO career_preferences VALUES (?, ?)", (jobs.USER, json.dumps(self.prefs())))
+            stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+            db.execute("UPDATE employers SET connector_status='healthy',discovery_status='verified',last_success_at=? WHERE source_type='greenhouse'",(stamp,))
+            for row in db.execute("SELECT * FROM employers WHERE source_type='greenhouse'").fetchall():
+                db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",(jobs._source_fingerprint(dict(row)),row["employer_id"]))
 
     def tearDown(self):
         jobs.DB = self.old_db
@@ -166,13 +171,60 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(extracted["preferred"]), 1)
         self.assertEqual(extracted["preferred"][0]["years"], "2")
 
-    def test_explicit_senior_required_years_rejected_for_new_grads_but_preferred_is_not(self):
+    def test_experience_extractor_uses_requirement_section_and_not_following_ideally_modifier(self):
+        extracted=extract_experience_requirements(
+            "THE SKILLSET YOU'LL BRING 3+ years experience in software development, ideally some of which at startups. "
+            "NICE TO HAVE 2 years of experience with cloud systems.")
+        self.assertEqual([item["years"] for item in extracted["required"]],["3+"])
+        self.assertEqual([item["years"] for item in extracted["preferred"]],["2"])
+        enterprise=extract_experience_requirements("THE SKILLSET YOU'LL BRING 2–8 years of professional software engineering experience on high impact teams.")
+        self.assertEqual([item["years"] for item in enterprise["required"]],["2–8"])
+
+    def test_required_years_without_confirmed_experience_need_review_not_automatic_rejection(self):
         prefs = self.prefs()
         terms = jobs.search_terms("", prefs)
         required = posting(85, "Software Engineer", content="Must have at least 8 years of professional experience.")
         preferred = posting(86, "Software Engineer", content="8 years of professional experience preferred.")
-        self.assertEqual(jobs.assess_job(required, prefs, terms)[1], "experience_level")
+        accepted, reason, reasons = jobs.assess_job(required, prefs, terms)
+        self.assertTrue(accepted)
+        self.assertIsNone(reason)
+        self.assertTrue(any("confirmed professional experience is unavailable" in item for item in reasons))
         self.assertTrue(jobs.assess_job(preferred, prefs, terms)[0])
+
+    def test_confirmed_experience_conflict_is_excluded_but_matching_experience_is_not(self):
+        prefs = self.prefs()
+        terms = jobs.search_terms("", prefs)
+        required = posting(85, "Software Engineer", content="Must have at least 3 years of professional experience.")
+        self.assertEqual(jobs.assess_job(required, prefs, terms, confirmed_experience_years=2)[1], "experience_level")
+        accepted, reason, _ = jobs.assess_job(required, prefs, terms, confirmed_experience_years=4)
+        self.assertTrue(accepted)
+        self.assertIsNone(reason)
+
+    def test_experience_classification_graduation_window_and_ranking_are_explained(self):
+        from job_relevance import (classify_experience_level, classify_career_category,
+                                   discovery_relevance_score, extract_graduation_windows,
+                                   extract_education_requirements)
+        self.assertEqual(classify_experience_level("Software Engineer, New Grad")[0], "New Graduate")
+        self.assertEqual(classify_experience_level("Software Engineer", "Requires 6+ years of professional experience.")[0], "Experienced")
+        self.assertEqual(classify_experience_level("Software Engineer", "Requires 2-8 years of professional experience.")[0], "Ambiguous")
+        self.assertEqual(extract_graduation_windows("Must graduate between 2025 and 2027.")[0]["end_year"], 2027)
+        self.assertEqual(extract_graduation_windows("Class of 2026 graduates may apply.")[0]["start_year"], 2026)
+        education = extract_education_requirements("Requirements. Bachelor's degree in computer science required. Nice to have a master's degree.")
+        self.assertTrue(any("bachelor" in item.casefold() for item in education["required"]))
+        self.assertTrue(any("master" in item.casefold() for item in education["preferred"]))
+        self.assertEqual(classify_career_category("Software Engineer", {"categories": ["software development"]}), "Software Development")
+        prefs = self.prefs(levels=["New Graduate"])
+        early_score, explanation, _, _ = discovery_relevance_score(
+            {"title": "Software Engineer, New Grad", "description": "Build products with Python.", "location_status": "eligible"}, prefs)
+        vague_score, _, _, _ = discovery_relevance_score(
+            {"title": "Software Engineer", "description": "", "location_status": "eligible"}, prefs)
+        self.assertGreater(early_score, vague_score)
+        self.assertTrue(any("matches a saved experience-level preference" in item for item in explanation))
+        skill_score, skill_explanation, _, _ = discovery_relevance_score(
+            {"title": "Software Engineer", "description": "Python experience preferred.", "location_status": "eligible"},
+            prefs, ["Python"])
+        self.assertGreater(skill_score, vague_score)
+        self.assertTrue(any("confirmed candidate skill" in item for item in skill_explanation))
 
     def test_senior_level_is_supported_when_user_selects_it(self):
         prefs = self.prefs(levels=["Senior"])
@@ -282,6 +334,178 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["preliminary_matches"], 1)
         self.assertEqual(result["results"][0]["review_status"], "needs_review")
 
+    def test_type_error_in_one_employer_does_not_stop_remaining_feeds(self):
+        sources=[EmployerSource(name,"greenhouse",token,f"https://boards.greenhouse.io/{token}")
+                 for name,token in (("Broken Feed Co","broken"),("Healthy Feed One","healthy-one"),("Healthy Feed Two","healthy-two"))]
+        board_jobs={
+            "broken":[posting(1,"Software Engineer Broken")],
+            "healthy-one":[posting(2,"Software Engineer One")],
+            "healthy-two":[posting(3,"Software Engineer Two")],
+        }
+        original=jobs.assess_job
+        def assess(job,prefs,terms):
+            if job["title"]=="Software Engineer Broken":
+                raise TypeError("malformed public feed field")
+            return original(job,prefs,terms)
+        with patch.object(jobs,"_employer_sources",return_value=sources), \
+             patch.object(jobs,"fetch_board",side_effect=lambda _company,token:(board_jobs[token],None)), \
+             patch.object(jobs,"assess_job",side_effect=assess):
+            result=jobs.discover("software engineering jobs",self.prefs())
+        self.assertEqual(result["status"],"preliminary_matches")
+        self.assertEqual(result["diagnostics"]["sources_checked"],3)
+        self.assertEqual(result["diagnostics"]["postings_retrieved"],3)
+        self.assertEqual(result["count"],2)
+        self.assertEqual({item["company"] for item in result["results"]},{"Healthy Feed One","Healthy Feed Two"})
+        self.assertEqual(result["diagnostics"]["feed_failures"][0]["stage"],"job_normalization_and_filtering")
+        self.assertIn("TypeError",result["diagnostics"]["feed_failures"][0]["reason"])
+        saved=jobs.saved_jobs()
+        self.assertEqual(saved["count"],2)
+
+    def test_public_html_feed_fetch_type_error_is_diagnostic_and_isolated(self):
+        sources=[EmployerSource("Etleap","public_html","","https://www.etleap.com/careers"),
+                 EmployerSource("Healthy Feed","greenhouse","healthy","https://boards.greenhouse.io/healthy")]
+        def fetch(source):
+            if source.name=="Etleap":raise TypeError("malformed adapter value")
+            return [posting(209,"Software Engineer")],None
+        with patch.object(jobs,"_employer_sources",return_value=sources),patch.object(jobs,"fetch_source",side_effect=fetch):
+            result=jobs.discover("software engineering jobs",self.prefs())
+        self.assertEqual(result["status"],"preliminary_matches")
+        self.assertEqual(result["diagnostics"]["sources_checked"],2)
+        self.assertEqual(result["count"],1)
+        failure=result["diagnostics"]["feed_failures"][0]
+        self.assertEqual(failure["company"],"Etleap")
+        self.assertEqual(failure["stage"],"feed_fetch")
+        self.assertIn("TypeError during feed_fetch",failure["reason"])
+        self.assertTrue(failure["diagnostic_ref"])
+
+    def test_discovery_run_resumes_from_completed_source_checkpoint(self):
+        first=EmployerSource("First Employer","greenhouse","first","https://boards.greenhouse.io/first")
+        second=EmployerSource("Second Employer","greenhouse","second","https://boards.greenhouse.io/second")
+        with patch.object(jobs,"_employer_sources",return_value=[first]), \
+             patch.object(jobs,"fetch_board",return_value=([posting(10,"Software Engineer First")],None)):
+            initial=jobs.discover("software engineering jobs",self.prefs(),run_id="resume-discovery")
+        self.assertEqual(initial["count"],1)
+        with jobs.database() as db:
+            db.execute("UPDATE job_discovery_runs SET status='interrupted',total_sources=2 WHERE run_id='resume-discovery'")
+        with patch.object(jobs,"_employer_sources",return_value=[first,second]), \
+             patch.object(jobs,"fetch_board",return_value=([posting(11,"Software Engineer Second")],None)) as fetch:
+            resumed=jobs.discover("software engineering jobs",self.prefs(),run_id="resume-discovery")
+        self.assertEqual(fetch.call_count,1)
+        self.assertEqual(fetch.call_args.args,("Second Employer","second"))
+        self.assertEqual(resumed["count"],2)
+        self.assertEqual(resumed["diagnostics"]["sources_checked"],2)
+        self.assertEqual(resumed["diagnostics"]["postings_retrieved"],2)
+        self.assertEqual({item["company"] for item in resumed["results"]},{"First Employer","Second Employer"})
+
+    def test_discovery_run_recovers_after_application_restart(self):
+        source=EmployerSource("Restart Employer","greenhouse","restart","https://boards.greenhouse.io/restart")
+        with patch.object(jobs,"_employer_sources",return_value=[source]), \
+             patch.object(jobs,"fetch_board",return_value=([posting(30,"Software Engineer Restart")],None)) as fetch:
+            first=jobs.discover("software engineering jobs",self.prefs(),run_id="restart-discovery")
+            self.assertEqual(first["count"],1)
+            with jobs.database() as db:
+                db.execute("UPDATE job_discovery_runs SET status='interrupted' WHERE run_id='restart-discovery'")
+            resumed=jobs.discover("software engineering jobs",self.prefs(),run_id="restart-discovery")
+        self.assertEqual(fetch.call_count,1)
+        self.assertEqual(resumed["count"],1)
+        self.assertEqual(resumed["diagnostics"]["sources_checked"],1)
+        with jobs.database() as db:
+            self.assertEqual(db.execute("SELECT status FROM job_discovery_runs WHERE run_id='restart-discovery'").fetchone()[0],"completed")
+
+    def test_discovery_returns_actionable_conflict_for_another_active_run(self):
+        stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_discovery_runs(run_id,user_id,prompt,status,created_at,updated_at) VALUES('already-running',?,?,'running',?,?)",
+                       (jobs.USER,"private prompt is not returned",stamp,stamp))
+        with self.assertRaises(HTTPException) as caught:
+            jobs.discover("software engineering jobs",self.prefs(),run_id="new-discovery")
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("legacy_unleased",caught.exception.detail)
+        with jobs.database() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM job_discovery_runs WHERE run_id='new-discovery'").fetchone())
+
+    def test_pause_stops_at_source_boundary_and_resumes_remaining_sources(self):
+        first=EmployerSource("First Employer","greenhouse","pause-first","https://boards.greenhouse.io/pause-first")
+        second=EmployerSource("Second Employer","greenhouse","pause-second","https://boards.greenhouse.io/pause-second")
+        calls=[]
+        def fetch(_company,token):
+            calls.append(token)
+            if token=="pause-first":
+                jobs.pause_discovery("pause-discovery")
+                return [posting(40,"Software Engineer First")],None
+            return [posting(41,"Software Engineer Second")],None
+        with patch.object(jobs,"_employer_sources",return_value=[first,second]), \
+             patch.object(jobs,"fetch_board",side_effect=fetch):
+            paused=jobs.discover("software engineering jobs",self.prefs(),run_id="pause-discovery")
+            self.assertEqual(paused["status"],"interrupted")
+            self.assertEqual(calls,["pause-first"])
+            resumed=jobs.discover("software engineering jobs",self.prefs(),run_id="pause-discovery")
+        self.assertEqual(calls,["pause-first","pause-second"])
+        self.assertEqual(resumed["count"],2)
+        self.assertEqual(resumed["diagnostics"]["sources_checked"],2)
+        self.assertEqual(resumed["diagnostics"]["postings_retrieved"],2)
+
+    def test_cancellation_releases_run_lease_and_next_workflow_can_start(self):
+        source=EmployerSource("Cancel Employer","greenhouse","cancel-board","https://boards.greenhouse.io/cancel-board")
+        def cancel_during_fetch(_company,_token):
+            jobs.cancel_discovery("cancel-this-run")
+            return [posting(42,"Software Engineer")],None
+        with patch.object(jobs,"_employer_sources",return_value=[source]), \
+             patch.object(jobs,"fetch_board",side_effect=cancel_during_fetch):
+            result=jobs.discover("software engineering jobs",self.prefs(),run_id="cancel-this-run",workflow_id="cancelled-workflow")
+        self.assertEqual(result["status"],"cancelled")
+        with jobs.database() as db:
+            row=db.execute("SELECT status,owner_token,lease_expires_at FROM job_discovery_runs WHERE run_id='cancel-this-run'").fetchone()
+        self.assertEqual(row["status"],"cancelled")
+        self.assertEqual(row["owner_token"],"")
+        self.assertIsNone(row["lease_expires_at"])
+        with patch.object(jobs,"_employer_sources",return_value=[]):
+            next_run=jobs.discover("software engineering jobs",self.prefs(),run_id="next-after-cancel")
+        self.assertEqual(next_run["status"],"no_matching_openings")
+
+    def test_failed_source_can_retry_without_double_counting_after_checkpoint(self):
+        first=EmployerSource("Flaky Employer","greenhouse","flaky","https://boards.greenhouse.io/flaky")
+        second=EmployerSource("Healthy Employer","greenhouse","healthy","https://boards.greenhouse.io/healthy")
+        board={"flaky":[posting(50,"Software Engineer Flaky")],"healthy":[posting(51,"Software Engineer Healthy")]}
+        original=jobs.assess_job
+        def fail_first(job,prefs,terms):
+            if job["title"].endswith("Flaky"):
+                raise TypeError("transient malformed field")
+            return original(job,prefs,terms)
+        with patch.object(jobs,"_employer_sources",return_value=[first,second]), \
+             patch.object(jobs,"fetch_board",side_effect=lambda _company,token:(board[token],None)), \
+             patch.object(jobs,"assess_job",side_effect=fail_first):
+            first_result=jobs.discover("software engineering jobs",self.prefs(),run_id="retry-discovery")
+        self.assertEqual(first_result["count"],1)
+        with jobs.database() as db:db.execute("UPDATE job_discovery_runs SET status='interrupted' WHERE run_id='retry-discovery'")
+        with patch.object(jobs,"_employer_sources",return_value=[first,second]), \
+             patch.object(jobs,"fetch_board",side_effect=lambda _company,token:(board[token],None)):
+            resumed=jobs.discover("software engineering jobs",self.prefs(),run_id="retry-discovery")
+        self.assertEqual(resumed["count"],2)
+        self.assertEqual(resumed["diagnostics"]["sources_checked"],2)
+        self.assertEqual(resumed["diagnostics"]["postings_retrieved"],2)
+        self.assertEqual(resumed["diagnostics"]["feed_failures"],[])
+
+    def test_legacy_interrupted_run_restarts_counters_without_overcounting(self):
+        first=EmployerSource("First Employer","greenhouse","first","https://boards.greenhouse.io/first")
+        second=EmployerSource("Second Employer","greenhouse","second","https://boards.greenhouse.io/second")
+        with patch.object(jobs,"_employer_sources",return_value=[first]), \
+             patch.object(jobs,"fetch_board",return_value=([posting(20,"Software Engineer First")],None)):
+            jobs.discover("software engineering jobs",self.prefs(),run_id="legacy-discovery")
+        with jobs.database() as db:
+            row=db.execute("SELECT diagnostics_json FROM job_discovery_runs WHERE run_id='legacy-discovery'").fetchone()
+            legacy=json.loads(row[0]);legacy.pop("completed_sources",None);legacy.pop("found_job_keys",None)
+            legacy["sources_checked"]=5;legacy["postings_retrieved"]=20
+            db.execute("UPDATE job_discovery_runs SET status='interrupted',diagnostics_json=? WHERE run_id='legacy-discovery'",
+                       (json.dumps(legacy),))
+        with patch.object(jobs,"_employer_sources",return_value=[first,second]), \
+             patch.object(jobs,"fetch_board",side_effect=[([posting(20,"Software Engineer First")],None),
+                 ([posting(21,"Software Engineer Second")],None)]):
+            resumed=jobs.discover("software engineering jobs",self.prefs(),run_id="legacy-discovery")
+        self.assertEqual(resumed["diagnostics"]["sources_checked"],2)
+        self.assertEqual(resumed["diagnostics"]["postings_retrieved"],2)
+        self.assertEqual(resumed["count"],2)
+
     def test_discovery_diagnostics_separate_geo_conflicts_and_unknown_locations(self):
         items = [posting(501, "Software Engineer", location={"name": "London, United Kingdom"}),
                  posting(502, "Software Engineer", location={"name": "Hybrid"}),
@@ -290,7 +514,8 @@ class DiscoveryTests(unittest.TestCase):
             result = jobs.discover("software engineering jobs in United States", jobs.preferences())
         self.assertEqual(result["diagnostics"]["geographic_mismatches"], 1)
         self.assertEqual(result["diagnostics"]["location_needs_review"], 1)
-        self.assertEqual([job["location_status"] for job in result["results"]], ["unknown", "eligible"])
+        self.assertEqual({job["location_status"] for job in result["results"]}, {"unknown", "eligible"})
+        self.assertGreaterEqual(result["results"][0]["relevance_score"], result["results"][1]["relevance_score"])
 
     def test_duplicate_prevention_survives_repeated_search(self):
         with self._mock_feeds({"cloudflare": [posting(123, "Software Engineer")]}):

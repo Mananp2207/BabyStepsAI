@@ -1,5 +1,7 @@
 import json
+import multiprocessing
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -29,6 +31,16 @@ def valid_result(**changes):
     return matcher.MatchResult.model_validate(data)
 
 
+def _process_match_claim(db_path,barrier,result_queue):
+    jobs.DB=Path(db_path)
+    barrier.wait()
+    try:
+        response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        result_queue.put(("ok",response.get("session_id")))
+    except Exception as error:
+        result_queue.put(("error",getattr(error,"detail",type(error).__name__)))
+
+
 class ResumeJobMatcherTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -39,6 +51,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
                 CREATE TABLE resumes (id TEXT PRIMARY KEY, user_id TEXT, created_at TEXT, active INTEGER);
                 CREATE TABLE resume_profiles (resume_id TEXT PRIMARY KEY, status TEXT, profile_json TEXT);
                 CREATE TABLE candidate_verifications (resume_id TEXT PRIMARY KEY,user_id TEXT,values_json TEXT,confirmed_json TEXT,updated_at TEXT);
+                CREATE TABLE application_answers(user_id TEXT,resume_id TEXT,question_key TEXT,answer TEXT,sensitive INTEGER,confirmed INTEGER,revoked_at TEXT,auto_reuse INTEGER);
                 CREATE TABLE career_preferences (user_id TEXT PRIMARY KEY, preferences_json TEXT NOT NULL);
                 CREATE TABLE discovered_openings (user_id TEXT, job_key TEXT, company TEXT, title TEXT, location TEXT, url TEXT, discovered_at TEXT, employment_type TEXT DEFAULT '', location_status TEXT DEFAULT 'unknown', location_reason TEXT DEFAULT '', search_prompt TEXT DEFAULT '', PRIMARY KEY(user_id,job_key));
                 CREATE TABLE application_authorizations (user_id TEXT PRIMARY KEY, version INTEGER NOT NULL, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -65,6 +78,51 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(resume_id, "resume-v1")
         self.assertEqual(status, "user_reviewed")
         self.assertEqual(profile["technical_skills"], ["Python"])
+
+    def test_matching_uses_confirmed_ordinary_answer_bank_facts_only(self):
+        with jobs.database() as db:
+            db.executemany("INSERT INTO application_answers VALUES(?,?,?,?,?,?,?,?)",[
+                (jobs.USER,"resume-v1","custom:graduation_date","2026-06",0,1,None,1),
+                (jobs.USER,"resume-v1","custom:technical_skills","Python, Rust",0,1,None,1),
+                (jobs.USER,"resume-v1","custom:professional_experience","Built verified production APIs",0,1,None,1),
+                (jobs.USER,"resume-v1","custom:work_authorization","Sensitive answer",1,1,None,0),
+                (jobs.USER,"resume-v1","custom:location","Old answer",0,0,None,1)])
+        _,_,profile=matcher.active_candidate()
+        self.assertEqual(profile["graduation_year"],"2026")
+        self.assertIn("Rust",profile["technical_skills"])
+        self.assertEqual(profile["work_experience"][-1]["responsibilities"],["Built verified production APIs"])
+        self.assertNotIn("work_authorization",profile)
+        self.assertNotIn("Old answer",str(profile))
+
+    def test_match_freshness_detects_engine_profile_preference_and_job_changes(self):
+        resume_id,status,profile=matcher.active_candidate()
+        self.assertEqual(status,"user_reviewed")
+        saved_prefs=jobs.preferences()
+        with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key='greenhouse:cloudflare:42'").fetchone())
+            stamp=matcher.now()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','potential_match',84,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,"greenhouse:cloudflare:42",resume_id,valid_result().model_dump_json(),stamp,stamp,
+                 matcher.profile_fingerprint(profile,resume_id),matcher.stable_fingerprint(saved_prefs),
+                 matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
+        current=matcher._match_rows(["greenhouse:cloudflare:42"],resume_id)[0]
+        self.assertFalse(current["stale"])
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET title='Changed Software Engineer' WHERE job_key='greenhouse:cloudflare:42'")
+        changed=matcher._match_rows(["greenhouse:cloudflare:42"],resume_id)[0]
+        self.assertTrue(changed["stale"])
+        self.assertEqual(changed["freshness_status"],"stale")
+
+    def test_legacy_match_without_version_fingerprints_is_stale(self):
+        with jobs.database() as db:
+            stamp=matcher.now()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at)
+                VALUES(?,?,'resume-v1','completed','potential_match',80,?,?,?)""",
+                (jobs.USER,"greenhouse:cloudflare:42",valid_result().model_dump_json(),stamp,stamp))
+        result=matcher._match_rows(["greenhouse:cloudflare:42"],"resume-v1")[0]
+        self.assertTrue(result["stale"])
 
     def test_confirmed_graduation_date_is_merged_for_job_matching(self):
         with jobs.database() as db:
@@ -132,12 +190,17 @@ class ResumeJobMatcherTests(unittest.TestCase):
 
     def test_completed_result_is_not_overwritten_or_analyzed_again(self):
         existing = valid_result()
+        resume_id,_,profile=matcher.active_candidate()
+        prefs=jobs.preferences()
         with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key='greenhouse:cloudflare:42'").fetchone())
             db.execute("""INSERT INTO job_match_results
-                (user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at)
-                VALUES(?,?,?,'completed',?,?,?,'2026-01-01','2026-01-01')""",
-                       (jobs.USER, "greenhouse:cloudflare:42", "resume-v1", existing.classification,
-                        existing.match_score, existing.model_dump_json()))
+                (user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at,
+                 candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed',?,?,?,'2026-01-01','2026-01-01',?,?,?,?,'current')""",
+                       (jobs.USER, "greenhouse:cloudflare:42", resume_id, existing.classification,
+                        existing.match_score, existing.model_dump_json(),matcher.profile_fingerprint(profile,resume_id),
+                        matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
         fake = {"id": 42, "title": "Software Engineer", "content": "Python required.",
                 "location": {"name": "Austin, Texas"}}
         with patch.object(matcher, "fetch_board", return_value=([fake], None)), \
@@ -152,6 +215,21 @@ class ResumeJobMatcherTests(unittest.TestCase):
         model.assert_not_called()
         self.assertEqual(rows[0]["match_score"], 84)
         self.assertEqual(rows[0]["match"]["explanation"], existing.explanation)
+
+    def test_provider_change_marks_saved_match_stale(self):
+        resume_id,status,profile=matcher.active_candidate()
+        prefs=jobs.preferences();key="greenhouse:cloudflare:42"
+        with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key=?",(key,)).fetchone())
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','potential_match',84,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,key,resume_id,valid_result().model_dump_json(),"2026-01-01","2026-01-01",
+                 matcher.profile_fingerprint(profile,resume_id),matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),
+                 matcher.matching_engine_version("ollama",matcher.MODEL)))
+        with patch.object(matcher,"current_provider_config",return_value=("gemini",matcher.GEMINI_MODEL)):
+            rows=matcher._match_rows([key],resume_id)
+        self.assertTrue(rows[0]["stale"])
 
     def test_senior_experience_requirement_is_sent_to_ollama(self):
         response = Mock()
@@ -203,11 +281,63 @@ class ResumeJobMatcherTests(unittest.TestCase):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"response": "not valid JSON"}
-        with patch.object(matcher, "OLLAMA_ATTEMPTS", 2), patch.object(matcher.time, "sleep"), \
+        with patch.object(matcher, "OLLAMA_ATTEMPTS", 3), patch.object(matcher.time, "sleep"), \
              patch.object(matcher.requests, "post", return_value=response) as post:
             with self.assertRaisesRegex(RuntimeError, "malformed match JSON"):
                 matcher.analyze_with_ollama({}, "user_reviewed", {}, {"title": "Role", "content": "Description"})
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_count, matcher.OLLAMA_ATTEMPTS)
+        self.assertEqual(post.call_args.kwargs["json"]["format"]["type"],"object")
+
+    def test_json_parser_recovers_fenced_object_with_surrounding_text(self):
+        parsed=matcher._parse_match_text("Here is the result:\n```json\n"+valid_result().model_dump_json()+"\n```\nDone.")
+        self.assertEqual(parsed.classification,"potential_match")
+
+    def test_gemini_structured_response_uses_server_key_and_validates_schema(self):
+        response=Mock();response.status_code=200
+        response.json.return_value={"candidates":[{"content":{"parts":[{"text":valid_result().model_dump_json()}]}}]}
+        with patch.dict("os.environ",{"GEMINI_API_KEY":"test-secret-key"}),patch.object(matcher.requests,"post",return_value=response) as post:
+            result=matcher.analyze_with_provider({"technical_skills":["Python"]},"user_reviewed",{},
+                {"title":"Software Engineer","content":"Python experience"},provider="gemini")
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"],"test-secret-key")
+        self.assertNotIn("params",post.call_args.kwargs)
+        self.assertEqual(post.call_args.kwargs["json"]["generationConfig"]["responseMimeType"],"application/json")
+        self.assertEqual(post.call_args.kwargs["json"]["generationConfig"]["responseSchema"]["type"],"OBJECT")
+        self.assertIn("classification",post.call_args.kwargs["json"]["generationConfig"]["responseSchema"]["required"])
+
+    def test_gemini_missing_key_fails_closed_without_request(self):
+        with patch.dict("os.environ",{"GEMINI_API_KEY":""}),patch.object(matcher.requests,"post") as post:
+            with self.assertRaisesRegex(RuntimeError,"GEMINI_API_KEY is not configured"):
+                matcher.analyze_with_provider({},"user_reviewed",{}, {"title":"Role","content":"Description"},provider="gemini")
+        post.assert_not_called()
+
+    def test_gemini_retries_malformed_json_with_repair_instruction(self):
+        bad=Mock();bad.status_code=200;bad.json.return_value={"candidates":[{"content":{"parts":[{"text":"not json"}]}}]}
+        good=Mock();good.status_code=200;good.json.return_value={"candidates":[{"content":{"parts":[{"text":valid_result().model_dump_json()}]}}]}
+        with patch.dict("os.environ",{"GEMINI_API_KEY":"test-secret-key"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",side_effect=[bad,good]) as post:
+            result=matcher.analyze_with_provider({},"user_reviewed",{}, {"title":"Role","content":"Description"},provider="gemini")
+        self.assertEqual(result.classification,"potential_match")
+        self.assertIn(matcher.MATCHING_JSON_REPAIR_INSTRUCTION,post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"])
+
+    def test_new_matching_checkpoint_pins_selected_provider_and_model(self):
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"matching_provider":"gemini"}),jobs.USER))
+        fake={"id":42,"title":"Software Engineer","content":"Python experience required.",
+              "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+              "location":{"name":"San Francisco, CA, United States"},"employment_type":"Full-time"}
+        with patch.dict("os.environ",{"GEMINI_API_KEY":"test-secret-key"}), \
+             patch.object(matcher,"fetch_board",return_value=([fake],None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            result=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        with jobs.database() as db:
+            session=db.execute("SELECT provider,provider_model FROM job_match_sessions WHERE session_id=?",(result["session_id"],)).fetchone()
+        self.assertEqual(session["provider"],"gemini")
+        self.assertEqual(session["provider_model"],matcher.GEMINI_MODEL)
+        progress=matcher._progress(result["session_id"])
+        self.assertEqual(progress["provider"],"gemini")
+        self.assertEqual(progress["provider_model"],matcher.GEMINI_MODEL)
 
     def test_ollama_timeout_is_retried(self):
         response = Mock()
@@ -270,6 +400,22 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertNotIn("resume_id", public)
         self.assertNotIn("job_key", public)
 
+    def test_batch_persists_selected_gemini_engine_version(self):
+        fake_job={"id":42,"title":"Software Engineer","content":"Python experience required.",
+                  "location":{"name":"San Francisco, CA, United States"},"metadata":[{"name":"Employment Type","value":"Full-time"}]}
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued','2026-01-01','2026-01-01')",
+                       (jobs.USER,"greenhouse:cloudflare:42","resume-v1"))
+        with patch.object(matcher,"fetch_board",return_value=([fake_job],None)), \
+             patch.object(matcher,"analyze_with_provider",return_value=valid_result()):
+            matcher._process_batch(["greenhouse:cloudflare:42"],"resume-v1","user_reviewed",{"technical_skills":["Python"]},
+                                   provider="gemini",provider_model=matcher.GEMINI_MODEL)
+        with jobs.database() as db:
+            result=db.execute("SELECT matching_model_version,freshness_status FROM job_match_results WHERE job_key=?",
+                              ("greenhouse:cloudflare:42",)).fetchone()
+        self.assertEqual(result["matching_model_version"],matcher.matching_engine_version("gemini",matcher.GEMINI_MODEL))
+        self.assertEqual(result["freshness_status"],"current")
+
     def test_analyze_matches_queues_only_saved_job_for_active_resume(self):
         fake_job = {"id": 42, "title": "Software Engineer", "content": "Python experience required.",
                     "location": {"name": "San Francisco, CA, United States"}, "metadata": [{"name": "Employment Type", "value": "Full-time"}]}
@@ -296,6 +442,223 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code,403)
         self.assertIn("Application settings",caught.exception.detail)
 
+    def test_unrelated_paused_legacy_session_does_not_block_new_workflow(self):
+        with jobs.database() as db:
+            old_keys=[f"greenhouse:cloudflare:old-{i}" for i in range(56)]
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,created_at,updated_at) VALUES('legacy-paused',?,'resume-v1','paused',?,3,56,'old','old')""",
+                (jobs.USER,json.dumps(old_keys)))
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,resume_id TEXT,current_stage TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-new',?,'resume-v1','matching')",(jobs.USER,))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python experience required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None) as submit:
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]),workflow_id="workflow-new")
+        self.assertEqual(response["status"],"queued")
+        self.assertTrue(response["session_id"])
+        self.assertEqual(submit.call_count,1)
+        with jobs.database() as db:
+            old=db.execute("SELECT status,owner_token FROM job_match_sessions WHERE session_id='legacy-paused'").fetchone()
+            new=db.execute("SELECT status,workflow_id,owner_token FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+        self.assertEqual(tuple(old),("paused",""))
+        self.assertEqual(new["status"],"queued")
+        self.assertEqual(new["workflow_id"],"workflow-new")
+        self.assertTrue(new["owner_token"])
+
+    def test_linked_subset_checkpoint_attaches_to_full_workflow_selection(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,matching_session_id TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('wf-retry',?, 'retry-session')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,created_at,updated_at)
+                VALUES('retry-session',?,'resume-v1','paused',?,3,1,'old','old')""",(jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+            requested=["greenhouse:cloudflare:42","greenhouse:cloudflare:43"]
+            self.assertIsNone(matcher._matching_conflict(db,requested,"wf-retry",matcher.now()))
+            attached=matcher._attach_workflow_checkpoint(db,"wf-retry",requested,matcher.now())
+            self.assertEqual(attached["workflow_id"],"wf-retry")
+            self.assertEqual(json.loads(attached["job_keys_json"]),requested)
+            self.assertEqual(attached["total_jobs"],2)
+
+    def test_workflow_never_attaches_a_checkpoint_owned_by_another_workflow(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,matching_session_id TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('wf-new',?, 'session-old')",(jobs.USER,))
+            db.execute("INSERT INTO user_workflows VALUES('wf-old',?, '')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,created_at,updated_at) VALUES('session-old',?,'resume-v1','paused',?,3,1,'wf-old','old','old')""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+            attached=matcher._attach_workflow_checkpoint(db,"wf-new",["greenhouse:cloudflare:42"],matcher.now())
+            self.assertIsNone(attached)
+            owner=db.execute("SELECT workflow_id,status FROM job_match_sessions WHERE session_id='session-old'").fetchone()
+            self.assertEqual(tuple(owner),("wf-old","paused"))
+
+    def test_matching_resume_does_not_reclaim_another_workflows_exact_paused_session(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,resume_id TEXT,matching_session_id TEXT,current_stage TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('wf-new',?,'resume-v1','session-old','matching')",(jobs.USER,))
+            db.execute("INSERT INTO user_workflows VALUES('wf-old',?,'resume-v1',NULL,'matching')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,created_at,updated_at) VALUES('session-old',?,'resume-v1','paused',?,3,1,'wf-old','old','old')""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]),workflow_id="wf-new")
+        self.assertNotEqual(response["session_id"],"session-old")
+        with jobs.database() as db:
+            old=db.execute("SELECT status,workflow_id,owner_token FROM job_match_sessions WHERE session_id='session-old'").fetchone()
+            new=db.execute("SELECT workflow_id,status FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+        self.assertEqual(tuple(old),("paused","wf-old",""))
+        self.assertEqual(tuple(new),("wf-new","queued"))
+
+    def test_legacy_active_session_requires_explicit_aged_recovery(self):
+        from datetime import timedelta
+        from fastapi import HTTPException
+        stamp=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=5)).isoformat()
+        with jobs.database() as db:
+            db.execute("""CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,status TEXT,
+                current_stage TEXT,pause_requested INTEGER,diagnostics_json TEXT,updated_at TEXT)""")
+            db.execute("INSERT INTO user_workflows VALUES('legacy-workflow',?,'running','matching',0,'{}',?)",
+                       (jobs.USER,stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,created_at,updated_at) VALUES('legacy-running',?,'resume-v1','running',?,3,1,'legacy-workflow',?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"]),stamp,stamp))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            with self.assertRaises(HTTPException) as caught:
+                matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertEqual(caught.exception.detail["code"],"legacy_unowned")
+        with self.assertRaises(HTTPException) as caught:
+            matcher.recover_match_session("legacy-running",False)
+        self.assertEqual(caught.exception.status_code,422)
+        recovered=matcher.recover_match_session("legacy-running",True)
+        self.assertTrue(recovered["recovered"])
+        with jobs.database() as db:
+            row=db.execute("SELECT status,job_keys_json FROM job_match_sessions WHERE session_id='legacy-running'").fetchone()
+            workflow=db.execute("SELECT status,current_stage,pause_requested FROM user_workflows WHERE workflow_id='legacy-workflow'").fetchone()
+        self.assertEqual(row["status"],"interrupted")
+        self.assertEqual(json.loads(row["job_keys_json"]),["greenhouse:cloudflare:42"])
+        self.assertEqual(tuple(workflow),("paused","matching",1))
+
+    def test_expired_dead_owner_is_interrupted_and_processing_checkpoint_requeued(self):
+        from datetime import timedelta
+        stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at)
+                VALUES(?,?,'resume-v1','processing',?,?)""",(jobs.USER,"greenhouse:cloudflare:stale",stale,stale))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES('dead-owner',?,'resume-v1','running',?,3,1,'','dead-token',99999999,?,?,?, ?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:stale"]),matcher.socket.gethostname(),stale,stale,stale,stale))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        self.assertEqual(response["status"],"queued")
+        with jobs.database() as db:
+            session=db.execute("SELECT status,owner_token,job_keys_json FROM job_match_sessions WHERE session_id='dead-owner'").fetchone()
+            result=db.execute("SELECT status FROM job_match_results WHERE job_key='greenhouse:cloudflare:stale'").fetchone()
+        self.assertEqual(session["status"],"interrupted")
+        self.assertEqual(session["owner_token"],"")
+        self.assertEqual(result["status"],"queued")
+        self.assertEqual(json.loads(session["job_keys_json"]),["greenhouse:cloudflare:stale"])
+
+    def test_concurrent_matching_acquisition_has_one_owner(self):
+        import threading
+        from fastapi import HTTPException
+        gate=threading.Barrier(2);results=[]
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        def run():
+            gate.wait()
+            try:results.append(("ok",matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))))
+            except HTTPException as error:results.append(("conflict",error.detail.get("code") if isinstance(error.detail,dict) else error.detail))
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            threads=[threading.Thread(target=run) for _ in range(2)]
+            for thread in threads:thread.start()
+            for thread in threads:thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sum(item[0]=="ok" for item in results),1)
+        self.assertEqual(sum(item[0]=="conflict" for item in results),1)
+        with jobs.database() as db:
+            owned=db.execute("SELECT COUNT(*) FROM job_match_sessions WHERE user_id=? AND status IN ('queued','running','paused') AND owner_token<>''",(jobs.USER,)).fetchone()[0]
+        self.assertEqual(owned,1)
+
+    def test_two_processes_cannot_acquire_distinct_matching_workers(self):
+        from fastapi import HTTPException
+        ctx=multiprocessing.get_context("fork")
+        barrier=ctx.Barrier(2);results=ctx.Queue()
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            processes=[ctx.Process(target=_process_match_claim,args=(str(jobs.DB),barrier,results)) for _ in range(2)]
+            for process in processes:process.start()
+            outcomes=[results.get(timeout=10) for _ in processes]
+            for process in processes:process.join(10)
+        self.assertTrue(all(process.exitcode==0 for process in processes))
+        self.assertEqual(sum(result[0]=="ok" for result in outcomes),1)
+        self.assertEqual(sum(result[0]=="error" for result in outcomes),1)
+        with jobs.database() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM job_match_sessions WHERE status IN ('queued','running','paused') AND owner_token<>''").fetchone()[0],1)
+
+    def test_twelve_discovered_jobs_match_in_one_owned_workflow_session(self):
+        keys=[f"greenhouse:cloudflare:batch-{i}" for i in range(12)]
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,resume_id TEXT,current_stage TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-12',?,'resume-v1','matching')",(jobs.USER,))
+            for i,key in enumerate(keys):
+                db.execute("""INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at)
+                    VALUES(?,?,'Cloudflare','Software Engineer','San Francisco, CA, United States',?,?)""",
+                    (jobs.USER,key,f"https://boards.greenhouse.io/cloudflare/jobs/{i}","2026-10-20"))
+        def fake_find(key,_cache):
+            external=key.rsplit(':',1)[-1]
+            return ({"id":external,"title":"Software Engineer","content":"Python experience required.",
+                "absolute_url":f"https://boards.greenhouse.io/cloudflare/jobs/{external}",
+                "location":{"name":"San Francisco, CA, United States"},"employment_type":"Full-time",
+                "country":"United States","workplaceType":"On-site","_source_platform":"greenhouse",
+                "company_name":"Cloudflare","_search_prompt":"software engineering jobs"},None)
+        with patch.object(matcher,"_find_feed_job",side_effect=fake_find), \
+             patch.object(matcher,"analyze_with_ollama",return_value=valid_result()) as model:
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3),workflow_id="workflow-12")
+            self.assertEqual(response["status"],"queued")
+            for _ in range(500):
+                progress=matcher._progress(response["session_id"])
+                if progress["status"] in {"completed","paused","interrupted"}:break
+                time.sleep(.01)
+        self.assertEqual(progress["status"],"completed",progress)
+        self.assertEqual(progress["completed"],12)
+        self.assertEqual(progress["pending"],0)
+        self.assertEqual(model.call_count,12)
+        retry=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3),workflow_id="workflow-12")
+        self.assertEqual(retry["session_id"],response["session_id"])
+        self.assertEqual(retry["status"],"completed")
+        self.assertEqual(model.call_count,12)
+        with jobs.database() as db:
+            row=db.execute("SELECT workflow_id,status FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+            saved=db.execute("SELECT COUNT(*) FROM job_match_results WHERE user_id=? AND job_key IN (SELECT value FROM json_each(?)) AND status='completed'",
+                             (jobs.USER,json.dumps(keys))).fetchone()[0]
+        self.assertEqual(tuple(row),("workflow-12","completed"))
+        self.assertEqual(saved,12)
+
     def test_unrelated_saved_jobs_are_excluded_before_ollama(self):
         with jobs.database() as db:
             db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (
@@ -308,26 +671,35 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(result["excluded"], 1)
         ollama.assert_not_called()
 
-    def test_session_batches_pause_resume_without_repeating_completed_jobs(self):
+    def test_session_pause_resume_preserves_completed_jobs_and_ownership(self):
         for job_id in (142, 143, 144, 145):
             with jobs.database() as db:
                 db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (
                     jobs.USER, f"greenhouse:cloudflare:{job_id}", "Cloudflare", "Software Engineer",
                     "San Francisco, CA, United States", f"https://boards.greenhouse.io/cloudflare/jobs/{job_id}", "2026-01-01"))
         feed = [{"id": job_id, "title": "Software Engineer", "content": "Python required."} for job_id in (142, 143, 144, 145)]
+        model_started=threading.Event();continue_model=threading.Event();calls=[]
+        def model_call(*_args):
+            calls.append(1)
+            if len(calls)==1:
+                model_started.set();continue_model.wait(5)
+            return valid_result()
         with patch.object(matcher, "fetch_board", return_value=(feed, None)), \
-             patch.object(matcher, "analyze_with_ollama", return_value=valid_result()) as model:
+             patch.object(matcher, "analyze_with_ollama", side_effect=model_call) as model:
             response = matcher.analyze_matches(matcher.MatchRequest(job_keys=[f"greenhouse:cloudflare:{i}" for i in (142, 143, 144, 145)], batch_size=3))
+            self.assertTrue(model_started.wait(2))
+            matcher.pause_matches(session_id=response["session_id"])
+            continue_model.set()
             for _ in range(100):
-                progress = matcher.get_match_progress()
-                if progress["status"] == "paused":
+                progress = matcher._progress(response["session_id"])
+                if progress["status"] == "paused" and progress["owner_state"]=="unowned":
                     break
                 time.sleep(0.01)
-            self.assertEqual(progress["completed"], 3)
-            self.assertEqual(progress["pending"], 1)
-            matcher.resume_matches()
+            self.assertEqual(progress["completed"], 1)
+            self.assertEqual(progress["pending"], 3)
+            matcher.resume_matches(session_id=response["session_id"])
             for _ in range(100):
-                progress = matcher.get_match_progress()
+                progress = matcher._progress(response["session_id"])
                 if progress["status"] == "completed":
                     break
                 time.sleep(0.01)

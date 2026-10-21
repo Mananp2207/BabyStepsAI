@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ class FakeResponse:
 class ApplicationAnswerAssistantTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.db=Path(self.temp.name)/"answers.sqlite3"
+        self.old_key_path=os.environ.get("BABYSTEPSAI_KEY_PATH"); os.environ["BABYSTEPSAI_KEY_PATH"]=str(Path(self.temp.name)/"encryption.key")
         self.old_assistant_db,self.old_profile_db=assistant.DB,profile.DB
         assistant.DB=self.db; profile.DB=self.db
         with sqlite3.connect(self.db) as db:
@@ -39,6 +41,8 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
 
     def tearDown(self):
         assistant.DB=self.old_assistant_db; profile.DB=self.old_profile_db; self.temp.cleanup()
+        if self.old_key_path is None: os.environ.pop("BABYSTEPSAI_KEY_PATH",None)
+        else: os.environ["BABYSTEPSAI_KEY_PATH"]=self.old_key_path
 
     def test_authorization_is_versioned_and_submission_cannot_be_enabled(self):
         initial=assistant.get_authorization()
@@ -50,6 +54,21 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
         self.assertFalse(updated["settings"]["live_submission_enabled"])
         with assistant.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM application_authorization_history WHERE user_id=?",(USER,)).fetchone()[0],3)
+
+    def test_matching_provider_is_versioned_and_gemini_key_is_not_persisted(self):
+        with patch.dict(os.environ,{"GEMINI_API_KEY":"optional-test-key"}):
+            saved=assistant.update_authorization(assistant.AuthorizationUpdate(
+                allow_ai_matching=True,matching_provider="gemini"))
+            self.assertEqual(saved["settings"]["matching_provider"],"gemini")
+            self.assertTrue(saved["settings"]["gemini_configured"])
+            status=assistant.get_authorization()
+        self.assertEqual(status["settings"]["matching_provider"],"gemini")
+        self.assertTrue(status["settings"]["gemini_configured"])
+        with assistant.connect() as db:
+            stored=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()[0]
+        self.assertNotIn("optional-test-key",stored)
+        self.assertNotIn("gemini_configured",stored)
+        self.assertFalse(status["settings"]["live_submission_enabled"])
 
     def test_sensitive_and_referral_questions_are_never_ai_drafted(self):
         from fastapi import HTTPException
@@ -146,7 +165,7 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
         self.assertIn('"city": "Oakland"',row[0])
         with assistant.connect() as db:
             saved=db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE resume_id='r1'").fetchone()
-        facts=profile.verified_profile_facts(json.loads(saved["values_json"]),json.loads(saved["confirmed_json"]))
+        facts=profile.verified_profile_facts(profile.verified_values_from_json(saved["values_json"]),json.loads(saved["confirmed_json"]))
         self.assertEqual(facts["city"],"Oakland")
         self.assertEqual(facts["country_work_authorizations"][0]["status"],"Authorized")
 

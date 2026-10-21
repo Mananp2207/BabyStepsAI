@@ -1,8 +1,11 @@
 """Rule-based discovery from the supported public Greenhouse job boards."""
 
 import json
+import logging
+import os
 import re
 import sqlite3
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -22,7 +25,10 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from job_relevance import (evaluate_location, extract_experience_requirements,
-                           infer_prompt_preferences, normalize_job_record, relevance_for_job)
+                           infer_prompt_preferences, normalize_job_record, relevance_for_job,
+                           classify_experience_level, discovery_relevance_score,
+                           extract_graduation_windows, extract_education_requirements,
+                           classify_career_category)
 from ui_theme import apply_ui_theme
 from job_connectors import (EmployerSource, canonicalize_job_url, discover_source_candidates, fetch_source,
                             normalize_job, observe_fetch, validate_public_https_url)
@@ -59,6 +65,10 @@ CATEGORY_TERMS = {
 }
 _FEED_CACHE = {}
 _FEED_CACHE_LOCK = threading.Lock()
+_DISCOVERY_LOCK = threading.Lock()
+DISCOVERY_LEASE_SECONDS = 90
+DISCOVERY_HEARTBEAT_SECONDS = 15
+logger=logging.getLogger("babysteps.job_discovery")
 
 
 class SearchRequest(BaseModel):
@@ -240,9 +250,17 @@ def initialize():
             total_sources INTEGER NOT NULL DEFAULT 0,sources_checked INTEGER NOT NULL DEFAULT 0,
             postings_retrieved INTEGER NOT NULL DEFAULT 0,diagnostics_json TEXT NOT NULL DEFAULT '{}',
             cancel_requested INTEGER NOT NULL DEFAULT 0,error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)""")
-        db.execute("UPDATE job_discovery_runs SET status='interrupted',updated_at=? WHERE status='running'",
-                   (datetime.now(timezone.utc).isoformat(),))
+        # Ownership is additive. Importing the app must never rewrite another
+        # process's running row; its durable lease determines whether it is live.
+        run_columns={row[1] for row in db.execute("PRAGMA table_info(job_discovery_runs)")}
+        for name,declaration in (("workflow_id","TEXT NOT NULL DEFAULT ''"),
+                                 ("owner_token","TEXT NOT NULL DEFAULT ''"),
+                                 ("owner_pid","INTEGER"),("owner_host","TEXT NOT NULL DEFAULT ''"),
+                                 ("heartbeat_at","TEXT"),("lease_expires_at","TEXT")):
+            if name not in run_columns:
+                db.execute(f"ALTER TABLE job_discovery_runs ADD COLUMN {name} {declaration}")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running_discovery_per_user ON job_discovery_runs(user_id) WHERE status='running'")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_one_discovery_run_per_workflow ON job_discovery_runs(workflow_id) WHERE workflow_id<>''")
         # Migrate existing configured employers without touching saved jobs.
         stamp = datetime.now(timezone.utc).isoformat()
         for company, board in BOARDS.items():
@@ -335,7 +353,50 @@ def _employment(job):
     return " ".join(values).casefold()
 
 
-def assess_job(job, prefs, terms):
+def _confirmed_professional_experience_years():
+    """Read only an explicitly confirmed numeric experience statement, if present."""
+    with database() as db:
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_answers'").fetchone()
+        if not table:
+            return None
+        rows = db.execute("""SELECT answer FROM application_answers WHERE user_id=?
+            AND question_key IN ('professional_experience','custom:professional_experience')
+            AND confirmed=1 AND sensitive=0 AND revoked_at IS NULL""", (USER,)).fetchall()
+    for row in rows:
+        match = re.search(r"\b(\d{1,2}(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\b", str(row["answer"] or ""), re.I)
+        if match:
+            return float(match.group(1))
+    return None
+
+
+def _confirmed_candidate_skills():
+    """Load only user-confirmed ordinary skills for local ranking."""
+    with database() as db:
+        resume_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='resumes'").fetchone()
+        verification_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_verifications'").fetchone()
+        resume = db.execute("SELECT id FROM resumes WHERE user_id=? AND active=1 ORDER BY created_at DESC LIMIT 1", (USER,)).fetchone() if resume_table else None
+        verification = db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE user_id=? AND resume_id=?", (USER,resume["id"])).fetchone() if resume and verification_table else None
+        answer_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_answers'").fetchone()
+        answers = db.execute("""SELECT answer FROM application_answers WHERE user_id=? AND resume_id=?
+            AND question_key='technical_skills' AND confirmed=1 AND sensitive=0 AND revoked_at IS NULL""", (USER,resume["id"])).fetchall() if resume and answer_table else []
+    skills = []
+    if verification:
+        try:
+            from candidate_verification import verified_values_from_json
+            values = verified_values_from_json(verification["values_json"])
+            flags = json.loads(verification["confirmed_json"] or "{}")
+            for key in ("technical_skills", "skills"):
+                if flags.get(key):
+                    value = values.get(key, [])
+                    skills.extend(value if isinstance(value, list) else re.split(r"[,;\n]", str(value)))
+        except (TypeError, ValueError, RuntimeError, json.JSONDecodeError):
+            pass
+    for row in answers:
+        skills.extend(re.split(r"[,;\n]", str(row["answer"] or "")))
+    return list(dict.fromkeys(value.strip() for value in skills if isinstance(value, str) and value.strip()))
+
+
+def assess_job(job, prefs, terms, confirmed_experience_years=None):
     """Apply hard conflicts from saved settings; leave unknown facts for review."""
     title = str(job.get("title", ""))
     normalized_title = title.casefold()
@@ -343,6 +404,8 @@ def assess_job(job, prefs, terms):
     content = re.sub(r"<[^>]+>", " ", str(job.get("content") or job.get("description", ""))).casefold()
     evidence = f"{normalized_title} {location} {content}"
     review_reasons = []
+    if confirmed_experience_years is None:
+        confirmed_experience_years = prefs.get("_confirmed_experience_years")
 
     normalized = normalize_job_record(job)
     is_relevant, relevance_reason, relevance_evidence = relevance_for_job(normalized, prefs)
@@ -364,9 +427,13 @@ def assess_job(job, prefs, terms):
     if early_selected and not senior_selected:
         experience_requirements = extract_experience_requirements(content)
         for item in experience_requirements["required"]:
-            minimum_years = int(re.match(r"\d+", item["years"]).group())
-            if minimum_years >= 5:
+            minimum_years = float(re.match(r"\d+(?:\.\d+)?", item["years"]).group())
+            if confirmed_experience_years is not None and confirmed_experience_years < minimum_years:
                 return False, "experience_level", []
+            if confirmed_experience_years is None:
+                review_reasons.append(
+                    f"Posting requires at least {minimum_years:g} years of experience; confirmed professional experience is unavailable, so eligibility needs review."
+                )
 
     types = [value.casefold().replace("-", " ") for value in _strings(prefs.get("employment_types", []))]
     employment = _employment(job).replace("-", " ").replace("_", " ")
@@ -442,11 +509,19 @@ def source_application_url(value, source):
 
 
 def _employer_sources():
+    """Return only currently live-verified and healthy employer feeds.
+
+    ``next_retry_at`` schedules source revalidation after failures; a future
+    scheduled review does not invalidate an otherwise healthy verified feed.
+    """
     with database() as db:
-        rows = db.execute("SELECT * FROM employers WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
+        rows = db.execute("""SELECT * FROM employers
+            WHERE active=1 AND connector_status='healthy' AND discovery_status='verified'
+              AND last_success_at IS NOT NULL
+            ORDER BY name COLLATE NOCASE""").fetchall()
     return [EmployerSource(name=row["name"], source_type=row["source_type"], token=row["source_token"],
                            careers_url=row["careers_url"], geographic_coverage=row["geographic_coverage"])
-            for row in rows]
+            for row in rows if row["source_fingerprint"] == _source_fingerprint(dict(row))]
 
 
 def _require_local_admin(request: Request):
@@ -557,7 +632,238 @@ def _fetch_board(company, board):
     return fetch_source(EmployerSource(company, "greenhouse", board))
 
 
-def discover(prompt, prefs, run_id=None):
+def _persist_discovered_items(items, timestamp):
+    """Persist accepted source jobs before advancing a discovery checkpoint."""
+    if not items:
+        return
+    with database() as db:
+        for item in items:
+            prior=db.execute("SELECT content_fingerprint FROM discovered_openings WHERE user_id=? AND job_key=?",
+                             (USER,item["job_key"])).fetchone()
+            if prior and prior["content_fingerprint"] and prior["content_fingerprint"]!=item["content_fingerprint"]:
+                table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
+                if table:
+                    cols={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")}
+                    if "freshness_status" in cols:
+                        db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=?",
+                                   (USER,item["job_key"]))
+            db.execute("""INSERT INTO discovered_openings
+                (user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source,
+                 source_platform,source_id,country,work_arrangement,description,posting_date,last_verified_at,active,content_fingerprint,job_url,
+                 salary_json,career_category,experience_level,required_qualifications_json,preferred_qualifications_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,job_key) DO UPDATE SET
+                company=excluded.company,title=excluded.title,location=excluded.location,url=excluded.url,
+                employment_type=excluded.employment_type,location_status=excluded.location_status,location_reason=excluded.location_reason,
+                search_prompt=excluded.search_prompt,discovery_source=excluded.discovery_source,
+                source_platform=excluded.source_platform,source_id=excluded.source_id,country=excluded.country,
+                work_arrangement=excluded.work_arrangement,description=excluded.description,posting_date=excluded.posting_date,
+                last_verified_at=excluded.last_verified_at,active=excluded.active,content_fingerprint=excluded.content_fingerprint,job_url=excluded.job_url,
+                salary_json=excluded.salary_json,career_category=excluded.career_category,experience_level=excluded.experience_level,
+                required_qualifications_json=excluded.required_qualifications_json,preferred_qualifications_json=excluded.preferred_qualifications_json""",
+                (USER,item["job_key"],item["company"],item["title"],item["location"],item["url"],timestamp,
+                 item["employment_type"],item["location_status"],item["location_reason"],item["search_prompt"],item["discovery_source"],
+                 item["source_platform"],item["source_id"],item["country"],item["work_arrangement"],item["description"],item["posting_date"],
+                 item["last_verified_at"],item["active"],item["content_fingerprint"],item["job_url"],item["salary_json"],item["career_category"],
+                 item["experience_level"],item["required_qualifications_json"],item["preferred_qualifications_json"]))
+            canonical=canonicalize_job_url(item["url"])
+            db.execute("""INSERT INTO job_source_provenance(source_platform,source_job_key,canonical_url,content_fingerprint,first_seen_at,last_seen_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(source_platform,source_job_key) DO UPDATE SET canonical_url=excluded.canonical_url,
+                content_fingerprint=excluded.content_fingerprint,last_seen_at=excluded.last_seen_at""",
+                (item["source_platform"],item["job_key"],canonical,item["content_fingerprint"],timestamp,timestamp))
+
+
+def active_discovery():
+    """Return active-run health without exposing prompts or ownership tokens."""
+    stamp=datetime.now(timezone.utc).isoformat()
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        for stale in db.execute("SELECT run_id,workflow_id,owner_pid,owner_host,lease_expires_at FROM job_discovery_runs WHERE user_id=? AND status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
+                                (USER,stamp)).fetchall():
+            if stale["owner_host"]==socket.gethostname() and not _pid_is_alive(stale["owner_pid"]):
+                changed=db.execute("""UPDATE job_discovery_runs SET status='interrupted',error='worker_lease_expired',
+                    owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,updated_at=?
+                    WHERE run_id=? AND status='running' AND lease_expires_at=?""",
+                    (stamp,stale["run_id"],stale["lease_expires_at"])).rowcount
+                if changed:_pause_recovered_workflow(db,stale["workflow_id"],stamp)
+        row=db.execute("""SELECT run_id,workflow_id,status,cancel_requested,updated_at,
+            owner_pid,owner_host,heartbeat_at,lease_expires_at
+            FROM job_discovery_runs WHERE user_id=? AND status='running'
+            ORDER BY updated_at DESC LIMIT 1""",(USER,)).fetchone()
+    if not row:return None
+    item=dict(row)
+    item["ownership_state"]=("legacy_unleased" if not item["lease_expires_at"] else
+        "lease_valid" if item["lease_expires_at"]>datetime.now(timezone.utc).isoformat() else "lease_expired")
+    return item
+
+
+def _pid_is_alive(pid):
+    if not pid:return False
+    try:os.kill(int(pid),0)
+    except ProcessLookupError:return False
+    except PermissionError:return True
+    except (OSError,ValueError,TypeError):return False
+    return True
+
+
+def _lease_expiry(stamp=None):
+    base=stamp or datetime.now(timezone.utc)
+    return (base+timedelta(seconds=DISCOVERY_LEASE_SECONDS)).isoformat()
+
+
+def _pause_recovered_workflow(db,workflow_id,stamp):
+    if not workflow_id:return
+    table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_workflows'").fetchone()
+    if not table:return
+    row=db.execute("SELECT status,diagnostics_json FROM user_workflows WHERE workflow_id=? AND user_id=?",
+                   (workflow_id,USER)).fetchone()
+    if not row or row["status"] not in {"queued","running"}:return
+    try:diagnostics=json.loads(row["diagnostics_json"] or "{}")
+    except (TypeError,json.JSONDecodeError):diagnostics={}
+    diagnostics["recovery"]="Discovery worker lease expired after process exit; resume to continue from the saved checkpoint."
+    db.execute("""UPDATE user_workflows SET status='paused',current_stage='discovering',pause_requested=1,
+        diagnostics_json=?,updated_at=? WHERE workflow_id=? AND user_id=?""",
+        (json.dumps(diagnostics),stamp,workflow_id,USER))
+
+
+def _acquire_discovery_run(prompt,run_id,workflow_id=None,total_sources=0):
+    """Claim a run ID and per-user slot atomically across processes."""
+    stamp=datetime.now(timezone.utc).isoformat();token=uuid.uuid4().hex
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        run=db.execute("SELECT * FROM job_discovery_runs WHERE run_id=?",(run_id,)).fetchone()
+        if run and run["user_id"]!=USER:
+            raise HTTPException(409,"duplicate_run_id: this discovery run ID belongs to another user.")
+        if run and run["workflow_id"] and workflow_id and run["workflow_id"]!=workflow_id:
+            raise HTTPException(409,"inconsistent_association: this run ID is associated with another workflow.")
+        if run and run["status"]=="running":
+            lease=run["lease_expires_at"]
+            if lease and lease<=stamp and run["owner_host"]==socket.gethostname() and not _pid_is_alive(run["owner_pid"]):
+                changed=db.execute("""UPDATE job_discovery_runs SET status='interrupted',error='worker_lease_expired',
+                    owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,updated_at=?
+                    WHERE run_id=? AND status='running' AND lease_expires_at=?""",
+                    (stamp,run_id,lease)).rowcount
+                if changed:
+                    _pause_recovered_workflow(db,run["workflow_id"],stamp)
+                    run=db.execute("SELECT * FROM job_discovery_runs WHERE run_id=?",(run_id,)).fetchone()
+            else:
+                kind="legacy_unleased" if not lease else ("stale_lease_owner_alive" if lease<=stamp else "active_worker")
+                raise HTTPException(409,f"{kind}: the requested discovery run still has an owner; inspect or recover it.")
+        if run and run["status"] not in {"queued","interrupted"}:
+            raise HTTPException(409,"duplicate_run_id: this discovery run is already finished or cancelled.")
+        other=db.execute("SELECT * FROM job_discovery_runs WHERE user_id=? AND status='running' AND run_id<>? LIMIT 1",
+                         (USER,run_id)).fetchone()
+        if other:
+            lease=other["lease_expires_at"]
+            if lease and lease<=stamp and other["owner_host"]==socket.gethostname() and not _pid_is_alive(other["owner_pid"]):
+                changed=db.execute("""UPDATE job_discovery_runs SET status='interrupted',error='worker_lease_expired',
+                    owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,updated_at=?
+                    WHERE run_id=? AND status='running' AND lease_expires_at=?""",
+                    (stamp,other["run_id"],lease)).rowcount
+                if changed:_pause_recovered_workflow(db,other["workflow_id"],stamp)
+            else:
+                kind="legacy_unleased" if not lease else ("stale_lease_owner_alive" if lease<=stamp else "active_worker")
+                raise HTTPException(409,f"{kind}: discovery run {other['run_id'][:8]}… owns this user's active slot; inspect or recover that run.")
+        prior={}
+        if run:
+            try:prior=json.loads(run["diagnostics_json"] or "{}")
+            except (TypeError,json.JSONDecodeError):prior={}
+            db.execute("""UPDATE job_discovery_runs SET status='running',cancel_requested=0,error=NULL,
+                total_sources=?,workflow_id=CASE WHEN workflow_id='' THEN ? ELSE workflow_id END,owner_token=?,owner_pid=?,
+                owner_host=?,heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE run_id=? AND user_id=?""",
+                (total_sources,workflow_id or "",token,os.getpid(),socket.gethostname(),stamp,_lease_expiry(),stamp,run_id,USER))
+        else:
+            db.execute("""INSERT INTO job_discovery_runs(run_id,user_id,prompt,status,total_sources,workflow_id,
+                owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES(?,?,?,'running',?,?,?,?,?,?,?,?,?)""",
+                (run_id,USER,str(prompt or "")[:1500],total_sources,workflow_id or "",token,os.getpid(),socket.gethostname(),stamp,
+                 _lease_expiry(),stamp,stamp))
+    return token,prior
+
+
+def _heartbeat_discovery(run_id,token,stop):
+    while not stop.wait(DISCOVERY_HEARTBEAT_SECONDS):
+        stamp=datetime.now(timezone.utc).isoformat()
+        try:
+            with database() as db:
+                changed=db.execute("""UPDATE job_discovery_runs SET heartbeat_at=?,lease_expires_at=?,updated_at=?
+                    WHERE run_id=? AND user_id=? AND status='running' AND owner_token=?""",
+                    (stamp,_lease_expiry(),stamp,run_id,USER,token)).rowcount
+            if not changed:return
+        except sqlite3.Error:
+            logger.exception("Discovery lease renewal failed for run %s",run_id[:8])
+
+
+def _finish_discovery_ownership(run_id,token,*,interrupted=False,error=None):
+    stamp=datetime.now(timezone.utc).isoformat()
+    with database() as db:
+        db.execute("""UPDATE job_discovery_runs SET status=CASE WHEN ? THEN 'interrupted' ELSE status END,
+            error=CASE WHEN ? THEN ? ELSE error END,owner_token='',owner_pid=NULL,owner_host='',
+            heartbeat_at=NULL,lease_expires_at=NULL,updated_at=? WHERE run_id=? AND user_id=? AND owner_token=?""",
+            (int(interrupted),int(interrupted),error,stamp,run_id,USER,token))
+
+
+def recover_abandoned_discovery(run_id,confirmed_abandoned=False):
+    """Explicitly recover an unowned/expired run while preserving its history."""
+    if not confirmed_abandoned:
+        raise HTTPException(422,"Confirm that the discovery worker is abandoned before recovery.")
+    now_dt=datetime.now(timezone.utc);stamp=now_dt.isoformat()
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row=db.execute("SELECT * FROM job_discovery_runs WHERE run_id=? AND user_id=?",(run_id,USER)).fetchone()
+        if not row:raise HTTPException(404,"Discovery run not found.")
+        if row["status"]!="running":
+            return {"run_id":run_id,"status":row["status"],"recovered":False,
+                    "sources_checked":row["sources_checked"],"postings_retrieved":row["postings_retrieved"]}
+        try:last_update=datetime.fromisoformat(row["updated_at"])
+        except (TypeError,ValueError):last_update=now_dt
+        if last_update.tzinfo is None:last_update=last_update.replace(tzinfo=timezone.utc)
+        age=(now_dt-last_update).total_seconds()
+        lease=row["lease_expires_at"]
+        if lease and lease>stamp:
+            raise HTTPException(409,"active_worker: the discovery worker's lease is still valid.")
+        if not lease and row["owner_pid"] and row["owner_host"]==socket.gethostname() and _pid_is_alive(row["owner_pid"]):
+            raise HTTPException(409,"inconsistent_ownership: a worker process is recorded without a lease; inspect the server before recovery.")
+        if age<120:
+            raise HTTPException(409,"stale_lease: wait until the run has been unchanged for at least two minutes before confirming recovery.")
+        workflow_id=row["workflow_id"]
+        if workflow_id:
+            tables=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_workflows'").fetchone()
+            if tables:
+                wf=db.execute("SELECT status,current_stage FROM user_workflows WHERE workflow_id=? AND user_id=?",
+                              (workflow_id,USER)).fetchone()
+                if wf and wf["status"] in {"queued","running"} and wf["current_stage"]!="discovering":
+                    raise HTTPException(409,"inconsistent_workflow: the associated workflow is active outside discovery; inspect it before recovery.")
+        changed=db.execute("""UPDATE job_discovery_runs SET status='interrupted',error='abandoned_run_recovered',
+            owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,updated_at=?
+            WHERE run_id=? AND user_id=? AND status='running'""",(stamp,run_id,USER)).rowcount
+        if changed and workflow_id:
+            tables=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_workflows'").fetchone()
+            if tables:
+                wf=db.execute("SELECT diagnostics_json,status FROM user_workflows WHERE workflow_id=? AND user_id=?",
+                              (workflow_id,USER)).fetchone()
+                if wf and wf["status"] in {"queued","running","paused"}:
+                    try:diagnostics=json.loads(wf["diagnostics_json"] or "{}")
+                    except (TypeError,json.JSONDecodeError):diagnostics={}
+                    diagnostics["recovery"]="Abandoned discovery lease recovered; resume this workflow to continue from its checkpoint."
+                    db.execute("""UPDATE user_workflows SET status='paused',current_stage='discovering',pause_requested=1,
+                        diagnostics_json=?,updated_at=? WHERE workflow_id=? AND user_id=?""",
+                        (json.dumps(diagnostics),stamp,workflow_id,USER))
+    return {"run_id":run_id,"status":"interrupted","recovered":bool(changed),
+            "sources_checked":row["sources_checked"],"postings_retrieved":row["postings_retrieved"]}
+
+
+def discover(prompt, prefs, run_id=None, workflow_id=None):
+    """Serialize local feed runs and make unexpected interruption resumable."""
+    if not _DISCOVERY_LOCK.acquire(blocking=False):
+        raise HTTPException(409,"Another employer search is still running. Wait for its checkpoint or cancel it before starting another.")
+    run_id=run_id or str(uuid.uuid4())
+    try:
+        return _discover(prompt,prefs,run_id,workflow_id)
+    finally:
+        _DISCOVERY_LOCK.release()
+
+
+def _discover(prompt, prefs, run_id, workflow_id=None):
     prefs = infer_prompt_preferences(prompt, prefs)
     terms = search_terms(prompt, prefs)
     if not terms:
@@ -566,14 +872,26 @@ def discover(prompt, prefs, run_id=None):
     sources = _employer_sources()
     with database() as db:
         configured_employers = db.execute("SELECT COUNT(DISTINCT lower(trim(name))) FROM employers").fetchone()[0]
-    run_id = run_id or str(uuid.uuid4())
     started_at = datetime.now(timezone.utc).isoformat()
-    with database() as db:
-        try:
-            db.execute("INSERT INTO job_discovery_runs(run_id,user_id,prompt,status,total_sources,created_at,updated_at) VALUES(?,?,?,'running',?,?,?)",
-                       (run_id,USER,str(prompt or "")[:1500],len(sources),started_at,started_at))
-        except sqlite3.IntegrityError as error:
-            raise HTTPException(409,"A discovery run is already active for this user, or the requested run ID was already used.") from error
+    token,prior_diagnostics=_acquire_discovery_run(prompt,run_id,workflow_id,len(sources))
+    stop=threading.Event()
+    heartbeat=threading.Thread(target=_heartbeat_discovery,args=(run_id,token,stop),daemon=True)
+    heartbeat.start()
+    try:
+        return _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior_diagnostics,started_at,token)
+    except Exception as error:
+        _finish_discovery_ownership(run_id,token,interrupted=True,
+            error=f"{type(error).__name__} during discovery; resume from the last saved checkpoint.")
+        raise
+    finally:
+        stop.set();heartbeat.join(timeout=2)
+        _finish_discovery_ownership(run_id,token)
+
+
+def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior_diagnostics,started_at,owner_token):
+    confirmed_experience_years = _confirmed_professional_experience_years()
+    confirmed_skills = _confirmed_candidate_skills()
+    prefs = {**prefs, "_confirmed_experience_years": confirmed_experience_years}
     diagnostics = {
         "employers_configured": configured_employers, "companies_checked": 0,
         "sources_checked": 0, "source_platforms": [], "postings_retrieved": 0,
@@ -588,154 +906,257 @@ def discover(prompt, prefs, run_id=None):
             "location", "work_arrangement", "instructions", "invalid_application_url",
         )},
         "preliminary_matches": 0, "needs_review": 0, "feed_failures": [],
+        "completed_sources": [], "found_job_keys": [], "checked_sources": [], "source_stats": {},
+        "current_source": None, "last_successful_checkpoint": None,
     }
+    # A workflow resume reuses its run ID. Restore cumulative counters and skip
+    # feeds that were fully checkpointed before an interruption.
+    has_source_checkpoints="completed_sources" in prior_diagnostics
+    if has_source_checkpoints:
+        for key,value in prior_diagnostics.items():
+            if key in diagnostics:
+                diagnostics[key]=value
     found = []
+    completed_sources=set(diagnostics.get("completed_sources") or [])
+    checked_sources=set(diagnostics.get("checked_sources") or [])
+    source_stats=diagnostics.get("source_stats") if isinstance(diagnostics.get("source_stats"),dict) else {}
+    diagnostics["source_stats"]=source_stats
     seen_urls = set()
+    saved_keys=list(dict.fromkeys(diagnostics.get("found_job_keys") or []))
+    if saved_keys:
+        placeholders=",".join("?" for _ in saved_keys)
+        with database() as db:
+            saved=db.execute(f"SELECT * FROM discovered_openings WHERE user_id=? AND job_key IN ({placeholders})",
+                             (USER,*saved_keys)).fetchall()
+        for row in saved:
+            item=dict(row)
+            item.update(review_status="needs_review",review_reasons=["Verify job details and eligibility before applying."])
+            found.append(item)
+            seen_urls.add(canonicalize_job_url(item["url"]))
     timestamp = datetime.now(timezone.utc).isoformat()
     for source in sources:
+        source_key=f"{source.source_type}:{source.token}"
+        if source_key in completed_sources:
+            continue
+        # A source that failed during an earlier partial run is retried. Replace
+        # its prior counter contribution so resumed diagnostics remain totals
+        # over distinct sources rather than repeated attempts.
+        prior_stats=source_stats.get(source_key,{})
+        for key,value in prior_stats.items():
+            if key=="rejected_by_filter" and isinstance(value,dict):
+                for reason,count in value.items():diagnostics["rejected_by_filter"][reason]=max(0,diagnostics["rejected_by_filter"].get(reason,0)-int(count or 0))
+            elif key in diagnostics and isinstance(diagnostics[key],int):
+                diagnostics[key]=max(0,diagnostics[key]-int(value or 0))
+        diagnostics["feed_failures"]=[failure for failure in diagnostics["feed_failures"] if failure.get("source_key")!=source_key]
+        baseline={key:value for key,value in diagnostics.items() if isinstance(value,int)}
+        baseline_rejected=dict(diagnostics["rejected_by_filter"])
         with database() as db:
             run = db.execute("SELECT cancel_requested FROM job_discovery_runs WHERE run_id=? AND user_id=?",(run_id,USER)).fetchone()
         if run and run["cancel_requested"]:
             break
-        diagnostics["sources_checked"] += 1
-        diagnostics["companies_checked"] += 1
-        if source.source_type not in diagnostics["source_platforms"]:
-            diagnostics["source_platforms"].append(source.source_type)
-        if source.source_type == "greenhouse":
-            board_jobs, error = fetch_board(source.name, source.token)
-        else:
-            board_jobs, error = fetch_source(source)
-        if error:
-            diagnostics["feed_failures"].append({"company": source.name, "source_platform": source.source_type, "reason": error})
+        source_found_start=len(found)
+        source_stage="feed_fetch"
+        source_success=False
+        try:
+            checked_sources.add(source_key)
+            diagnostics["checked_sources"]=sorted(checked_sources)
+            diagnostics["sources_checked"]=len(checked_sources)
+            diagnostics["companies_checked"] += 1
+            diagnostics["current_source"]={"company":source.name,"provider":source.source_type,"stage":"feed_fetch"}
             with database() as db:
-                stamp = datetime.now(timezone.utc).isoformat()
-                db.execute("UPDATE employers SET last_attempt_at=?,connector_status=?,error_details=?,updated_at=? WHERE source_type=? AND source_token=?",
-                           (stamp,_source_health(error),error[:500],stamp,source.source_type,source.token))
-                db.execute("UPDATE job_discovery_runs SET sources_checked=?,postings_retrieved=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
-                           (diagnostics["sources_checked"],diagnostics["postings_retrieved"],json.dumps(diagnostics),stamp,run_id,USER))
-            if not isinstance(board_jobs,list) or not board_jobs:
-                continue
-        if not isinstance(board_jobs, list):
-            diagnostics["feed_failures"].append({"company": source.name, "source_platform": source.source_type, "reason": "Malformed response: jobs was not a list."})
-            continue
-        if not error and source.source_type in {"greenhouse", "lever", "ashby", "career_page"}:
-            present = {}
-            for raw in board_jobs:
-                if isinstance(raw, dict):
-                    try:
-                        normalized=normalize_job(source.source_type,source,raw)
-                        present[normalized["job_key"]]=bool(normalized["active"])
-                    except (TypeError,ValueError):
-                        continue
-            prefix=f"{source.source_type}:{source.token}:%"
-            with database() as db:
-                db.execute("UPDATE discovered_openings SET active=0 WHERE source_platform=? AND job_key LIKE ?",
-                           (source.source_type,prefix))
-                for known_key,is_active in present.items():
-                    db.execute("UPDATE discovered_openings SET active=? WHERE user_id=? AND source_platform=? AND job_key=?",
-                               (int(is_active),USER,source.source_type,known_key))
-        if not error:
-            stamp = datetime.now(timezone.utc).isoformat()
-            with database() as db:
-                db.execute("UPDATE employers SET last_attempt_at=?,last_success_at=?,connector_status='healthy',error_details='',updated_at=? WHERE source_type=? AND source_token=?",
-                           (stamp,stamp,stamp,source.source_type,source.token))
-        diagnostics["postings_retrieved"] += len(board_jobs)
-        for raw_job in board_jobs:
-            if not isinstance(raw_job, dict):
-                diagnostics["rejected_by_filter"]["invalid_posting"] += 1
-                continue
-            try:
-                record = normalize_job(source.source_type, source, raw_job)
-            except (TypeError, ValueError):
-                diagnostics["rejected_by_filter"]["invalid_posting"] += 1
-                continue
-            with database() as db:
-                prior=db.execute("SELECT content_fingerprint FROM discovered_openings WHERE user_id=? AND job_key=?",
-                                 (USER,record["job_key"])).fetchone()
-                if prior:
-                    diagnostics["previously_seen_jobs"] += 1
-                else:
-                    diagnostics["new_jobs"] += 1
-                if prior:
-                    changed=bool(prior["content_fingerprint"] and prior["content_fingerprint"]!=record["content_fingerprint"])
-                    db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,description=?,
-                        country=?,work_arrangement=?,posting_date=?,last_verified_at=?,active=?,content_fingerprint=?,job_url=?,salary_json=?
-                        WHERE user_id=? AND job_key=?""",
-                        (source.name,record["title"],record["location"] or "Unspecified",record["application_url"],record["employment_type"],
-                         record["description"],record["country"],record["work_arrangement"],record["posting_date"],record["last_verified_at"],
-                         int(record["active"]),record["content_fingerprint"],record["job_url"],json.dumps(record["salary"]) if record["salary"] is not None else None,USER,record["job_key"]))
-                    if changed:
-                        table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
-                        if table:
-                            cols={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")}
-                            if "freshness_status" in cols:
-                                db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=?",(USER,record["job_key"]))
-            if not record["active"]:
-                diagnostics["expired_or_removed"] += 1
-                continue
-            job = _legacy_job(record)
-            normalized_job = normalize_job_record(job, source.source_type, source.name, record["job_key"])
-            relevant, _, relevance_evidence = relevance_for_job(normalized_job, prefs, prompt)
-            if not relevant:
-                diagnostics["rejected_by_filter"]["role"] += 1
-                diagnostics["rejected_unrelated"] += 1
-                continue
-            diagnostics["relevant_jobs"] += 1
-            accepted, reason, review_reasons = assess_job(job, prefs, terms)
-            if not accepted:
-                diagnostics["rejected_by_filter"][reason] += 1
-                if reason == "location":
-                    diagnostics["geographic_mismatches"] += 1
-                if reason == "experience_level":
-                    diagnostics["experience_mismatches"] += 1
-                continue
-            geo_status, geo_reason = evaluate_location(job, prefs.get("location", ""))
-            if geo_status == "unknown":
-                diagnostics["location_needs_review"] += 1
-            url = source_application_url(record["application_url"], source)
-            if not url:
-                diagnostics["rejected_by_filter"]["invalid_application_url"] += 1
-                continue
-            location = _job_location(job) or "Unspecified"
-            employment_type = _employment(job)
-            canonical = canonicalize_job_url(url)
-            if canonical in seen_urls:
-                diagnostics["duplicate_listings_removed"] += 1
-                # Retain source provenance without deleting or rewriting the
-                # source-specific saved opening.
+                db.execute("UPDATE job_discovery_runs SET sources_checked=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
+                           (diagnostics["sources_checked"],json.dumps(diagnostics),datetime.now(timezone.utc).isoformat(),run_id,USER))
+            if source.source_type not in diagnostics["source_platforms"]:
+                diagnostics["source_platforms"].append(source.source_type)
+            source_stage="feed_fetch"
+            if source.source_type == "greenhouse":
+                board_jobs, error = fetch_board(source.name, source.token)
+            else:
+                board_jobs, error = fetch_source(source)
+            source_stage="feed_postprocessing"
+            if error:
+                diagnostics["feed_failures"].append({"company": source.name, "source_platform": source.source_type,
+                    "stage":"feed_fetch","reason":error,"source_key":source_key})
                 with database() as db:
-                    db.execute("INSERT OR IGNORE INTO job_source_provenance(source_platform,source_job_key,canonical_url,content_fingerprint,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?)",
-                               (source.source_type, record["job_key"], canonical, record["content_fingerprint"], timestamp, timestamp))
-                continue
-            with database() as db:
-                primary_source = db.execute("SELECT source_job_key FROM job_source_provenance WHERE canonical_url=? ORDER BY first_seen_at,source_platform LIMIT 1",
-                                            (canonical,)).fetchone()
-                if primary_source and primary_source["source_job_key"] != record["job_key"]:
-                    diagnostics["duplicate_listings_removed"] += 1
-                    db.execute("INSERT OR IGNORE INTO job_source_provenance(source_platform,source_job_key,canonical_url,content_fingerprint,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?)",
-                               (source.source_type, record["job_key"], canonical, record["content_fingerprint"], timestamp, timestamp))
+                    stamp = datetime.now(timezone.utc).isoformat()
+                    db.execute("UPDATE employers SET last_attempt_at=?,connector_status=?,error_details=?,updated_at=? WHERE source_type=? AND source_token=?",
+                               (stamp,_source_health(error),error[:500],stamp,source.source_type,source.token))
+                    current=db.execute("SELECT consecutive_failures FROM employers WHERE source_type=? AND source_token=?",
+                                       (source.source_type,source.token)).fetchone()
+                    failures=(int(current[0] or 0)+1) if current else 1
+                    state=_source_health(error)
+                    retry=_next_source_retry(state,error,failures)
+                    db.execute("UPDATE employers SET consecutive_failures=?,next_retry_at=? WHERE source_type=? AND source_token=?",
+                               (failures,retry,source.source_type,source.token))
+                    db.execute("UPDATE job_discovery_runs SET sources_checked=?,postings_retrieved=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
+                               (diagnostics["sources_checked"],diagnostics["postings_retrieved"],json.dumps(diagnostics),stamp,run_id,USER))
+                if not isinstance(board_jobs,list) or not board_jobs:
                     continue
-            seen_urls.add(canonical)
-            found.append({
-                "job_key": record["job_key"], "company": source.name,
-                "title": job["title"], "location": location, "url": url,
-                "employment_type": employment_type, "location_status": geo_status,
-                "location_reason": geo_reason, "search_prompt": str(prompt or "")[:1500],
-                "review_status": "needs_review",
-                "review_reasons": review_reasons or ["Verify job details and eligibility before applying."],
-                "discovery_source": "Company Careers Page",
-                "source_platform": source.source_type, "source_id": record["source_id"],
-                "country": record["country"], "work_arrangement": record["work_arrangement"],
-                "description": record["description"], "posting_date": record["posting_date"],
-                "last_verified_at": record["last_verified_at"], "active": 1,
-                "content_fingerprint": record["content_fingerprint"], "job_url": record["job_url"],
-                "salary_json":json.dumps(record["salary"]) if record["salary"] is not None else None,
-                "career_category":record["career_category"],"experience_level":record["experience_level"],
-                "required_qualifications_json":None,"preferred_qualifications_json":None,
-            })
-        with database() as db:
-            db.execute("UPDATE job_discovery_runs SET sources_checked=?,postings_retrieved=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
-                       (diagnostics["sources_checked"],diagnostics["postings_retrieved"],json.dumps(diagnostics),datetime.now(timezone.utc).isoformat(),run_id,USER))
+            if not isinstance(board_jobs, list):
+                diagnostics["feed_failures"].append({"company": source.name, "source_platform": source.source_type,
+                    "stage":"feed_response_validation","reason": "Malformed response: jobs was not a list.","source_key":source_key})
+                continue
+            if not error and source.source_type in {"greenhouse", "lever", "ashby", "career_page"}:
+                present = {}
+                for raw in board_jobs:
+                    if isinstance(raw, dict):
+                        try:
+                            normalized=normalize_job(source.source_type,source,raw)
+                            present[normalized["job_key"]]=bool(normalized["active"])
+                        except (TypeError,ValueError):
+                            continue
+                prefix=f"{source.source_type}:{source.token}:%"
+                with database() as db:
+                    db.execute("UPDATE discovered_openings SET active=0 WHERE source_platform=? AND job_key LIKE ?",
+                               (source.source_type,prefix))
+                    for known_key,is_active in present.items():
+                        db.execute("UPDATE discovered_openings SET active=? WHERE user_id=? AND source_platform=? AND job_key=?",
+                                   (int(is_active),USER,source.source_type,known_key))
+            if not error:
+                stamp = datetime.now(timezone.utc).isoformat()
+                with database() as db:
+                    db.execute("""UPDATE employers SET last_attempt_at=?,last_success_at=?,connector_status='healthy',error_details='',
+                        consecutive_failures=0,next_retry_at=NULL,updated_at=? WHERE source_type=? AND source_token=?""",
+                               (stamp,stamp,stamp,source.source_type,source.token))
+            diagnostics["postings_retrieved"] += len(board_jobs)
+            source_stage="job_normalization_and_filtering"
+            for raw_job in board_jobs:
+                if not isinstance(raw_job, dict):
+                    diagnostics["rejected_by_filter"]["invalid_posting"] += 1
+                    continue
+                try:
+                    record = normalize_job(source.source_type, source, raw_job)
+                except (TypeError, ValueError):
+                    diagnostics["rejected_by_filter"]["invalid_posting"] += 1
+                    continue
+                with database() as db:
+                    prior=db.execute("SELECT content_fingerprint FROM discovered_openings WHERE user_id=? AND job_key=?",
+                                     (USER,record["job_key"])).fetchone()
+                    if prior:
+                        diagnostics["previously_seen_jobs"] += 1
+                    else:
+                        diagnostics["new_jobs"] += 1
+                    if prior:
+                        changed=bool(prior["content_fingerprint"] and prior["content_fingerprint"]!=record["content_fingerprint"])
+                        db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,description=?,
+                            country=?,work_arrangement=?,posting_date=?,last_verified_at=?,active=?,content_fingerprint=?,job_url=?,salary_json=?
+                            WHERE user_id=? AND job_key=?""",
+                            (source.name,record["title"],record["location"] or "Unspecified",record["application_url"],record["employment_type"],
+                             record["description"],record["country"],record["work_arrangement"],record["posting_date"],record["last_verified_at"],
+                             int(record["active"]),record["content_fingerprint"],record["job_url"],json.dumps(record["salary"]) if record["salary"] is not None else None,USER,record["job_key"]))
+                        if changed:
+                            table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
+                            if table:
+                                cols={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")}
+                                if "freshness_status" in cols:
+                                    db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=?",(USER,record["job_key"]))
+                if not record["active"]:
+                    diagnostics["expired_or_removed"] += 1
+                    continue
+                job = _legacy_job(record)
+                normalized_job = normalize_job_record(job, source.source_type, source.name, record["job_key"])
+                relevant, _, relevance_evidence = relevance_for_job(normalized_job, prefs, prompt)
+                if not relevant:
+                    diagnostics["rejected_by_filter"]["role"] += 1
+                    diagnostics["rejected_unrelated"] += 1
+                    continue
+                diagnostics["relevant_jobs"] += 1
+                accepted, reason, review_reasons = assess_job(job, prefs, terms)
+                if not accepted:
+                    diagnostics["rejected_by_filter"][reason] += 1
+                    if reason == "location":
+                        diagnostics["geographic_mismatches"] += 1
+                    if reason == "experience_level":
+                        diagnostics["experience_mismatches"] += 1
+                    continue
+                geo_status, geo_reason = evaluate_location(job, prefs.get("location", ""))
+                if geo_status == "unknown":
+                    diagnostics["location_needs_review"] += 1
+                url = source_application_url(record["application_url"], source)
+                if not url:
+                    diagnostics["rejected_by_filter"]["invalid_application_url"] += 1
+                    continue
+                location = _job_location(job) or "Unspecified"
+                employment_type = _employment(job)
+                experience_level, experience_level_evidence = classify_experience_level(
+                    job["title"], record["description"], employment_type)
+                record["experience_level"] = experience_level
+                record["career_category"] = classify_career_category(job["title"], prefs)
+                if experience_level_evidence and experience_level == "Ambiguous":
+                    review_reasons.append(experience_level_evidence[0])
+                score, ranking_explanation, _, _ = discovery_relevance_score(
+                    {**job, "title": job["title"], "description": record["description"],
+                     "employment_type": employment_type, "location_status": geo_status,
+                     "posting_date": record["posting_date"]}, prefs, confirmed_skills)
+                canonical = canonicalize_job_url(url)
+                if canonical in seen_urls:
+                    diagnostics["duplicate_listings_removed"] += 1
+                    # Retain source provenance without deleting or rewriting the
+                    # source-specific saved opening.
+                    with database() as db:
+                        db.execute("INSERT OR IGNORE INTO job_source_provenance(source_platform,source_job_key,canonical_url,content_fingerprint,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?)",
+                                   (source.source_type, record["job_key"], canonical, record["content_fingerprint"], timestamp, timestamp))
+                    continue
+                with database() as db:
+                    primary_source = db.execute("SELECT source_job_key FROM job_source_provenance WHERE canonical_url=? ORDER BY first_seen_at,source_platform LIMIT 1",
+                                                (canonical,)).fetchone()
+                    if primary_source and primary_source["source_job_key"] != record["job_key"]:
+                        diagnostics["duplicate_listings_removed"] += 1
+                        db.execute("INSERT OR IGNORE INTO job_source_provenance(source_platform,source_job_key,canonical_url,content_fingerprint,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?)",
+                                   (source.source_type, record["job_key"], canonical, record["content_fingerprint"], timestamp, timestamp))
+                        continue
+                seen_urls.add(canonical)
+                found.append({
+                    "job_key": record["job_key"], "company": source.name,
+                    "title": job["title"], "location": location, "url": url,
+                    "employment_type": employment_type, "location_status": geo_status,
+                    "location_reason": geo_reason, "search_prompt": str(prompt or "")[:1500],
+                    "review_status": "needs_review",
+                    "review_reasons": review_reasons or ["Verify job details and eligibility before applying."],
+                    "discovery_source": "Company Careers Page",
+                    "source_platform": source.source_type, "source_id": record["source_id"],
+                    "country": record["country"], "work_arrangement": record["work_arrangement"],
+                    "description": record["description"], "posting_date": record["posting_date"],
+                    "last_verified_at": record["last_verified_at"], "active": 1,
+                    "content_fingerprint": record["content_fingerprint"], "job_url": record["job_url"],
+                    "salary_json":json.dumps(record["salary"]) if record["salary"] is not None else None,
+                    "career_category":record["career_category"],"experience_level":record["experience_level"],
+                    "required_qualifications_json":None,"preferred_qualifications_json":None,
+                    "experience_level_evidence":experience_level_evidence,
+                    "graduation_windows":extract_graduation_windows(record["description"]),
+                    "education_requirements":extract_education_requirements(record["description"]),
+                    "relevance_score":score,"ranking_explanation":ranking_explanation,
+                })
+            source_stage="source_progress_persistence"
+            with database() as db:
+                db.execute("UPDATE job_discovery_runs SET sources_checked=?,postings_retrieved=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
+                           (diagnostics["sources_checked"],diagnostics["postings_retrieved"],json.dumps(diagnostics),datetime.now(timezone.utc).isoformat(),run_id,USER))
+            source_success=not bool(error)
+        except Exception as error:
+            # Employer feeds are independent. Keep the workflow moving while
+            # recording a sanitized source/phase diagnostic (never raw job text).
+            diagnostic_ref=uuid.uuid4().hex[:10]
+            logger.exception("Employer discovery source failed: company=%s provider=%s stage=%s error_type=%s diagnostic_ref=%s",
+                             source.name,source.source_type,source_stage,type(error).__name__,diagnostic_ref)
+            diagnostics["feed_failures"].append({"company":source.name,"source_platform":source.source_type,
+                "stage":source_stage,"reason":f"{type(error).__name__} during {source_stage}; backend log reference {diagnostic_ref}.",
+                "diagnostic_ref":diagnostic_ref,"source_key":source_key})
+        finally:
+            _persist_discovered_items(found[source_found_start:],timestamp)
+            if source_success:
+                completed_sources.add(source_key)
+                diagnostics["last_successful_checkpoint"]={"company":source.name,"provider":source.source_type,
+                    "at":datetime.now(timezone.utc).isoformat()}
+            diagnostics["current_source"]=None
+            source_stats[source_key]={key:max(0,diagnostics.get(key,0)-baseline.get(key,0))
+                for key in baseline if key!="sources_checked"}
+            source_stats[source_key]["rejected_by_filter"]={key:max(0,diagnostics["rejected_by_filter"].get(key,0)-baseline_rejected.get(key,0))
+                for key in diagnostics["rejected_by_filter"]}
+            diagnostics["completed_sources"]=sorted(completed_sources)
+            diagnostics["found_job_keys"]=list(dict.fromkeys(item["job_key"] for item in found))
+            with database() as db:
+                db.execute("UPDATE job_discovery_runs SET sources_checked=?,postings_retrieved=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
+                           (diagnostics["sources_checked"],diagnostics["postings_retrieved"],json.dumps(diagnostics),datetime.now(timezone.utc).isoformat(),run_id,USER))
 
     diagnostics["preliminary_matches"] = len(found)
     diagnostics["needs_review"] = len(found)
@@ -750,8 +1171,9 @@ def discover(prompt, prefs, run_id=None):
         status = "filters_too_restrictive"
     with database() as db:
         cancelled=db.execute("SELECT cancel_requested FROM job_discovery_runs WHERE run_id=? AND user_id=?",(run_id,USER)).fetchone()
+        cancel_reason=db.execute("SELECT error FROM job_discovery_runs WHERE run_id=? AND user_id=?",(run_id,USER)).fetchone()
     if cancelled and cancelled["cancel_requested"]:
-        status="cancelled"
+        status="interrupted" if cancel_reason and cancel_reason["error"]=="pause_requested" else "cancelled"
 
     timestamp = datetime.now(timezone.utc).isoformat()
     with database() as db:
@@ -794,18 +1216,35 @@ def discover(prompt, prefs, run_id=None):
             stored = {row["job_key"]: dict(row) for row in rows}
 
     results = []
+    ranking_skills = _confirmed_candidate_skills()
     for item in found:
         if item["job_key"] not in stored: continue
         result={**stored[item["job_key"]],"review_status":item["review_status"],"review_reasons":item["review_reasons"]}
+        score, ranking_explanation, experience_level, level_evidence = discovery_relevance_score(result, prefs, ranking_skills)
+        result.update(experience_level=result.get("experience_level") or experience_level,
+                      career_category=result.get("career_category") or classify_career_category(result.get("title"), prefs),
+                      relevance_score=item.get("relevance_score",score),
+                      ranking_explanation=item.get("ranking_explanation",ranking_explanation),
+                      experience_level_evidence=item.get("experience_level_evidence",level_evidence),
+                      graduation_windows=item.get("graduation_windows",extract_graduation_windows(result.get("description"))),
+                      education_requirements=item.get("education_requirements",extract_education_requirements(result.get("description"))))
         for field in ("salary_json","required_qualifications_json","preferred_qualifications_json"):
             raw=result.pop(field,None)
             try: result[field.removesuffix("_json")]=json.loads(raw) if raw else None
             except (TypeError,json.JSONDecodeError): result[field.removesuffix("_json")]=None
         results.append(result)
+    results.sort(key=lambda item: (-int(item.get("relevance_score", 50)),
+                                   str(item.get("posting_date") or ""),
+                                   str(item.get("company") or "").casefold()))
+    diagnostics["genuine_early_career_candidates"] = sum(
+        item.get("experience_level") in {"New Graduate", "Early Career", "Internship", "Graduate Eligible"}
+        for item in results)
+    diagnostics["experience_level_needs_review"] = sum(
+        item.get("experience_level") in {"Ambiguous", "Mid-Level"} for item in results)
     diagnostics["jobs_requiring_analysis"] = len(results)
     warnings = [f"Some sources were unavailable; results cover only feeds that responded ({len(diagnostics['feed_failures'])}/{len(sources)} failed)."
                 for _ in [0] if diagnostics["feed_failures"] and not all_failed]
-    final_state="cancelled" if status=="cancelled" else "completed"
+    final_state=status if status in {"cancelled","interrupted"} else "completed"
     with database() as db:
         db.execute("UPDATE job_discovery_runs SET status=?,sources_checked=?,postings_retrieved=?,diagnostics_json=?,updated_at=? WHERE run_id=? AND user_id=?",
                    (final_state,diagnostics["sources_checked"],diagnostics["postings_retrieved"],json.dumps(diagnostics),datetime.now(timezone.utc).isoformat(),run_id,USER))
@@ -854,13 +1293,24 @@ def discovery_progress(run_id: str):
 @router.post("/api/jobs/discovery/{run_id}/cancel")
 def cancel_discovery(run_id: str):
     with database() as db:
-        cursor=db.execute("UPDATE job_discovery_runs SET cancel_requested=1,updated_at=? WHERE user_id=? AND run_id=? AND status='running'",
+        cursor=db.execute("UPDATE job_discovery_runs SET cancel_requested=1,error='cancel_requested',updated_at=? WHERE user_id=? AND run_id=? AND status='running'",
                           (datetime.now(timezone.utc).isoformat(),USER,run_id))
         if not cursor.rowcount:
             row=db.execute("SELECT status FROM job_discovery_runs WHERE user_id=? AND run_id=?",(USER,run_id)).fetchone()
             if not row: raise HTTPException(404,"Discovery run not found.")
             return {"cancel_requested":False,"status":row["status"]}
     return {"cancel_requested":True,"status":"cancelling"}
+
+
+def pause_discovery(run_id):
+    """Stop at the next source boundary while retaining a resumable run ID."""
+    with database() as db:
+        cursor=db.execute("UPDATE job_discovery_runs SET cancel_requested=1,error='pause_requested',updated_at=? WHERE user_id=? AND run_id=? AND status='running'",
+                          (datetime.now(timezone.utc).isoformat(),USER,run_id))
+        if not cursor.rowcount:
+            row=db.execute("SELECT status FROM job_discovery_runs WHERE user_id=? AND run_id=?",(USER,run_id)).fetchone()
+            return {"cancel_requested":False,"status":row["status"] if row else "not_found"}
+    return {"cancel_requested":True,"status":"pausing"}
 
 
 @router.get("/api/jobs/saved")
@@ -1354,7 +1804,7 @@ function renderJobs(){
       (!employment||(job.employment_type||'Unknown')===employment)&&(!source||(job.source_platform||'Unknown')===source)&&
       (!recency||(job.posting_date&&((Date.now()-Date.parse(job.posting_date))/(86400000)<=recency)));
   });
-  for(const job of visible){const article=document.createElement('article');article.className='job';const title=document.createElement('h3');title.textContent=job.title;const locationLabel=job.location_status==='eligible'?'location verified':job.location_status==='unknown'?'location needs review':job.location_status||'location needs review';const detail=document.createElement('p');detail.textContent=`${job.company} · ${job.location||'Location unknown'} · ${job.employment_type||'Employment type unknown'} · ${locationLabel} · ${job.source_platform||'source unknown'} · Preliminary`;const why=document.createElement('p');why.className='note';why.textContent=[...new Set([...(job.review_reasons||[]),job.location_reason||''].filter(Boolean))].join(' ');const link=document.createElement('a');link.href=job.job_url||job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='View original posting';const apply=document.createElement('a');apply.href=job.url;apply.target='_blank';apply.rel='noopener noreferrer';apply.textContent='Application page';apply.style.marginLeft='14px';article.append(title,detail,why,link,apply);results.append(article)}
+  for(const job of visible){const article=document.createElement('article');article.className='job';const title=document.createElement('h3');title.textContent=job.title;const locationLabel=job.location_status==='eligible'?'location verified':job.location_status==='unknown'?'location needs review':job.location_status||'location needs review';const detail=document.createElement('p');detail.textContent=`${job.company} · ${job.location||'Location unknown'} · ${job.employment_type||'Employment type unknown'} · ${locationLabel} · ${job.source_platform||'source unknown'} · Preliminary`;const level=document.createElement('p');level.className='note';level.textContent=`Experience level: ${job.experience_level||'Ambiguous'} · relevance rank ${job.relevance_score??'—'}/100. ${[...(job.experience_level_evidence||[]),...(job.ranking_explanation||[])].join(' ')}`;const why=document.createElement('p');why.className='note';why.textContent=[...new Set([...(job.review_reasons||[]),job.location_reason||''].filter(Boolean))].join(' ');const windows=document.createElement('p');windows.className='note';windows.textContent=(job.graduation_windows||[]).map(x=>`Graduation eligibility: ${x.start_year}${x.start_year===x.end_year?'':`–${x.end_year}`}`).join(' · ');const education=job.education_requirements||{},educationLine=[...(education.required||[]).map(x=>'Required: '+x),...(education.preferred||[]).map(x=>'Preferred: '+x),...(education.unclear||[]).map(x=>'Unclear: '+x)];const educationNote=document.createElement('p');educationNote.className='note';educationNote.textContent=educationLine.length?'Education evidence: '+educationLine.join(' · '):'';const link=document.createElement('a');link.href=job.job_url||job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='View original posting';const apply=document.createElement('a');apply.href=job.url;apply.target='_blank';apply.rel='noopener noreferrer';apply.textContent='Application page';apply.style.marginLeft='14px';article.append(title,detail,level,why);if(windows.textContent)article.append(windows);if(educationNote.textContent)article.append(educationNote);article.append(link,apply);results.append(article)}
   if(!visible.length&&currentJobs.length)results.textContent='No openings match these filters.';
 }
 for(const id of ['filterText','filterCompany','filterCategory','filterLocation','filterExperience','filterArrangement','filterEmployment','filterSource','filterRecency'])document.getElementById(id).addEventListener('input',renderJobs);
@@ -1370,7 +1820,7 @@ button.addEventListener('click',async()=>{
     const messages={cancelled:'Discovery cancelled safely; completed source results were retained.',all_sources_unavailable:'All configured job sources are unavailable.',no_matching_openings:'No matching openings were returned by the available sources.',filters_too_restrictive:'Openings were retrieved, but the current filters rejected them.',preliminary_matches:`${data.count} preliminary match${data.count===1?'':'es'} need review.`};
     status.textContent=messages[data.status]||'Search complete.';
     const d=data.diagnostics;
-    if(d){const p=document.createElement('p');p.className='diagnostics';p.textContent=`Employers configured: ${d.employers_configured??'—'} · Employers checked: ${d.companies_checked} · Sources: ${(d.source_platforms||[]).join(', ')||'none'} · Jobs discovered: ${d.postings_retrieved} · New: ${d.new_jobs??'—'} · Previously seen: ${d.previously_seen_jobs??'—'} · Relevant roles: ${d.relevant_jobs??d.preliminary_matches} · Duplicates removed: ${d.duplicate_listings_removed??0} · Expired postings: ${d.expired_or_removed??0} · Unrelated excluded: ${d.rejected_unrelated??d.rejected_by_filter.role} · Geographic mismatches: ${d.geographic_mismatches??d.rejected_by_filter.location} · Experience mismatches: ${d.experience_mismatches??d.rejected_by_filter.experience_level} · Location needs review: ${d.location_needs_review??0} · Preliminary matches: ${d.preliminary_matches} · Needs review: ${d.needs_review}`;diagnostics.append(p);for(const failure of d.feed_failures){const f=document.createElement('p');f.className='note';f.textContent=`${failure.company} (${failure.source_platform||'source'}): ${failure.reason}`;diagnostics.append(f)}}
+    if(d){const p=document.createElement('p');p.className='diagnostics';p.textContent=`Employers configured: ${d.employers_configured??'—'} · Employers checked: ${d.companies_checked} · Sources: ${(d.source_platforms||[]).join(', ')||'none'} · Jobs discovered: ${d.postings_retrieved} · New: ${d.new_jobs??'—'} · Previously seen: ${d.previously_seen_jobs??'—'} · Relevant roles: ${d.relevant_jobs??d.preliminary_matches} · Genuine early-career candidates: ${d.genuine_early_career_candidates??0} · Experience level needs review: ${d.experience_level_needs_review??0} · Duplicates removed: ${d.duplicate_listings_removed??0} · Expired postings: ${d.expired_or_removed??0} · Unrelated excluded: ${d.rejected_unrelated??d.rejected_by_filter.role} · Geographic mismatches: ${d.geographic_mismatches??d.rejected_by_filter.location} · Confirmed experience mismatches: ${d.experience_mismatches??d.rejected_by_filter.experience_level} · Location needs review: ${d.location_needs_review??0} · Preliminary matches: ${d.preliminary_matches} · Needs review: ${d.needs_review}`;diagnostics.append(p);for(const failure of d.feed_failures){const f=document.createElement('p');f.className='note';f.textContent=`${failure.company} (${failure.source_platform||'source'}): ${failure.reason}`;diagnostics.append(f)}}
     for(const warning of data.feed_warnings||[]){const p=document.createElement('p');p.className='note';p.textContent=warning;diagnostics.append(p)}
     currentJobs=data.results||[];for(const job of currentJobs)currentJobKeys.push(job.job_key);
     document.getElementById('jobFilters').hidden=!currentJobs.length;

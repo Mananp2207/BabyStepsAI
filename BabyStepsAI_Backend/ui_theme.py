@@ -19,7 +19,7 @@ html[data-bsa-theme="dark"] a{color:var(--bsa-link)!important}html[data-bsa-them
     links = ("<nav class=\"bsa-global-nav\" aria-label=\"Main navigation\">"
              "<a href=\"/\">Dashboard</a><a href=\"/#upload\">My Resume</a>"
              "<a href=\"/candidate-profile\">Candidate Profile</a><a href=\"/careers\">Career Preferences</a>"
-             "<a href=\"/find-jobs\">Find Jobs</a><a href=\"/applications\">Applications</a>"
+             "<a href=\"/find-jobs\">Find Jobs</a><a href=\"/workflow\">Job Search Workflow</a><a href=\"/applications\">Applications</a>"
              "<a href=\"/application-settings\">Settings</a><button class=\"bsa-theme-toggle\" type=\"button\">Dark mode</button></nav>")
     existing_nav = re.compile(r"<nav\b[^>]*>.*?</nav>", re.I | re.S)
     if existing_nav.search(document):

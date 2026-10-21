@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -14,6 +15,8 @@ from job_search_agent import USER
 class CandidateVerificationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.old_key_path = os.environ.get("BABYSTEPSAI_KEY_PATH")
+        os.environ["BABYSTEPSAI_KEY_PATH"] = str(Path(self.temp.name) / "encryption.key")
         self.db = Path(self.temp.name) / "test.db"
         self.old_db = profile.DB
         profile.DB = self.db
@@ -26,6 +29,8 @@ class CandidateVerificationTests(unittest.TestCase):
 
     def tearDown(self):
         profile.DB = self.old_db
+        if self.old_key_path is None: os.environ.pop("BABYSTEPSAI_KEY_PATH", None)
+        else: os.environ["BABYSTEPSAI_KEY_PATH"] = self.old_key_path
         self.temp.cleanup()
 
     def test_resume_facts_are_suggestions_until_each_field_is_confirmed(self):
@@ -47,6 +52,14 @@ class CandidateVerificationTests(unittest.TestCase):
         self.assertEqual(facts["technical_skills"], ["Python", "SQL"])
         self.assertNotIn("work_authorization", facts)
         self.assertNotIn("work_authorization", answers)
+
+    def test_sensitive_answers_are_ciphertext_at_rest_and_not_echoed_in_answer_list(self):
+        profile.update_verification(profile.VerificationUpdate(values={"work_authorization":"United States"},confirmed_fields=["work_authorization"]))
+        with profile.connect() as db:
+            row=db.execute("SELECT answer,answer_encrypted FROM application_answers WHERE question_key='work_authorization'").fetchone()
+        self.assertEqual(row["answer"],"");self.assertTrue(row["answer_encrypted"])
+        visible=next(item for item in profile.list_answers() if item["key"]=="work_authorization")
+        self.assertEqual(visible["answer"],"");self.assertTrue(visible["sensitive"])
 
     def test_graduation_month_year_saves_loads_changes_and_can_be_cleared(self):
         profile.update_verification(profile.VerificationUpdate(

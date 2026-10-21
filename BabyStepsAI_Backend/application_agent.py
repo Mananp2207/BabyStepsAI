@@ -19,7 +19,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from job_search_agent import USER, DB as JOB_DB, fetch_board
-from candidate_verification import verified_profile_facts, save_application_answer, AnswerUpdate
+from candidate_verification import (verified_profile_facts, save_application_answer, AnswerUpdate,
+                                    verified_values_from_json, _answer_plaintext)
 from application_browser import apply_targets, classify_control, page_interruption, submission_controls
 from application_answer_assistant import get_authorization, generate_draft, draft_safe_profile, ORDINARY_PROMPT, SENSITIVE_PROMPT, MAX_ANSWER_CHARS
 from ui_theme import apply_ui_theme
@@ -78,6 +79,8 @@ def initialize():
         review_columns={row[1] for row in db.execute("PRAGMA table_info(application_eligibility_reviews)")}
         if "match_updated_at" not in review_columns:
             db.execute("ALTER TABLE application_eligibility_reviews ADD COLUMN match_updated_at TEXT NOT NULL DEFAULT ''")
+        if "decision" not in review_columns:
+            db.execute("ALTER TABLE application_eligibility_reviews ADD COLUMN decision TEXT NOT NULL DEFAULT 'approved'")
         existing = {row[1] for row in db.execute("PRAGMA table_info(applications)")}
         for name in ("started_at", "state_changed_at", "heartbeat_at", "attempt_number", "queue_priority", "submitted_at"):
             if name not in existing:
@@ -386,15 +389,19 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
         with connect() as db:
             gate_class,reviewed,unresolved=_eligibility_gate(db,item.get("job_key"),item.get("active_resume_id")) if item.get("active_resume_id") else ("not_analyzed",False,True)
         item["eligibility_reviewed"]=reviewed
+        try:
+            from resume_job_matcher import matching_engine_version
+            expected_version=matching_engine_version()
+        except Exception:expected_version=""
         item["eligibility_stale"]=bool(item.get("freshness_status")=="stale" or
-            item.get("matching_model_version") not in (None,"","qwen2.5:3b","qwen2.5:3b/job-match-v1"))
+            (item.get("matching_model_version") not in (None,"") and item.get("matching_model_version")!=expected_version))
         item["preparation_reason"]=("AI matching is required before preparation." if gate_class=="not_analyzed" else
             "This opening is not eligible according to the latest match." if gate_class=="not_eligible" else
-            "Review unresolved mandatory requirements before preparing." if gate_class=="potential_match" and unresolved and not reviewed else
+            "Resolve mandatory requirements before preparing; a review cannot override them." if unresolved else
             "Review this match before preparation." if gate_class=="needs_review" and not reviewed else "")
         item["preparation_allowed"]=bool(authorized and item["url_syntax_allowed"] and resume_available and item["application_state"]=="not_started" and
             item.get("active",1) and
-            gate_class!="not_eligible" and gate_class!="not_analyzed" and (not unresolved or reviewed) and (gate_class=="potential_match" or (gate_class=="needs_review" and reviewed)))
+            gate_class not in {"not_eligible","not_analyzed","rejected","deferred"} and not unresolved and (gate_class=="potential_match" or (gate_class=="needs_review" and reviewed)))
         # Query strings and fragments may contain signed or session-like tokens.
         # Keep the original private in SQLite for preparation, but don't return it to the dashboard.
         try: item["url"]=urlparse(str(item.get("url") or ""))._replace(query="",fragment="").geturl()
@@ -408,21 +415,43 @@ def _candidate():
         resume=db.execute("SELECT r.id,r.stored_name,r.original_name FROM resumes r WHERE r.user_id=? AND r.active=1 LIMIT 1",(USER,)).fetchone()
         if not resume: raise HTTPException(409,"Upload and activate a resume before starting a dry run.")
         v=db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE resume_id=? AND user_id=?",(resume["id"],USER)).fetchone()
-        ans=db.execute("SELECT question_key,question_text,answer,sensitive,auto_reuse,answer_type,jurisdiction FROM application_answers WHERE user_id=? AND resume_id=? AND confirmed=1 AND revoked_at IS NULL",(USER,resume["id"])).fetchall()
+        ans=db.execute("SELECT id,question_key,question_text,answer,answer_encrypted,sensitive,auto_reuse,answer_type,jurisdiction FROM application_answers WHERE user_id=? AND resume_id=? AND confirmed=1 AND revoked_at IS NULL",(USER,resume["id"])).fetchall()
+        answers_by_key={}
+        for item in ans:
+            answers_by_key[item["question_key"]]={"answer":_answer_plaintext(item,db),"question":item["question_text"],
+                "sensitive":bool(item["sensitive"]),"auto_reuse":bool(item["auto_reuse"]),
+                "answer_type":item["answer_type"],"jurisdiction":item["jurisdiction"]}
     stored=Path(str(resume["stored_name"] or ""))
     resume_path=(STORAGE/stored.name).resolve()
     if stored.name!=str(resume["stored_name"] or "") or resume_path.parent!=STORAGE.resolve() or not resume_path.is_file():
         raise HTTPException(409,"The active resume file is unavailable or invalid. Upload and activate a valid PDF first.")
     values={}; confirmed={}
     if v:
-        try: values=json.loads(v["values_json"]); confirmed=json.loads(v["confirmed_json"])
+        try: values=verified_values_from_json(v["values_json"]); confirmed=json.loads(v["confirmed_json"])
         except (TypeError,json.JSONDecodeError): raise HTTPException(409,"Candidate verification data is invalid.")
     date_value=str(values.get("graduation_date") or "")
     if date_value and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])",date_value) and confirmed.get("graduation_date"):
         values.setdefault("graduation_year",date_value[:4]); values.setdefault("graduation_month",date_value[5:7])
         confirmed.setdefault("graduation_year",True); confirmed.setdefault("graduation_month",True)
     facts=verified_profile_facts(values,confirmed)
-    answers={x["question_key"]:{"answer":x["answer"],"question":x["question_text"],"sensitive":bool(x["sensitive"]),"auto_reuse":bool(x["auto_reuse"]),"answer_type":x["answer_type"],"jurisdiction":x["jurisdiction"]} for x in ans}
+    # User-uploaded attachments remain private and are surfaced to the form
+    # filler only after checking the active resume scope and canonical path.
+    try:
+        with connect() as db:
+            docs=db.execute("SELECT document_type,stored_name,original_name,mime_type FROM application_documents WHERE user_id=? AND resume_id=? ORDER BY created_at DESC",
+                            (USER,resume["id"])).fetchall()
+        private_docs=(Path(__file__).resolve().parent/"private_documents").resolve()
+        facts["__application_documents"]=[]
+        for doc in docs:
+            name=str(doc["stored_name"] or "")
+            if not re.fullmatch(r"[0-9a-f-]{36}\.(?:pdf|docx|png|jpg|jpeg)",name,re.I):continue
+            path=(private_docs/name).resolve()
+            if path.parent==private_docs and path.is_file():
+                facts["__application_documents"].append({"document_type":doc["document_type"],
+                    "original_name":doc["original_name"],"mime_type":doc["mime_type"],"path":str(path)})
+    except sqlite3.OperationalError:
+        facts["__application_documents"]=[]
+    answers=answers_by_key
     answers["__settings"]=get_authorization()["settings"]
     return resume,facts,answers
 
@@ -529,7 +558,7 @@ def _confirmed_location(candidate):
     return ", ".join(str(candidate.get(key)).strip() for key in ("city","state_province","country")
                       if candidate.get(key) and str(candidate.get(key)).strip())
 
-def _unresolved_mandatory(result_json):
+def _unresolved_mandatory(result_json,job_description=""):
     try: result=json.loads(result_json or "{}")
     except (TypeError,json.JSONDecodeError): return True
     for key in ("required_skills","required_experience","education_requirements"):
@@ -541,18 +570,35 @@ def _unresolved_mandatory(result_json):
     missing=result.get("missing_information",[])
     if isinstance(missing,list) and any(re.search(r"work authorization|sponsor|visa|location|graduat|education|professional experience|years of experience",str(item),re.I) for item in missing):
         return True
+    try:
+        from job_relevance import extract_experience_requirements
+        extracted=extract_experience_requirements(job_description)
+        required_years=extracted.get("required",[])+extracted.get("unclear",[])
+    except (TypeError,AttributeError):required_years=[]
+    for requirement in required_years:
+        years=requirement.get("years")
+        evidence=[entry for entry in result.get("required_experience",[]) if isinstance(entry,dict)
+                  and str(years or "").casefold() in str(entry.get("requirement") or "").casefold()
+                  and str(entry.get("status") or "").casefold()=="met"
+                  and any(str(item).strip() for item in entry.get("candidate_evidence",[]) if isinstance(item,str))]
+        if not evidence:return True
     return False
 
 def _eligibility_gate(db,job_key,resume_id):
     match=db.execute("SELECT classification,result_json,updated_at,freshness_status,matching_model_version FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume_id)).fetchone()
     if not match: return "not_analyzed",False,True
-    if match["freshness_status"]=="stale": return "not_analyzed",False,True
+    if match["freshness_status"]!="current": return "not_analyzed",False,True
     model_version=match["matching_model_version"] or ""
-    if model_version and model_version not in {"qwen2.5:3b","qwen2.5:3b/job-match-v1"}: return "not_analyzed",False,True
+    try:
+        from resume_job_matcher import matching_engine_version
+        expected_version=matching_engine_version()
+    except Exception:
+        expected_version=""
+    if not expected_version or model_version!=expected_version:return "not_analyzed",False,True
     profile=db.execute("SELECT updated_at,values_json,confirmed_json FROM candidate_verifications WHERE user_id=? AND resume_id=?",(USER,resume_id)).fetchone()
     if not profile: return "not_analyzed",False,True
     try:
-        if not verified_profile_facts(json.loads(profile["values_json"] or "{}"),json.loads(profile["confirmed_json"] or "{}")):
+        if not verified_profile_facts(verified_values_from_json(profile["values_json"]),json.loads(profile["confirmed_json"] or "{}")):
             return "not_analyzed",False,True
     except (TypeError,json.JSONDecodeError): return "not_analyzed",False,True
     if profile:
@@ -564,8 +610,12 @@ def _eligibility_gate(db,job_key,resume_id):
             if analyzed < edited: return "not_analyzed",False,True
         except (TypeError,ValueError): return "not_analyzed",False,True
     classification=match["classification"] or "not_analyzed"
-    reviewed=bool(db.execute("SELECT 1 FROM application_eligibility_reviews WHERE user_id=? AND job_key=? AND resume_id=? AND classification=? AND match_updated_at=?",(USER,job_key,resume_id,classification,str(match["updated_at"] or ""))).fetchone())
-    return classification,reviewed,_unresolved_mandatory(match["result_json"])
+    opening=db.execute("SELECT description FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,job_key)).fetchone()
+    description=opening["description"] if opening and "description" in opening.keys() else ""
+    decision=db.execute("SELECT decision FROM application_eligibility_reviews WHERE user_id=? AND job_key=? AND resume_id=? AND classification=? AND match_updated_at=?",(USER,job_key,resume_id,classification,str(match["updated_at"] or ""))).fetchone()
+    if decision and decision["decision"] in {"rejected","deferred"}:return decision["decision"],False,True
+    reviewed=bool(decision and decision["decision"]=="approved")
+    return classification,reviewed,_unresolved_mandatory(match["result_json"],description)
 
 def _question_category(text):
     value=str(text or "").casefold()
@@ -664,7 +714,14 @@ def _answer(info,candidate,answers):
         shared=len(tokens & known); required_shared=1 if min(len(tokens),len(known))<=2 else 2
         if tokens and known and shared>=required_shared and shared/max(1,min(len(tokens),len(known)))>=0.6:
             return item["answer"],key
-    if re.search(r"resume|curriculum vitae|cv upload",label) and info.get("type")=="file": return "__RESUME__","resume"
+    if info.get("type")=="file":
+        if re.search(r"resume|curriculum vitae|cv upload",label):return "__RESUME__","resume"
+        doc_type=("transcript" if re.search(r"transcript",label) else
+                  "cover_letter" if re.search(r"cover letter",label) else
+                  "certificate" if re.search(r"certificate|certification",label) else
+                  "portfolio" if re.search(r"portfolio|work sample",label) else None)
+        choices=[item for item in candidate.get("__application_documents",[]) if item.get("document_type")==doc_type] if doc_type else []
+        if len(choices)==1:return "__DOCUMENT__:"+choices[0]["path"],"document"
     return None,None
 
 
@@ -720,6 +777,8 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                 value,source=None,None
             if isinstance(source,str) and source.startswith("custom:") and not settings.get("allow_auto_use_confirmed_answers",False) and not local_mock:
                 value,source=None,None
+            if source=="document" and not settings.get("allow_auto_use_confirmed_answers",False) and not local_mock:
+                value,source=None,None
             if isinstance(source,str) and source.startswith("custom:"):
                 matching_answer_key=source
             if _requires_human_confirmation(info):
@@ -741,6 +800,15 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                     report.append({"field":"Resume upload","result":"unsupported_file_type"}); continue
                 if on_upload: on_upload()
                 field.set_input_files(str(resume_path)); report.append({"field":"Resume upload","result":"filled"}); continue
+            if info["type"]=="file" and isinstance(value,str) and value.startswith("__DOCUMENT__:"):
+                path=Path(value.split(":",1)[1]).resolve();private_docs=(Path(__file__).resolve().parent/"private_documents").resolve()
+                accept=str(info.get("accept") or "").casefold()
+                if path.parent!=private_docs or not path.is_file():
+                    missing.append("The selected private application document is unavailable.");continue
+                if accept and not any(token in accept for token in (path.suffix.casefold(),"*/*")):
+                    missing.append("The saved application document format is not accepted by this field.");continue
+                if on_upload:on_upload()
+                field.set_input_files(str(path));report.append({"field":info.get("label") or "Application document","result":"filled","source":"private_document"});continue
             if info["type"]=="radio":
                 group=info.get("name") or info.get("id") or info.get("label")
                 if group in processed_radios: continue
@@ -1100,8 +1168,8 @@ def enqueue_saved_jobs(request:ApplicationQueueRequest):
             match=db.execute("SELECT classification,match_score,result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,key,resume["id"])).fetchone()
             posting=db.execute("SELECT discovered_at,location_status FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
             gate_class,reviewed,unresolved=_eligibility_gate(db,key,resume["id"])
-        if gate_class=="not_eligible" or gate_class=="not_analyzed" or (gate_class not in {"potential_match","needs_review"}) or ((gate_class=="needs_review" or unresolved) and not reviewed):
-            reason="AI matching marked this opening not eligible." if gate_class=="not_eligible" else "Run AI matching first." if gate_class=="not_analyzed" else "Review this match and any unresolved mandatory requirements before queueing."
+        if gate_class=="not_eligible" or gate_class=="not_analyzed" or gate_class in {"rejected","deferred"} or gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
+            reason="AI matching marked this opening not eligible." if gate_class=="not_eligible" else "You rejected this opening." if gate_class=="rejected" else "You deferred this opening's review." if gate_class=="deferred" else "Run AI matching first." if gate_class=="not_analyzed" else "Resolve mandatory requirements before queueing." if unresolved else "Review this match before queueing."
             skipped.append({"job_key":key,"reason":reason}); continue
         score=float(match["match_score"] or 0) if match else 0
         recency=0
@@ -1129,7 +1197,7 @@ def start_dry_run(request:DryRunRequest):
             gate_class,reviewed,unresolved=_eligibility_gate(db,job["job_key"],resume["id"])
             if gate_class=="not_eligible": raise HTTPException(409,"AI matching marked this opening not eligible; preparation is blocked.")
             if gate_class=="not_analyzed": raise HTTPException(409,"Run AI matching before preparing this saved opening.")
-            if gate_class not in {"potential_match","needs_review"} or ((gate_class=="needs_review" or unresolved) and not reviewed):
+            if gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
                 raise HTTPException(409,"Review the eligibility result and unresolved mandatory requirements before preparing this opening.")
     if not is_local and not get_authorization()["settings"].get("allow_automated_form_preparation"):
         raise HTTPException(403,"Enable automated form preparation in Application settings before preparing an employer application.")
@@ -1153,7 +1221,7 @@ def prepare_saved_job(request:DryRunRequest):
         gate_class,reviewed,unresolved=_eligibility_gate(db,request.job_key,resume["id"])
     if gate_class=="not_eligible": raise HTTPException(409,"AI matching marked this opening not eligible. Preparation is blocked.")
     if gate_class=="not_analyzed": raise HTTPException(409,"Run AI matching before preparing this saved opening.")
-    if gate_class not in {"potential_match","needs_review"} or ((gate_class=="needs_review" or unresolved) and not reviewed):
+    if gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
         raise HTTPException(409,"Review this match and unresolved mandatory requirements before preparing this opening.")
     normalized=str(job["application_url"]).split("?",1)[0].rstrip("/").casefold()
     with connect() as db:
@@ -1171,12 +1239,32 @@ def review_saved_job_eligibility(job_key:str,request:EligibilityReviewRequest):
     resume,_,_=_candidate()
     with connect() as db:
         classification,_,unresolved=_eligibility_gate(db,job_key,resume["id"])
+        if classification in {"rejected","deferred"}:
+            current=db.execute("SELECT classification,result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume["id"])).fetchone()
+            classification=current["classification"] if current else classification
+            opening=db.execute("SELECT description FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,job_key)).fetchone()
+            unresolved=_unresolved_mandatory(current["result_json"] if current else "{}",opening["description"] if opening else "")
         if classification=="not_eligible": raise HTTPException(409,"This opening is marked not eligible and cannot be queued.")
         if classification=="not_analyzed": raise HTTPException(409,"Run AI matching before reviewing this opening.")
         if classification not in {"potential_match","needs_review"}: raise HTTPException(409,"A completed eligibility result is required.")
+        if unresolved:raise HTTPException(409,"Unresolved mandatory requirements cannot be overridden by a review. Confirm missing facts and reassess first.")
         match=db.execute("SELECT updated_at FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume["id"])).fetchone()
-        db.execute("INSERT INTO application_eligibility_reviews(user_id,job_key,resume_id,classification,reviewed_at,match_updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,job_key,resume_id) DO UPDATE SET classification=excluded.classification,reviewed_at=excluded.reviewed_at,match_updated_at=excluded.match_updated_at",(USER,job_key,resume["id"],classification,now(),str(match["updated_at"] or "")))
+        db.execute("INSERT INTO application_eligibility_reviews(user_id,job_key,resume_id,classification,reviewed_at,match_updated_at,decision) VALUES(?,?,?,?,?,?,'approved') ON CONFLICT(user_id,job_key,resume_id) DO UPDATE SET classification=excluded.classification,reviewed_at=excluded.reviewed_at,match_updated_at=excluded.match_updated_at,decision='approved'",(USER,job_key,resume["id"],classification,now(),str(match["updated_at"] or "")))
     return {"reviewed":True,"classification":classification,"mandatory_requirements_need_review":unresolved,"message":"Review recorded for this resume version. This does not guarantee eligibility or authorize submission."}
+
+
+def record_eligibility_decision(job_key:str,decision:str):
+    if decision not in {"rejected","deferred"}:raise HTTPException(422,"Unknown eligibility decision.")
+    resume,_,_=_candidate()
+    with connect() as db:
+        classification,_,_=_eligibility_gate(db,job_key,resume["id"])
+        if classification in {"rejected","deferred"}:
+            current=db.execute("SELECT classification FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume["id"])).fetchone()
+            classification=current["classification"] if current else classification
+        if classification not in {"potential_match","needs_review"}:raise HTTPException(409,"A fresh, eligible or reviewable result is required.")
+        match=db.execute("SELECT updated_at FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume["id"])).fetchone()
+        db.execute("INSERT INTO application_eligibility_reviews(user_id,job_key,resume_id,classification,reviewed_at,match_updated_at,decision) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,job_key,resume_id) DO UPDATE SET classification=excluded.classification,reviewed_at=excluded.reviewed_at,match_updated_at=excluded.match_updated_at,decision=excluded.decision",(USER,job_key,resume["id"],classification,now(),str(match["updated_at"] or ""),decision))
+    return {"decision":decision,"classification":classification,"submission_enabled":False}
 
 @router.post("/api/applications/{application_id}/answers")
 def save_missing_application_answer(application_id:str,request:MissingAnswerRequest):
@@ -1366,7 +1454,7 @@ def resume_one(application_id:str):
                 gate_class,reviewed,unresolved=_eligibility_gate(db,row["job_key"],resume["id"])
                 if gate_class=="not_eligible": raise HTTPException(409,"AI matching marked this opening not eligible; retry is blocked.")
                 if gate_class=="not_analyzed": raise HTTPException(409,"Run AI matching before retrying this saved opening.")
-                if gate_class not in {"potential_match","needs_review"} or ((gate_class=="needs_review" or unresolved) and not reviewed):
+                if gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
                     raise HTTPException(409,"Review the eligibility result and unresolved mandatory requirements before retrying.")
         if row["state"] not in {"paused","failed","needs_user_input","unsupported"}: raise HTTPException(409,"Application is not resumable.")
         if row["state"] in {"opening","filling","queued"}:

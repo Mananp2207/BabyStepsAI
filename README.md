@@ -12,6 +12,7 @@ BabyStepsAI is a local-first job discovery and application preparation prototype
 - Employer source discovery, provenance, health reporting, and local administration.
 - Job normalization, duplicate detection, eligibility matching, and match freshness checks.
 - Grounded application answer drafting and a persistent dry-run queue.
+- One-prompt workflow orchestration from authorized discovery through eligibility matching and sequential application preparation, with persisted progress and pause/resume/cancel controls.
 - Conservative browser preparation that pauses for authentication, CAPTCHA, missing facts, or other human-required steps.
 - No paid AI service is required. Ollama can provide local model inference.
 
@@ -56,7 +57,9 @@ ollama pull qwen2.5:3b
 ollama serve
 ```
 
-The core server can run without Ollama, though AI-backed features will be unavailable. `.env.example` contains a safe browser setting example; the application does not automatically load `.env` files. No API key is required for local operation.
+The default matching provider is local Ollama. Matching supports optional Google Gemini from **Application Settings**; Gemini sends the confirmed candidate profile and saved job content to Google. To use it, set `GEMINI_API_KEY` in the server process environment before startup. The key is never saved in SQLite or returned by the settings API. `GEMINI_MODEL` optionally selects another supported Gemini model; the default is `gemini-2.5-flash`. No API key is required for local Ollama operation, and the server does not automatically load `.env` files.
+
+The workflow dashboard can retry failed saved-job analyses in one matching-only run. It reuses stored openings and does not repeat employer discovery. Provider, model, resume, confirmed profile, preferences, job content, and matching-engine version are tracked for match freshness.
 
 ## Run locally
 
@@ -68,9 +71,11 @@ cd BabyStepsAI_Backend
 Keep the server bound to `127.0.0.1`. Useful pages:
 
 - Dashboard and resume upload: <http://127.0.0.1:8000/>
+- First-time onboarding and reusable application information: <http://127.0.0.1:8000/onboarding>
 - Candidate profile: <http://127.0.0.1:8000/candidate-profile>
 - Career preferences: <http://127.0.0.1:8000/careers>
 - Job discovery: <http://127.0.0.1:8000/find-jobs>
+- Unified workflow: <http://127.0.0.1:8000/workflow>
 - Employer sources: <http://127.0.0.1:8000/employers>
 - Application dry-run queue: <http://127.0.0.1:8000/applications>
 
@@ -93,11 +98,15 @@ python -m unittest discover -v
 python -m py_compile *.py
 ```
 
+The unified workflow requires automatic discovery and AI matching permissions. Automatic dry-run preparation also requires its separate setting in Application settings. These permissions never enable live employer submission.
+
 Mocked tests use deterministic local responses. Live source verification requires network access and is separate from the test suite.
 
 ## Local data and privacy
 
 The root `.gitignore` excludes databases, SQLite journals, resumes, candidate profiles, application history, local screenshots, reports, credentials, and browser state. Do not commit private candidate records or employer verification reports. The app currently uses a single local development identity and stores resume/profile/job/application information in its local database and storage directories.
+
+Sensitive profile and optional demographic fields use Fernet authenticated encryption. By default, the encryption key is stored outside the repository at `~/.config/babystepsai/encryption.key` with owner-only file permissions. Back up this key securely; encrypted values cannot be recovered if the key is lost. `BABYSTEPSAI_ENCRYPTION_KEY` or `BABYSTEPSAI_KEY_PATH` can select a managed key. The application deliberately refuses plaintext fallback when the key cannot be read.
 
 ## Limitations
 
