@@ -70,10 +70,16 @@ class WorkflowOrchestratorTests(unittest.TestCase):
              patch.object(workflow.application_agent,"_candidate",return_value=({"id":"resume-1"},{"name":"Confirmed"},{})), \
              patch.object(workflow.candidate_verification,"profile_completeness",return_value={"ready_for_dry_runs":True}), \
              patch.object(workflow.resume_job_matcher,"active_candidate",return_value=({},"user_reviewed")), \
-             patch.object(workflow.career_preferences,"get_preferences",return_value={"roles":["Software Engineer"]}), \
+             patch.object(workflow.career_preferences,"get_preferences",return_value={"roles":["Software Engineer"],
+                 "levels":["New Graduate","Entry Level","Junior"],"employment_types":["Full-time"],
+                 "location":"United States","work_arrangement":"Any"}), \
              patch.object(workflow.job_search_agent,"active_discovery",return_value=None), \
              patch.object(workflow,"_submit"):
-            status,data=self.asgi_request("POST","/api/workflows",{"prompt":"Find software engineering jobs"})
+            prompt=("Find full-time new-graduate, entry-level, junior, associate, and Software Engineer I jobs in the United States. "
+                    "Prioritize positions suitable for recent Computer Science graduates. Exclude internships, senior positions, "
+                    "and jobs requiring more professional experience than my verified profile demonstrates. Analyze eligibility "
+                    "and prepare suitable applications as dry runs without submitting them.")
+            status,data=self.asgi_request("POST","/api/workflows",{"prompt":prompt})
             self.assertEqual(status,202,data)
             self.assertEqual(data["status"],"queued")
             self.assertTrue(data["workflow_id"])
@@ -81,7 +87,9 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             self.assertEqual(data["preferences_version"],4)
             row=workflow._row(data["workflow_id"])
             self.assertIsNotNone(row)
-            self.assertEqual(row["prompt"],"Find software engineering jobs")
+            self.assertEqual(row["prompt"],prompt)
+            self.assertEqual(data["clarification_required"],[])
+            self.assertTrue(data["diagnostics"]["workflow_preferences"]["_prompt_exclude_senior"])
             status,current=self.asgi_request("GET","/api/workflows/current")
             self.assertEqual(status,200)
             self.assertEqual(current["workflow"]["workflow_id"],data["workflow_id"])
@@ -206,13 +214,25 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             db.execute("UPDATE user_workflows SET status='running',current_stage='matching',matching_session_id='match-owned' WHERE workflow_id='wf-test'")
         progress={"session_id":"match-owned","status":"running","total":12,"completed":4,"pending":8,
                   "failed":0,"current_job":{"company":"Example","title":"Engineer"},
-                  "last_successful_checkpoint":{"company":"Example","title":"Engineer","at":"now"}}
+                  "last_successful_checkpoint":{"company":"Example","title":"Engineer","at":"now"},
+                  "worker_health":"slow_processing","recovery_available":False,
+                  "current_elapsed_seconds":240,"last_progress_at":"heartbeat-now","heartbeat_age_seconds":2}
         with patch.object(workflow.resume_job_matcher,"_progress",return_value=progress):
             status,data=self.asgi_request("GET","/api/workflows/current")
         self.assertEqual(status,200)
         self.assertEqual(data["workflow"]["diagnostics"]["matching"]["completed"],4)
         self.assertEqual(data["workflow"]["diagnostics"]["matching"]["pending"],8)
         self.assertEqual(data["workflow"]["diagnostics"]["matching"]["current_job"]["title"],"Engineer")
+        self.assertEqual(data["workflow"]["diagnostics"]["matching"]["worker_health"],"slow_processing")
+        self.assertEqual(data["workflow"]["diagnostics"]["matching"]["current_elapsed_seconds"],240)
+        self.assertFalse(data["workflow"]["diagnostics"]["matching"]["recovery_available"])
+
+    def test_matching_dashboard_explains_slow_live_and_recoverable_worker_states(self):
+        page=workflow.WORKFLOW_PAGE
+        self.assertIn("Current job processing for",page)
+        self.assertIn("Last worker heartbeat",page)
+        self.assertIn("worker process is alive and renewing its lease",page)
+        self.assertIn("lease expired and the local worker is not running",page)
 
     def test_matching_recovery_route_is_loopback_gated_and_explicit(self):
         with patch.object(workflow.resume_job_matcher,"recover_match_session",return_value={"recovered":True,"status":"interrupted"}) as recover:
@@ -334,6 +354,87 @@ class WorkflowOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(conflicts),3)
         self.assertIn("Canada",conflicts[0])
         self.assertEqual(prefs["location"],"Canada")
+
+    def test_exact_new_graduate_prompt_is_compatible_with_saved_preferences(self):
+        prompt=("Find full-time new-graduate, entry-level, junior, associate, and Software Engineer I jobs in the United States. "
+                "Prioritize positions suitable for recent Computer Science graduates. Exclude internships, senior positions, "
+                "and jobs requiring more professional experience than my verified profile demonstrates. Analyze eligibility "
+                "and prepare suitable applications as dry runs without submitting them.")
+        prefs={"roles":["Software Engineer"],"levels":["New Graduate","Entry Level","Junior"],
+               "employment_types":["Full-time"],"location":"United States","work_arrangement":"Any"}
+        self.assertEqual(workflow.prompt_conflicts(prompt,prefs),[])
+        effective=workflow.job_relevance.apply_prompt_preferences(prompt,prefs)
+        self.assertEqual(effective["employment_types"],["Full-time"])
+        self.assertTrue(effective["_prompt_exclude_internships"])
+        self.assertTrue(effective["_prompt_exclude_senior"])
+
+    def test_conflict_records_describe_only_genuine_contradictions(self):
+        broad={"location":"United States","employment_types":["Full-time","Internship"],
+               "levels":["New Graduate","Entry Level","Junior"]}
+        prompt="Find full-time new-grad and Software Engineer I jobs in the United States; exclude internships and senior roles."
+        self.assertEqual(workflow._prompt_conflict_details(prompt,broad),[])
+        conflicts=workflow._prompt_conflict_details("Find senior jobs in Canada and include internships",{
+            "location":"United States","employment_types":["Full-time"],"levels":["Entry Level"]})
+        self.assertEqual({item["field"] for item in conflicts},{"location","employment_types","levels"})
+        self.assertTrue(all(item["saved_preference"] and item["requested_preference"] and item["reason"] and item["resolution"] for item in conflicts))
+        self.assertEqual(workflow.prompt_conflicts("Find jobs in California",{"location":"United States"}),[])
+
+    def test_prompt_only_conflict_resolution_does_not_change_saved_preferences(self):
+        saved={"location":"United States","employment_types":["Full-time"],"levels":["Entry Level"]}
+        with workflow.database() as db:
+            db.execute("UPDATE user_workflows SET status='needs_clarification',current_stage='needs_clarification',prompt='Find senior software jobs in Canada',diagnostics_json=? WHERE workflow_id='wf-test'",
+                (json.dumps({"preference_conflicts":workflow._prompt_conflict_details("Find senior software jobs in Canada",saved)}),))
+        with patch.object(workflow,"_authorization",return_value={"allow_automatic_discovery":True,"allow_ai_matching":True}), \
+             patch.object(workflow,"_versions",return_value=("resume-1","rv1","pv1",3,saved)), \
+             patch.object(workflow.career_preferences,"get_preferences",return_value=saved), \
+             patch.object(workflow,"_submit",return_value=True):
+            status,data=self.asgi_request("POST","/api/workflows/wf-test/resolve-preferences",{"choice":"prompt"})
+        self.assertEqual(status,202,data)
+        self.assertFalse(data["saved_preferences_changed"])
+        diagnostics=data["workflow"]["diagnostics"]
+        self.assertEqual(diagnostics["preference_resolution"]["choice"],"prompt")
+        self.assertEqual(diagnostics["workflow_preferences"]["location"],"Canada")
+        self.assertEqual(saved["location"],"United States")
+
+    def test_saved_preference_resolution_accepts_an_explicitly_edited_preference_snapshot(self):
+        edited={"location":"Canada","employment_types":["Full-time"],"levels":["Senior"]}
+        with workflow.database() as db:
+            db.execute("UPDATE user_workflows SET status='needs_clarification',current_stage='needs_clarification',prompt='Find senior software jobs in Canada',diagnostics_json='{}' WHERE workflow_id='wf-test'")
+        with patch.object(workflow,"_authorization",return_value={"allow_automatic_discovery":True,"allow_ai_matching":True}), \
+             patch.object(workflow,"_versions",return_value=("resume-1","rv1","pv1",4,edited)), \
+             patch.object(workflow.career_preferences,"get_preferences",return_value=edited), \
+             patch.object(workflow,"_submit",return_value=True):
+            status,data=self.asgi_request("POST","/api/workflows/wf-test/resolve-preferences",{"choice":"saved"})
+        self.assertEqual(status,202,data)
+        self.assertEqual(data["workflow"]["preferences_version"],4)
+        self.assertEqual(data["workflow"]["diagnostics"]["workflow_preferences"]["location"],"Canada")
+
+    def test_dashboard_exposes_field_level_conflict_resolution_controls(self):
+        for text in ("Saved preference","Requested preference","Why this conflicts",
+                     "Use saved preferences","Use prompt preferences for this workflow only","Edit saved preferences",
+                     "Continue with requested prompt preferences"):
+            self.assertIn(text,workflow.WORKFLOW_PAGE)
+
+    def test_legacy_clarification_recomputes_and_exposes_resolvable_current_conflicts(self):
+        prompt="Find full-time new-graduate jobs in the United States; exclude internships and senior positions."
+        prefs={"location":"United States","employment_types":["Full-time"],"levels":["New Graduate","Entry Level"]}
+        with workflow.database() as db:
+            db.execute("UPDATE user_workflows SET status='needs_clarification',current_stage='needs_clarification',prompt=?,diagnostics_json=? WHERE workflow_id='wf-test'",
+                (prompt,json.dumps({"clarification_required":["Old false positive about senior roles."]})))
+        with patch.object(workflow.career_preferences,"get_preferences",return_value=prefs):
+            item=workflow._serialize(workflow._row("wf-test"))
+        self.assertEqual(item["diagnostics"]["preference_conflicts"],[])
+        self.assertEqual(item["diagnostics"]["clarification_required"],[])
+
+    def test_saved_preference_choice_does_not_apply_conflicting_prompt_constraints(self):
+        saved={"employment_types":["Internship"],"levels":["Senior"]}
+        effective=workflow.job_relevance.apply_prompt_preferences(
+            "Find full-time junior software roles; exclude internships and senior jobs",saved,
+            ignore_fields=["employment_types","levels"])
+        self.assertEqual(effective["employment_types"],["Internship"])
+        self.assertEqual(effective["levels"],["Senior"])
+        self.assertFalse(effective["_prompt_exclude_internships"])
+        self.assertFalse(effective["_prompt_exclude_senior"])
 
     def test_discovery_matching_and_authorized_dry_run_queue_are_orchestrated(self):
         class MatchDatabase:

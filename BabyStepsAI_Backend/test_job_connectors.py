@@ -474,9 +474,33 @@ class ConnectorTests(unittest.TestCase):
             start=next(item for item in sent if item["type"]=="http.response.start")
             body=b"".join(item.get("body",b"") for item in sent if item["type"]=="http.response.body")
             return start["status"],body
+        with discovery.database() as db:
+            source=db.execute("SELECT name,source_token FROM employers WHERE source_type='greenhouse' AND active=1 LIMIT 1").fetchone()
+            stamp=discovery.datetime.now(discovery.timezone.utc).isoformat()
+            desc=("New graduate software engineer responsibilities include building reliable services, writing tested code, "
+                  "collaborating with product teams, reviewing changes, and improving system performance. "*4)
+            db.execute("""INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,
+                employment_type,source_platform,source_id,description,last_verified_at,active,experience_level)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,'New Graduate')""",
+                (discovery.USER,f"greenhouse:{source['source_token']}:early-integration",source["name"],
+                 "Software Engineer - New Grad","Austin, TX","https://boards.greenhouse.io/test/jobs/early",
+                 stamp,"Full-time","greenhouse","early-integration",desc,stamp))
+            db.execute("""INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,
+                employment_type,source_platform,source_id,description,last_verified_at,active)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                (discovery.USER,f"greenhouse:{source['source_token']}:missing-description",source["name"],
+                 "Software Engineer","Austin, TX","https://boards.greenhouse.io/test/jobs/missing",
+                 stamp,"Full-time","greenhouse","missing-description","Apply online.",stamp))
         status,body=asyncio.run(request("GET","/api/employers"))
         self.assertEqual(status,200,body)
-        self.assertEqual(json.loads(body)["count"],3)
+        employers=json.loads(body)
+        self.assertEqual(employers["count"],3)
+        self.assertEqual(employers["summary"]["sources"],3)
+        self.assertEqual(employers["summary"]["eligible_discovery_sources"],3)
+        self.assertEqual(employers["summary"]["current_verified_openings"],2)
+        self.assertEqual(employers["summary"]["current_early_career_openings"],1)
+        self.assertEqual(employers["summary"]["current_missing_descriptions"],1)
+        self.assertEqual(employers["results"][0]["saved_openings_count"],2)
         import_body=json.dumps({"sources":[{"name":"ASGI Source","source_type":"ashby","source_token":"asgi-demo"}]}).encode()
         status,body=asyncio.run(request("POST","/api/employers/import",import_body))
         self.assertEqual(status,200,body)

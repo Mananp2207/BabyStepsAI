@@ -40,7 +40,7 @@ FEED_CACHE_TTL = 15 * 60
 EMPLOYER_DISCOVERY_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="employer-discovery")
 BOARDS = {"Cloudflare": "cloudflare", "Datadog": "datadog", "Figma": "figma"}
 SENIOR = re.compile(r"\b(senior|staff|principal|lead|director|manager|vp|head of)\b", re.I)
-EARLY = re.compile(r"\b(intern|internship|junior|entry[- ]level|new grad|graduate|associate)\b", re.I)
+EARLY = re.compile(r"\b(intern|internship|junior|entry[- ]level|new grad|graduate|associate|software engineer\s+i|swe\s+i)\b", re.I)
 INTERN = re.compile(r"\b(intern|internship)\b", re.I)
 SOFTWARE_ROLE_ALIASES = (
     "software engineer", "software developer", "software development engineer",
@@ -404,6 +404,10 @@ def assess_job(job, prefs, terms, confirmed_experience_years=None):
     content = re.sub(r"<[^>]+>", " ", str(job.get("content") or job.get("description", ""))).casefold()
     evidence = f"{normalized_title} {location} {content}"
     review_reasons = []
+    if prefs.get("_prompt_exclude_internships") and INTERN.search(f"{title} {content}"):
+        return False, "employment_type", []
+    if prefs.get("_prompt_exclude_senior") and SENIOR.search(title):
+        return False, "experience_level", []
     if confirmed_experience_years is None:
         confirmed_experience_years = prefs.get("_confirmed_experience_years")
 
@@ -605,6 +609,12 @@ def employer_retry_eligible(row, *, now=None, force=False):
         # their first fingerprint and retry deadline.
         return True
     return retry_at <= (now or datetime.now(timezone.utc)).isoformat()
+
+
+def usable_posting_description(value):
+    """Match the enrichment pipeline's minimum for a usable job description."""
+    text=re.sub(r"<[^>]*>"," ",str(value or ""))
+    return len(text)>=180 and len(re.findall(r"[A-Za-z]",text))>=120
 
 
 def _legacy_job(record):
@@ -1032,6 +1042,7 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                 with database() as db:
                     prior=db.execute("SELECT content_fingerprint FROM discovered_openings WHERE user_id=? AND job_key=?",
                                      (USER,record["job_key"])).fetchone()
+                    was_previously_seen=bool(prior)
                     if prior:
                         diagnostics["previously_seen_jobs"] += 1
                     else:
@@ -1108,6 +1119,8 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                 seen_urls.add(canonical)
                 found.append({
                     "job_key": record["job_key"], "company": source.name,
+                    "discovery_status":"previously_seen" if was_previously_seen else "newly_discovered",
+                    "description_available":usable_posting_description(record["description"]),
                     "title": job["title"], "location": location, "url": url,
                     "employment_type": employment_type, "location_status": geo_status,
                     "location_reason": geo_reason, "search_prompt": str(prompt or "")[:1500],
@@ -1228,11 +1241,34 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                       experience_level_evidence=item.get("experience_level_evidence",level_evidence),
                       graduation_windows=item.get("graduation_windows",extract_graduation_windows(result.get("description"))),
                       education_requirements=item.get("education_requirements",extract_education_requirements(result.get("description"))))
+        result.update(discovery_status=item.get("discovery_status","previously_seen"),
+                      description_available=usable_posting_description(result.get("description")),
+                      matching_status="not_analyzed",eligibility_classification="needs_review",
+                      matching_failure_reason="")
         for field in ("salary_json","required_qualifications_json","preferred_qualifications_json"):
             raw=result.pop(field,None)
             try: result[field.removesuffix("_json")]=json.loads(raw) if raw else None
             except (TypeError,json.JSONDecodeError): result[field.removesuffix("_json")]=None
         results.append(result)
+    if results:
+        try:
+            # Reuse only assessments that the matcher itself considers fresh;
+            # older saved results remain visible as needing reassessment.
+            import resume_job_matcher
+            active_resume,_,_=resume_job_matcher.active_candidate()
+            existing=resume_job_matcher._match_rows([item["job_key"] for item in results],active_resume)
+            by_key={item["job_key"]:item for item in existing}
+            for item in results:
+                match=by_key.get(item["job_key"])
+                if not match:continue
+                item["matching_status"]="stale" if match.get("stale") else match.get("status","not_analyzed")
+                item["eligibility_classification"]=(match.get("classification") if match.get("status")=="completed" and not match.get("stale")
+                    else "needs_review")
+                item["matching_failure_reason"]=match.get("error") or ""
+        except (ImportError,sqlite3.Error,KeyError,TypeError,ValueError,HTTPException):
+            # Search results must remain available if the optional saved-match
+            # diagnostic cannot be read in a partially migrated database.
+            pass
     results.sort(key=lambda item: (-int(item.get("relevance_score", 50)),
                                    str(item.get("posting_date") or ""),
                                    str(item.get("company") or "").casefold()))
@@ -1325,12 +1361,33 @@ def saved_jobs():
 @router.get("/api/employers")
 def list_employers(request: Request):
     _require_local_admin(request)
+    current=datetime.now(timezone.utc)
     with database() as db:
         rows = db.execute("""SELECT employer_id,name,careers_url,source_type,source_token,public_feed_url,geographic_coverage,
             last_success_at,last_attempt_at,connector_status,error_details,verification_evidence_json,active,
             health_reason,consecutive_failures,next_retry_at,source_fingerprint,force_revalidate,
             website_url,evidence_url,candidate_source,candidate_record_url,candidate_license,discovered_at,discovery_status
             FROM employers ORDER BY name COLLATE NOCASE""").fetchall()
+        openings=[dict(row) for row in db.execute("""SELECT company,source_platform,source_id,job_key,title,description,
+            employment_type,active,last_verified_at,posting_date FROM discovered_openings WHERE user_id=?""",(USER,)).fetchall()]
+    eligible_sources=[row for row in rows if row["active"] and row["connector_status"]=="healthy" and
+        row["discovery_status"]=="verified" and row["last_success_at"] and
+        row["source_fingerprint"]==_source_fingerprint(dict(row))]
+    cutoff=(current-timedelta(days=30)).isoformat()
+    opening_counts={};current_counts={};early_counts={};missing_description_counts={}
+    for opening in openings:
+        company=(opening["company"] or "").casefold()
+        opening_counts[company]=opening_counts.get(company,0)+1
+        matching_source=next((row for row in eligible_sources if row["source_type"]==opening["source_platform"] and
+            row["name"].casefold()==company and opening["job_key"]==f"{row['source_type']}:{row['source_token']}:{opening['source_id']}"),None)
+        verified=bool(opening["active"] and opening["last_verified_at"] and opening["last_verified_at"]>=cutoff and matching_source)
+        if not verified:continue
+        current_counts[company]=current_counts.get(company,0)+1
+        level=classify_experience_level(opening["title"],opening["description"],opening["employment_type"])[0]
+        if level in {"New Graduate","Early Career","Graduate Eligible"}:
+            early_counts[company]=early_counts.get(company,0)+1
+        if not usable_posting_description(opening["description"]):
+            missing_description_counts[company]=missing_description_counts.get(company,0)+1
     grouped={}
     for row in rows:
         item=dict(row)
@@ -1340,6 +1397,11 @@ def list_employers(request: Request):
         group=grouped.setdefault(key,{"name":item["name"],"careers_url":item["careers_url"],
             "geographic_coverage":item["geographic_coverage"],"website_url":item["website_url"],
             "evidence_url":item["evidence_url"],"active":False,"sources":[]})
+        company_key=item["name"].casefold()
+        group["saved_openings_count"]=opening_counts.get(company_key,0)
+        group["current_openings_count"]=current_counts.get(company_key,0)
+        group["early_career_current_openings_count"]=early_counts.get(company_key,0)
+        group["current_missing_descriptions_count"]=missing_description_counts.get(company_key,0)
         group["active"]=group["active"] or bool(item["active"])
         if not group["careers_url"]:group["careers_url"]=item["careers_url"]
         try: evidence=json.loads(item["verification_evidence_json"] or "{}")
@@ -1351,7 +1413,22 @@ def list_employers(request: Request):
             for source in employer["sources"]:
                 stages=db.execute("SELECT stage_key,status,diagnostics_json,updated_at FROM employer_discovery_stages WHERE employer_id=? ORDER BY stage_key",(source["employer_id"],)).fetchall()
                 source["stages"]=[{**dict(stage),"diagnostics":json.loads(stage["diagnostics_json"] or "{}")} for stage in stages]
-    return {"results": list(grouped.values()), "count": len(grouped)}
+    unsupported=sum("unsupported" in str(row["connector_status"]).casefold() for row in rows)
+    awaiting=sum(row["connector_status"] in {"ready","needs_verification"} or
+        row["discovery_status"] in {"needs_verification","registered","candidate"} for row in rows)
+    scheduled=sum(bool(row["next_retry_at"] and row["next_retry_at"]>current.isoformat()) for row in rows)
+    summary={"employers":len({row["employer_id"] for row in rows}),
+        "sources":len(rows),"active_employers":len({row["employer_id"] for row in rows if row["active"]}),
+        "active_sources":sum(bool(row["active"]) for row in rows),
+        "healthy_verified_sources":sum(bool(row["active"] and row["connector_status"]=="healthy" and
+            row["discovery_status"]=="verified" and row["last_success_at"]) for row in rows),
+        "eligible_discovery_sources":len(eligible_sources),"unsupported_sources":unsupported,
+        "awaiting_verification_sources":awaiting,"scheduled_retry_sources":scheduled,
+        "saved_openings":len(openings),"current_verified_openings":sum(current_counts.values()),
+        "current_early_career_openings":sum(early_counts.values()),
+        "current_missing_descriptions":sum(missing_description_counts.values()),
+        "current_opening_window_days":30}
+    return {"results": list(grouped.values()), "count": len(grouped),"summary":summary}
 
 
 @router.get("/api/employer-candidates")
@@ -1749,8 +1826,8 @@ EMPLOYER_PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta n
 <header><h1>Employer Sources</h1><p class="muted">Local administration · sources stay inactive until a live public validation succeeds.</p><a href="/find-jobs">Find jobs</a></header><main><div id="summary">Loading…</div><h2>Discover from an official company website</h2><input id="name" placeholder="Company name"><input id="website" placeholder="https://company.example"><button id="discover">Discover and register</button><p id="status" role="status"></p></main><main><h2>Automated candidate providers</h2><div id="providers">Loading provider health…</div><p><label>Sources to validate <input id="runLimit" type="number" min="1" max="100" value="20"></label> <label>Companies to inspect <input id="seedLimit" type="number" min="1" max="500" value="100"></label></p><button id="runDiscovery">Run selected discovery</button><p id="discoveryStatus" role="status"></p><div id="candidateList"></div></main><main><h2>Import candidate CSV or JSON</h2><input id="file" type="file" accept=".csv,.json"><button id="import">Import inactive candidates</button></main><main><h2>Configured employers</h2><label>Provider <select id="sourceProvider"><option value="">All providers</option><option>greenhouse</option><option>lever</option><option>ashby</option><option>smartrecruiters</option><option>public_html</option><option>rss</option><option>sitemap</option><option>workday</option></select></label> <label>Status <select id="sourceStatus"><option value="">All statuses</option><option>healthy</option><option>needs_verification</option><option>unsupported_structure</option><option>unsupported_provider</option><option>javascript_rendered</option><option>temporarily_unavailable</option><option>permanently_unavailable</option><option>network_timeout</option><option>rate_limited</option><option>authentication_required</option><option>access_restricted</option><option>robots_disallowed</option></select></label> <label>Verified <select id="verifyWindow"><option value="0">Any date</option><option value="24">Last 24 hours</option><option value="168">Last 7 days</option><option value="720">Last 30 days</option></select></label> <label>Failure reason <input id="failureFilter" type="search" placeholder="Search error or health reason"></label><div id="list"></div></main>
 <script>
 const $=id=>document.getElementById(id);const api=async(url,opts={})=>{const r=await fetch(url,opts);const d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d};
-async function load(){const d=await api('/api/employers');let sources=d.results.flatMap(e=>e.sources.map(s=>({...s,name:e.name})));const count=(f)=>sources.filter(f).length;let jobs=0;for(const s of sources){try{jobs+=Number(s.verification_evidence?.postings_observed||0)}catch(_){}}$('summary').textContent=`Employers: ${d.count} · Verified: ${count(s=>s.last_success_at)} · Active sources: ${count(s=>s.active)} · Awaiting verification: ${count(s=>s.connector_status==='needs_verification')} · Temporarily unavailable: ${count(s=>s.connector_status==='temporarily_unavailable')} · Unsupported: ${count(s=>s.connector_status==='unsupported')} · Postings observed in latest checks: ${jobs}`;
- $('list').replaceChildren();for(const e of d.results){const visible=e.sources.filter(s=>{const hrs=Number($('verifyWindow').value||0),verified=Date.parse(s.last_success_at||'');const dateOk=!hrs||(Number.isFinite(verified)&&(Date.now()-verified)<=hrs*3600000);const term=$('failureFilter').value.trim().toLowerCase();return (!$('sourceProvider').value||s.source_type===$('sourceProvider').value)&&(!$('sourceStatus').value||s.connector_status===$('sourceStatus').value)&&dateOk&&(!term||`${s.health_reason||''} ${s.error_details||''}`.toLowerCase().includes(term))});if(!visible.length)continue;const a=document.createElement('article');const h=document.createElement('h3');h.textContent=e.name;a.append(h);for(const s of visible){const p=document.createElement('p');p.textContent=`${s.source_type} ${s.source_token||''} · ${s.connector_status} (${s.health_reason||'not checked'}) · ${s.active?'active':'inactive'} · Jobs observed ${s.verification_evidence?.postings_observed||0} · Last verified ${s.last_success_at||'never'} · Last attempt ${s.last_attempt_at||'never'} · Next retry ${s.next_retry_at||'eligible'} · Failures ${s.consecutive_failures||0}${s.error_details?` · ${s.error_details}`:''}`;a.append(p);const stage=document.createElement('small');const ev=s.verification_evidence||{};stage.textContent='Evidence: '+(e.evidence_url||s.candidate_record_url||'not recorded')+(ev.recognized_ats_provider?` · ATS ${ev.recognized_ats_provider}`:'')+(ev.http_responses?.length?` · HTTP ${ev.http_responses.map(x=>`${x.host}:${x.status_code}`).join(', ')}`:'')+' · Stages: '+(s.stages||[]).map(x=>`${x.stage_key}=${x.status}`).join(' · ');a.append(stage);const validate=document.createElement('button');validate.textContent='Validate when eligible';validate.onclick=async()=>{try{const x=await api(`/api/employers/${encodeURIComponent(s.employer_id)}/validate`,{method:'POST'});$('status').textContent=x.message;await load()}catch(x){$('status').textContent=x.message}};a.append(validate);const force=document.createElement('button');force.textContent='Force revalidate';force.onclick=async()=>{try{const x=await api(`/api/employers/${encodeURIComponent(s.employer_id)}/validate?force=true`,{method:'POST'});$('status').textContent=x.message;await load()}catch(x){$('status').textContent=x.message}};a.append(force);if(s.active){const disable=document.createElement('button');disable.textContent='Disable';disable.onclick=async()=>{await api(`/api/employers/${encodeURIComponent(s.employer_id)}/disable`,{method:'POST'});load()};a.append(disable)}}$('list').append(a)}}
+async function load(){const d=await api('/api/employers');let sources=d.results.flatMap(e=>e.sources.map(s=>({...s,name:e.name})));const c=d.summary||{};$('summary').textContent=`Employers ${c.employers??d.count} · Active employers ${c.active_employers??'—'} · Sources ${c.sources??sources.length} · Healthy verified ${c.healthy_verified_sources??'—'} · Eligible for discovery ${c.eligible_discovery_sources??'—'} · Awaiting verification ${c.awaiting_verification_sources??'—'} · Unsupported ${c.unsupported_sources??'—'} · Scheduled retry ${c.scheduled_retry_sources??'—'} · Saved openings ${c.saved_openings??'—'} · Current verified openings ${c.current_verified_openings??'—'} · Early-career openings ${c.current_early_career_openings??'—'} · Missing descriptions ${c.current_missing_descriptions??'—'} (current window: ${c.current_opening_window_days??30} days)`;
+ $('list').replaceChildren();for(const e of d.results){const visible=e.sources.filter(s=>{const hrs=Number($('verifyWindow').value||0),verified=Date.parse(s.last_success_at||'');const dateOk=!hrs||(Number.isFinite(verified)&&(Date.now()-verified)<=hrs*3600000);const term=$('failureFilter').value.trim().toLowerCase();return (!$('sourceProvider').value||s.source_type===$('sourceProvider').value)&&(!$('sourceStatus').value||s.connector_status===$('sourceStatus').value)&&dateOk&&(!term||`${s.health_reason||''} ${s.error_details||''}`.toLowerCase().includes(term))});if(!visible.length)continue;const a=document.createElement('article');const h=document.createElement('h3');h.textContent=e.name;a.append(h);const coverage=document.createElement('p');coverage.textContent=`Saved openings ${e.saved_openings_count||0} · Current verified ${e.current_openings_count||0} · Early-career evidence ${e.early_career_current_openings_count||0} · Missing descriptions ${e.current_missing_descriptions_count||0}`;a.append(coverage);for(const s of visible){const p=document.createElement('p');p.textContent=`${s.source_type} ${s.source_token||''} · ${s.connector_status} (${s.health_reason||'not checked'}) · ${s.active?'active':'inactive'} · Jobs observed ${s.verification_evidence?.postings_observed||0} · Last verified ${s.last_success_at||'never'} · Last attempt ${s.last_attempt_at||'never'} · Next retry ${s.next_retry_at||'eligible'} · Failures ${s.consecutive_failures||0}${s.error_details?` · ${s.error_details}`:''}`;a.append(p);const stage=document.createElement('small');const ev=s.verification_evidence||{};stage.textContent='Evidence: '+(e.evidence_url||s.candidate_record_url||'not recorded')+(ev.recognized_ats_provider?` · ATS ${ev.recognized_ats_provider}`:'')+(ev.http_responses?.length?` · HTTP ${ev.http_responses.map(x=>`${x.host}:${x.status_code}`).join(', ')}`:'')+' · Stages: '+(s.stages||[]).map(x=>`${x.stage_key}=${x.status}`).join(' · ');a.append(stage);const validate=document.createElement('button');validate.textContent='Validate when eligible';validate.onclick=async()=>{try{const x=await api(`/api/employers/${encodeURIComponent(s.employer_id)}/validate`,{method:'POST'});$('status').textContent=x.message;await load()}catch(x){$('status').textContent=x.message}};a.append(validate);const force=document.createElement('button');force.textContent='Force revalidate';force.onclick=async()=>{try{const x=await api(`/api/employers/${encodeURIComponent(s.employer_id)}/validate?force=true`,{method:'POST'});$('status').textContent=x.message;await load()}catch(x){$('status').textContent=x.message}};a.append(force);if(s.active){const disable=document.createElement('button');disable.textContent='Disable';disable.onclick=async()=>{await api(`/api/employers/${encodeURIComponent(s.employer_id)}/disable`,{method:'POST'});load()};a.append(disable)}}$('list').append(a)}}
 $('discover').onclick=async()=>{try{const d=await api('/api/employers/discover-source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('name').value.trim(),website_url:$('website').value.trim()})});$('status').textContent=`Found ${d.count}, registered ${d.registered} inactive source(s). Use Validate on a source to activate after public response validation.`;await load()}catch(e){$('status').textContent=e.message}};
 function csvRows(text){const lines=text.split(/\r?\n/).filter(Boolean),parse=line=>{const out=[];let v='',q=false;for(let i=0;i<line.length;i++){if(line[i]==='"'&&q&&line[i+1]==='"'){v+='"';i++}else if(line[i]==='"')q=!q;else if(line[i]===','&&!q){out.push(v);v=''}else v+=line[i]}out.push(v);return out};const heads=parse(lines.shift()).map(x=>x.trim());return lines.map(line=>Object.fromEntries(parse(line).map((v,i)=>[heads[i],v.trim()])))}
 $('import').onclick=async()=>{try{const f=$('file').files[0];if(!f)throw Error('Choose a candidate file.');const text=await f.text(),data=f.name.toLowerCase().endsWith('.json')?JSON.parse(text):null;const rows=data?(Array.isArray(data)?data:data.sources):csvRows(text);const d=await api('/api/employers/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sources:rows})});$('status').textContent=`Imported ${d.imported} inactive source(s).`;await load()}catch(e){$('status').textContent=e.message}};
@@ -1767,7 +1844,7 @@ PAGE = r'''<!doctype html>
 <title>Find Jobs · BabyStepsAI</title><style>
 *{box-sizing:border-box}body{font-family:system-ui,sans-serif;max-width:900px;margin:36px auto;padding:0 18px;background:#f8fafc;color:#172033}header,main{background:white;border:1px solid #e2e8f0;border-radius:14px;padding:24px;margin-bottom:18px}h1{margin:0 0 8px}p{color:#536174}textarea{width:100%;min-height:100px;padding:12px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}button{margin-top:12px;background:#2563eb;color:white;border:0;border-radius:8px;padding:11px 18px;font:inherit;cursor:pointer}button:disabled{opacity:.6}.note{font-size:14px}.job{padding:16px 0;border-top:1px solid #e2e8f0}.job h3{margin:0 0 6px}.job p{margin:4px 0}.error{color:#b91c1c}.diagnostics{font-size:14px;background:#f1f5f9;padding:12px;border-radius:8px}</style></head>
 <body><header><h1>Find Jobs</h1><p>Search registered public job sources using your saved career preferences and a prompt.</p><a href="/">Dashboard</a> · <a href="/careers">Career preferences</a> · <a href="/applications">Applications</a> · <a href="/application-settings">Automation permissions</a></header>
-<main><h2>What are you looking for?</h2><label for="prompt">Add focus or context for this search</label><textarea id="prompt" placeholder="For example: Find entry level data engineer roles in the United States"></textarea><p class="note">Results use registered public job sources. Matches are preliminary; eligibility must be analyzed and reviewed. Applications are never submitted automatically.</p><button id="search">Find Jobs</button><button id="cancelSearch" hidden>Cancel search</button><button id="analyze" hidden>Analyze Matches</button><label for="batchSize">Jobs per AI batch</label> <select id="batchSize"><option value="3">3</option><option value="4">4</option><option value="5">5</option></select><button id="pause" hidden>Pause Analysis</button><button id="resume" hidden>Resume Analysis</button><p id="status" role="status"></p><p id="matchStatus" role="status"></p><div id="diagnostics"></div><div id="jobFilters" hidden><label>Search title/company <input id="filterText" type="search"></label> <label>Company <select id="filterCompany"><option value="">All companies</option></select></label> <label>Category <select id="filterCategory"><option value="">All categories</option></select></label> <label>Location <input id="filterLocation" type="search" placeholder="City or country"></label> <label>Experience <select id="filterExperience"><option value="">All levels</option></select></label> <label>Work arrangement <select id="filterArrangement"><option value="">All arrangements</option></select></label> <label>Employment type <select id="filterEmployment"><option value="">All employment types</option></select></label> <label>Source <select id="filterSource"><option value="">All sources</option></select></label> <label>Posting recency <select id="filterRecency"><option value="">Any date</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div id="results"></div><div id="matchResults"></div></main>
+<main><h2>What are you looking for?</h2><label for="prompt">Add focus or context for this search</label><textarea id="prompt" placeholder="For example: Find entry level data engineer roles in the United States"></textarea><p class="note">Results use registered public job sources. Matches are preliminary; eligibility must be analyzed and reviewed. Applications are never submitted automatically.</p><button id="search">Find Jobs</button><button id="cancelSearch" hidden>Cancel search</button><button id="analyze" hidden>Analyze Matches</button><label for="batchSize">Jobs per AI batch</label> <select id="batchSize"><option value="3">3</option><option value="4">4</option><option value="5">5</option></select><button id="pause" hidden>Pause Analysis</button><button id="resume" hidden>Resume Analysis</button><p id="status" role="status"></p><p id="matchStatus" role="status"></p><div id="diagnostics"></div><div id="coverageMetrics" class="diagnostics" hidden></div><div id="jobFilters" hidden><label>Search title/company <input id="filterText" type="search"></label> <label>Company <select id="filterCompany"><option value="">All companies</option></select></label> <label>Category <select id="filterCategory"><option value="">All categories</option></select></label> <label>Location <input id="filterLocation" type="search" placeholder="City or country"></label> <label>Experience <select id="filterExperience"><option value="">All levels</option></select></label> <label>Discovery status <select id="filterDiscovery"><option value="">New and previously seen</option><option value="newly_discovered">Newly discovered</option><option value="previously_seen">Previously seen</option></select></label> <label>Eligibility <select id="filterEligibility"><option value="">All classifications</option><option value="needs_review">Needs review</option><option value="potential_match">Potential match</option><option value="not_eligible">Not eligible</option><option value="failed">Failed analysis</option><option value="not_analyzed">Not analyzed</option></select></label> <label>Description <select id="filterDescription"><option value="">Any description status</option><option value="available">Available</option><option value="missing">Missing or incomplete</option></select></label> <label>Work arrangement <select id="filterArrangement"><option value="">All arrangements</option></select></label> <label>Employment type <select id="filterEmployment"><option value="">All employment types</option></select></label> <label>Source <select id="filterSource"><option value="">All sources</option></select></label> <label>Posting recency <select id="filterRecency"><option value="">Any date</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label></div><div id="results"></div><div id="matchResults"></div></main>
 <script>
 const button=document.getElementById('search');
 const cancelSearch=document.getElementById('cancelSearch');
@@ -1784,6 +1861,9 @@ let currentJobs=[];
 let polling=false;
 let discoveryRunId=null;
 let discoveryTimer=null;
+let currentDiagnostics={};
+
+function renderCoverage(){const root=document.getElementById('coverageMetrics');if(!currentJobs.length){root.hidden=true;return}const count=f=>currentJobs.filter(f).length,early=new Set(['New Graduate','Early Career','Graduate Eligible']);const values=[['Newly discovered',count(j=>j.discovery_status==='newly_discovered')],['Previously seen',count(j=>j.discovery_status==='previously_seen')],['Early-career evidence',count(j=>early.has(j.experience_level))],['Needs review',count(j=>(j.eligibility_classification||'needs_review')==='needs_review')],['Confirmed ineligible / filter conflicts',count(j=>j.eligibility_classification==='not_eligible')+Number(currentDiagnostics.experience_mismatches||0)+Number(currentDiagnostics.geographic_mismatches||0)+Number(currentDiagnostics.rejected_by_filter?.employment_type||0)+Number(currentDiagnostics.rejected_by_filter?.work_arrangement||0)+Number(currentDiagnostics.rejected_by_filter?.instructions||0)],['Descriptions missing',count(j=>!j.description_available)],['Failed employer sources',(currentDiagnostics.feed_failures||[]).length]];root.hidden=false;root.replaceChildren(...values.map(([label,value])=>{const item=document.createElement('span');item.textContent=`${label}: ${value}`;return item}))}
 
 function renderJobs(){
   const text=(document.getElementById('filterText').value||'').toLowerCase();
@@ -1795,6 +1875,9 @@ function renderJobs(){
   const employment=document.getElementById('filterEmployment').value;
   const source=document.getElementById('filterSource').value;
   const recency=Number(document.getElementById('filterRecency').value||0);
+  const discovery=document.getElementById('filterDiscovery').value;
+  const eligibility=document.getElementById('filterEligibility').value;
+  const description=document.getElementById('filterDescription').value;
   results.replaceChildren();
   const visible=currentJobs.filter(job=>{
     const title=String(job.title||'').toLowerCase(),name=String(job.company||'');
@@ -1802,16 +1885,19 @@ function renderJobs(){
       (!category||(job.career_category||'Unknown')===category)&&(!location||String(job.location||'').toLowerCase().includes(location))&&
       (!level||(job.experience_level||'Unknown')===level)&&(!arrangement||(job.work_arrangement||'Unknown')===arrangement)&&
       (!employment||(job.employment_type||'Unknown')===employment)&&(!source||(job.source_platform||'Unknown')===source)&&
-      (!recency||(job.posting_date&&((Date.now()-Date.parse(job.posting_date))/(86400000)<=recency)));
+      (!discovery||(job.discovery_status||'previously_seen')===discovery)&&
+      (!eligibility||(eligibility==='failed'?job.matching_status==='failed':eligibility==='not_analyzed'?['not_analyzed','stale'].includes(job.matching_status||'not_analyzed'):(job.eligibility_classification||'needs_review')===eligibility))&&
+      (!description||(description==='available'?job.description_available:!job.description_available))&&
+      (!recency||((job.posting_date||job.last_verified_at)&&((Date.now()-Date.parse(job.posting_date||job.last_verified_at))/(86400000)<=recency)));
   });
-  for(const job of visible){const article=document.createElement('article');article.className='job';const title=document.createElement('h3');title.textContent=job.title;const locationLabel=job.location_status==='eligible'?'location verified':job.location_status==='unknown'?'location needs review':job.location_status||'location needs review';const detail=document.createElement('p');detail.textContent=`${job.company} · ${job.location||'Location unknown'} · ${job.employment_type||'Employment type unknown'} · ${locationLabel} · ${job.source_platform||'source unknown'} · Preliminary`;const level=document.createElement('p');level.className='note';level.textContent=`Experience level: ${job.experience_level||'Ambiguous'} · relevance rank ${job.relevance_score??'—'}/100. ${[...(job.experience_level_evidence||[]),...(job.ranking_explanation||[])].join(' ')}`;const why=document.createElement('p');why.className='note';why.textContent=[...new Set([...(job.review_reasons||[]),job.location_reason||''].filter(Boolean))].join(' ');const windows=document.createElement('p');windows.className='note';windows.textContent=(job.graduation_windows||[]).map(x=>`Graduation eligibility: ${x.start_year}${x.start_year===x.end_year?'':`–${x.end_year}`}`).join(' · ');const education=job.education_requirements||{},educationLine=[...(education.required||[]).map(x=>'Required: '+x),...(education.preferred||[]).map(x=>'Preferred: '+x),...(education.unclear||[]).map(x=>'Unclear: '+x)];const educationNote=document.createElement('p');educationNote.className='note';educationNote.textContent=educationLine.length?'Education evidence: '+educationLine.join(' · '):'';const link=document.createElement('a');link.href=job.job_url||job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='View original posting';const apply=document.createElement('a');apply.href=job.url;apply.target='_blank';apply.rel='noopener noreferrer';apply.textContent='Application page';apply.style.marginLeft='14px';article.append(title,detail,level,why);if(windows.textContent)article.append(windows);if(educationNote.textContent)article.append(educationNote);article.append(link,apply);results.append(article)}
+  for(const job of visible){const article=document.createElement('article');article.className='job';const title=document.createElement('h3');title.textContent=job.title;const locationLabel=job.location_status==='eligible'?'location verified':job.location_status==='unknown'?'location needs review':job.location_status||'location needs review';const detail=document.createElement('p');detail.textContent=`${job.company} · ${job.location||'Location unknown'} · ${job.employment_type||'Employment type unknown'} · ${locationLabel} · ${job.source_platform||'source unknown'} · Preliminary`;const level=document.createElement('p');level.className='note';level.textContent=`Experience level: ${job.experience_level||'Ambiguous'} · relevance rank ${job.relevance_score??'—'}/100. ${[...(job.experience_level_evidence||[]),...(job.ranking_explanation||[])].join(' ')}`;const why=document.createElement('p');why.className='note';why.textContent=[...new Set([...(job.review_reasons||[]),job.location_reason||''].filter(Boolean))].join(' ');const windows=document.createElement('p');windows.className='note';windows.textContent=(job.graduation_windows||[]).map(x=>`Graduation eligibility: ${x.start_year}${x.start_year===x.end_year?'':`–${x.end_year}`}`).join(' · ');const education=job.education_requirements||{},educationLine=[...(education.required||[]).map(x=>'Required: '+x),...(education.preferred||[]).map(x=>'Preferred: '+x),...(education.unclear||[]).map(x=>'Unclear: '+x)];const educationNote=document.createElement('p');educationNote.className='note';educationNote.textContent=educationLine.length?'Education evidence: '+educationLine.join(' · '):'';const link=document.createElement('a');link.href=job.job_url||job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='View original posting';const apply=document.createElement('a');apply.href=job.url;apply.target='_blank';apply.rel='noopener noreferrer';apply.textContent='Application page';apply.style.marginLeft='14px';const classification=document.createElement('p');classification.className='note';classification.textContent=`Eligibility: ${job.eligibility_classification||'needs_review'} · matching: ${job.matching_status||'not_analyzed'}${job.matching_failure_reason?' · '+job.matching_failure_reason:''}`;const description=document.createElement('p');description.className='note';description.textContent=job.description_available?'Usable job description available':'Description missing or too incomplete for reliable eligibility matching';article.append(title,detail,level,classification,description,why);if(windows.textContent)article.append(windows);if(educationNote.textContent)article.append(educationNote);article.append(link,apply);results.append(article)}
   if(!visible.length&&currentJobs.length)results.textContent='No openings match these filters.';
 }
-for(const id of ['filterText','filterCompany','filterCategory','filterLocation','filterExperience','filterArrangement','filterEmployment','filterSource','filterRecency'])document.getElementById(id).addEventListener('input',renderJobs);
+for(const id of ['filterText','filterCompany','filterCategory','filterLocation','filterExperience','filterDiscovery','filterEligibility','filterDescription','filterArrangement','filterEmployment','filterSource','filterRecency'])document.getElementById(id).addEventListener('input',renderJobs);
 
 button.addEventListener('click',async()=>{
   button.disabled=true;cancelSearch.hidden=false;status.textContent='Starting discovery…';status.className='';
-  results.replaceChildren();diagnostics.replaceChildren();matchResults.replaceChildren();analyzeButton.hidden=true;currentJobKeys=[];currentJobs=[];document.getElementById('jobFilters').hidden=true;
+  results.replaceChildren();diagnostics.replaceChildren();matchResults.replaceChildren();document.getElementById('coverageMetrics').hidden=true;analyzeButton.hidden=true;currentJobKeys=[];currentJobs=[];currentDiagnostics={};document.getElementById('jobFilters').hidden=true;
   discoveryRunId=(globalThis.crypto&&crypto.randomUUID)?crypto.randomUUID():`run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   discoveryTimer=setInterval(async()=>{try{const r=await fetch(`/api/jobs/discovery/${encodeURIComponent(discoveryRunId)}`);if(!r.ok)return;const s=await r.json();status.textContent=`Searching ${s.sources_checked} of ${s.total_sources} sources · ${s.postings_retrieved} postings retrieved${s.cancel_requested?' · cancelling after current source':''}`;}catch(_){/* final search response remains authoritative */}},700);
   try{
@@ -1819,14 +1905,14 @@ button.addEventListener('click',async()=>{
     const data=await response.json();if(!response.ok)throw new Error(data.detail||'Search failed');
     const messages={cancelled:'Discovery cancelled safely; completed source results were retained.',all_sources_unavailable:'All configured job sources are unavailable.',no_matching_openings:'No matching openings were returned by the available sources.',filters_too_restrictive:'Openings were retrieved, but the current filters rejected them.',preliminary_matches:`${data.count} preliminary match${data.count===1?'':'es'} need review.`};
     status.textContent=messages[data.status]||'Search complete.';
-    const d=data.diagnostics;
+    const d=data.diagnostics;currentDiagnostics=d||{};
     if(d){const p=document.createElement('p');p.className='diagnostics';p.textContent=`Employers configured: ${d.employers_configured??'—'} · Employers checked: ${d.companies_checked} · Sources: ${(d.source_platforms||[]).join(', ')||'none'} · Jobs discovered: ${d.postings_retrieved} · New: ${d.new_jobs??'—'} · Previously seen: ${d.previously_seen_jobs??'—'} · Relevant roles: ${d.relevant_jobs??d.preliminary_matches} · Genuine early-career candidates: ${d.genuine_early_career_candidates??0} · Experience level needs review: ${d.experience_level_needs_review??0} · Duplicates removed: ${d.duplicate_listings_removed??0} · Expired postings: ${d.expired_or_removed??0} · Unrelated excluded: ${d.rejected_unrelated??d.rejected_by_filter.role} · Geographic mismatches: ${d.geographic_mismatches??d.rejected_by_filter.location} · Confirmed experience mismatches: ${d.experience_mismatches??d.rejected_by_filter.experience_level} · Location needs review: ${d.location_needs_review??0} · Preliminary matches: ${d.preliminary_matches} · Needs review: ${d.needs_review}`;diagnostics.append(p);for(const failure of d.feed_failures){const f=document.createElement('p');f.className='note';f.textContent=`${failure.company} (${failure.source_platform||'source'}): ${failure.reason}`;diagnostics.append(f)}}
     for(const warning of data.feed_warnings||[]){const p=document.createElement('p');p.className='note';p.textContent=warning;diagnostics.append(p)}
     currentJobs=data.results||[];for(const job of currentJobs)currentJobKeys.push(job.job_key);
     document.getElementById('jobFilters').hidden=!currentJobs.length;
-    const selectOptions={filterCompany:[...new Set(currentJobs.map(j=>j.company).filter(Boolean))],filterCategory:[...new Set(currentJobs.map(j=>j.career_category||'Unknown'))],filterExperience:[...new Set(currentJobs.map(j=>j.experience_level||'Unknown'))],filterArrangement:[...new Set(currentJobs.map(j=>j.work_arrangement||'Unknown'))],filterEmployment:[...new Set(currentJobs.map(j=>j.employment_type||'Unknown'))],filterSource:[...new Set(currentJobs.map(j=>j.source_platform||'Unknown'))]};
+    const selectOptions={filterDiscovery:[...new Set(currentJobs.map(j=>j.discovery_status||'previously_seen'))],filterDescription:[...new Set(currentJobs.map(j=>j.description_available?'available':'missing'))],filterCompany:[...new Set(currentJobs.map(j=>j.company).filter(Boolean))],filterCategory:[...new Set(currentJobs.map(j=>j.career_category||'Unknown'))],filterExperience:[...new Set(currentJobs.map(j=>j.experience_level||'Unknown'))],filterArrangement:[...new Set(currentJobs.map(j=>j.work_arrangement||'Unknown'))],filterEmployment:[...new Set(currentJobs.map(j=>j.employment_type||'Unknown'))],filterSource:[...new Set(currentJobs.map(j=>j.source_platform||'Unknown'))]};
     for(const [id,values] of Object.entries(selectOptions)){const select=document.getElementById(id),label=select.options[0].textContent;select.replaceChildren(new Option(label,''));for(const value of values.sort())select.add(new Option(value,value));}
-    renderJobs();
+    renderCoverage();renderJobs();
     analyzeButton.hidden=currentJobKeys.length===0;matchStatus.textContent='';
   }catch(error){status.textContent=error.message;status.className='error'}finally{button.disabled=false;cancelSearch.hidden=true;clearInterval(discoveryTimer)}
 });
@@ -1845,7 +1931,7 @@ analyzeButton.addEventListener('click',async()=>{
 
 async function renderProgress(){
   const poll=await fetch('/api/jobs/match-progress');const state=await poll.json();if(!poll.ok)throw new Error(state.detail||'Could not retrieve analysis status');
-  matchStatus.textContent=`AI analysis: ${state.completed+state.failed+state.excluded} of ${state.total} processed · ${state.pending} pending · Potential matches ${state.potential_match} · Needs review ${state.needs_review} · Not eligible ${state.not_eligible} · Excluded as unrelated ${state.excluded} · Status: ${state.status}`;
+  matchStatus.textContent=`AI analysis: ${state.completed+state.failed+state.excluded} of ${state.total} processed · ${state.pending} pending · Potential matches ${state.potential_match} · Needs review ${state.needs_review} · Not eligible ${state.not_eligible} · Excluded as unrelated ${state.excluded} · Status: ${state.status}`;const resultByKey=new Map((state.results||[]).filter(x=>x.job_key).map(x=>[x.job_key,x]));currentJobs=currentJobs.map(job=>{const match=resultByKey.get(job.job_key);return match?{...job,matching_status:match.stale?'stale':match.status,eligibility_classification:match.stale?'needs_review':(match.classification||'needs_review'),matching_failure_reason:match.error||''}:job});renderCoverage();renderJobs();
   pauseButton.hidden=state.status!=='running'&&state.status!=='queued';resumeButton.hidden=state.status!=='paused';
   matchResults.replaceChildren();
       for(const item of state.results||[]){

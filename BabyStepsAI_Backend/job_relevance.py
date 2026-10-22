@@ -302,32 +302,68 @@ def evaluate_location(job, requested_location):
     return "unknown", f"Posting location cannot be verified against the requested location ({requested_location})."
 
 
-def infer_prompt_preferences(prompt, preferences):
-    """Apply prompt-only location/level hints without overriding saved choices."""
-    effective = dict(preferences or {})
+def prompt_constraints(prompt):
+    """Extract explicit, safely enforceable refinements from a search prompt."""
     text = str(prompt or "").casefold()
-    location = str(effective.get("location", "")).strip()
-    if not location or location.casefold() in {"any", "anywhere", "global"}:
-        for country, aliases in COUNTRY_ALIASES.items():
-            if any(_contains_alias(text, alias) for alias in aliases):
-                effective["location"] = country.title()
+    constraints = {"location": "", "employment_types": [], "levels": [],
+                   "exclude_internships": False, "exclude_senior": False}
+    for country, aliases in COUNTRY_ALIASES.items():
+        if any(_contains_alias(text, alias) for alias in aliases):
+            constraints["location"] = country.title()
+            break
+    if not constraints["location"]:
+        for state in US_STATES:
+            if _contains_alias(text, state):
+                constraints["location"] = state.title()
                 break
-        if not effective.get("location") or effective["location"] == location:
-            for state in US_STATES:
-                if _contains_alias(text, state):
-                    effective["location"] = state.title()
-                    break
-    if not effective.get("levels"):
-        inferred_levels = []
-        if re.search(r"\b(new[- ]grads?|new graduates?|recent grads?|class of 20\d\d|graduat(?:e|ing) in 20\d\d)\b", text):
-            inferred_levels.append("New Graduate")
-        if re.search(r"\b(entry[- ]level|early career|junior|associate)\b", text):
-            inferred_levels.extend(["Entry Level", "Junior", "Associate"])
-        if re.search(r"\b(senior|staff|principal|manager|director)\b", text):
-            inferred_levels.append("Senior")
-        if inferred_levels:
-            effective["levels"] = list(dict.fromkeys(inferred_levels))
+    if re.search(r"\b(full[- ]time|full time positions?)\b", text):
+        constraints["employment_types"].append("Full-time")
+    if re.search(r"\b(include|only|looking for|find)\s+(?:paid\s+)?internships?\b", text):
+        constraints["employment_types"].append("Internship")
+    constraints["exclude_internships"] = bool(re.search(r"\b(exclude|no|without|skip)\b[^.!?]{0,100}\binternships?\b", text))
+    constraints["exclude_senior"] = bool(re.search(r"\b(exclude|no|without|skip)\b[^.!?]{0,100}\b(?:senior|staff|principal|lead|director|manager)\b", text))
+    early_patterns = (
+        (r"\bnew[- ]grads?|new graduates?|recent grads?|class of 20\d\d|graduat(?:e|ing) in 20\d\d\b", "New Graduate"),
+        (r"\bentry[- ]level\b", "Entry Level"),
+        (r"\bjunior\b", "Junior"), (r"\bassociate\b", "Associate"),
+        (r"\bsoftware engineer\s+i\b|\bswe\s+i\b", "Entry Level"),
+    )
+    for pattern, level in early_patterns:
+        if re.search(pattern, text): constraints["levels"].append(level)
+    if re.search(r"\b(senior|staff|principal|lead|director|manager)\b", text) and not constraints["exclude_senior"]:
+        constraints["levels"].append("Senior")
+    constraints["levels"] = list(dict.fromkeys(constraints["levels"]))
+    constraints["employment_types"] = list(dict.fromkeys(constraints["employment_types"]))
+    return constraints
+
+
+def apply_prompt_preferences(prompt, preferences, *, ignore_fields=()):
+    """Return workflow-scoped preferences; never persist or mutate saved choices."""
+    effective = dict(preferences or {})
+    constraints = prompt_constraints(prompt)
+    ignored = set(ignore_fields)
+    if "location" not in ignored and constraints["location"]:
+        effective["location"] = constraints["location"]
+    if "employment_types" not in ignored and constraints["employment_types"]:
+        effective["employment_types"] = constraints["employment_types"]
+    if "levels" not in ignored and constraints["levels"]:
+        effective["levels"] = constraints["levels"]
+    effective["_prompt_exclude_internships"] = constraints["exclude_internships"] and "employment_types" not in ignored
+    effective["_prompt_exclude_senior"] = constraints["exclude_senior"] and "levels" not in ignored
     effective["search_prompt"] = str(prompt or "")
+    return effective
+
+
+def infer_prompt_preferences(prompt, preferences):
+    """Compatibility wrapper for existing callers."""
+    saved=preferences or {}
+    ignore=[field for field in ("levels","employment_types") if saved.get(field)]
+    location=str(saved.get("location") or "").casefold()
+    if location and location not in {"any","anywhere","global"}:ignore.append("location")
+    effective=apply_prompt_preferences(prompt, saved, ignore_fields=ignore)
+    constraints=prompt_constraints(prompt)
+    effective["_prompt_exclude_internships"]=constraints["exclude_internships"]
+    effective["_prompt_exclude_senior"]=constraints["exclude_senior"]
     return effective
 
 
@@ -482,7 +518,7 @@ def discovery_relevance_score(job, preferences, confirmed_skills=()):
     early = {"new graduate", "entry level", "junior", "associate", "early career", "internship"}
     if requested and level.casefold() in requested:
         score += 20
-        explanations.append("Posting level matches a saved experience-level preference (+20).")
+        explanations.append("Posting level matches a selected experience-level preference (+20).")
     elif requested & early and level in {"New Graduate", "Early Career", "Internship", "Graduate Eligible"}:
         score += 15
         explanations.append("Posting has explicit early-career evidence (+15).")
@@ -493,7 +529,7 @@ def discovery_relevance_score(job, preferences, confirmed_skills=()):
     aliases = role_aliases(preferences)
     if aliases and any(re.search(r"(?<![a-z0-9])" + re.escape(alias.casefold()) + r"(?![a-z0-9])", str(job.get("title", "")).casefold()) for alias in aliases):
         score += 10
-        explanations.append("Title evidence matches a saved career category or role (+10).")
+        explanations.append("Title evidence matches a selected career category or role (+10).")
     skill_hits = [str(skill).strip() for skill in confirmed_skills if isinstance(skill, str) and len(skill.strip()) >= 2
                   and re.search(r"(?<![a-z0-9])" + re.escape(skill.strip().casefold()) + r"(?![a-z0-9])", title_description)]
     if skill_hits:
@@ -502,13 +538,13 @@ def discovery_relevance_score(job, preferences, confirmed_skills=()):
         explanations.append(f"{len(skill_hits)} confirmed candidate skill(s) appear in the posting (+{skill_points}).")
     if job.get("location_status") == "eligible":
         score += 12
-        explanations.append("Posting location matches the saved location (+12).")
+        explanations.append("Posting location matches the selected location (+12).")
     if preferences.get("employment_types"):
         wanted = [str(value).casefold() for value in preferences["employment_types"]]
         observed = str(job.get("employment_type") or "").casefold()
         if observed and any(value in observed for value in wanted):
             score += 8
-            explanations.append("Employment type matches a saved preference (+8).")
+            explanations.append("Employment type matches a selected preference (+8).")
     posted = job.get("posting_date")
     if posted:
         try:

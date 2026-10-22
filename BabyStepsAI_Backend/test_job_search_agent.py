@@ -7,7 +7,8 @@ from fastapi import HTTPException
 
 import job_search_agent as jobs
 from job_connectors import EmployerSource
-from job_relevance import evaluate_location, extract_experience_requirements, infer_prompt_preferences
+from job_relevance import (evaluate_location, extract_experience_requirements, infer_prompt_preferences,
+                           apply_prompt_preferences, prompt_constraints)
 
 
 def posting(job_id, title, **overrides):
@@ -59,6 +60,13 @@ class DiscoveryTests(unittest.TestCase):
                 return [], str(value)
             return value, None
         return patch.object(jobs, "fetch_board", side_effect=fetch)
+
+    def test_find_jobs_dashboard_exposes_coverage_and_eligibility_filters(self):
+        page=jobs.PAGE
+        for marker in ("coverageMetrics","filterDiscovery","filterEligibility","filterDescription",
+                       "Newly discovered","Previously seen","Confirmed ineligible",
+                       "Failed employer sources","Description missing or too incomplete"):
+            self.assertIn(marker,page)
 
     def test_related_software_titles_are_kept_for_review(self):
         prefs = jobs.preferences()
@@ -219,7 +227,7 @@ class DiscoveryTests(unittest.TestCase):
         vague_score, _, _, _ = discovery_relevance_score(
             {"title": "Software Engineer", "description": "", "location_status": "eligible"}, prefs)
         self.assertGreater(early_score, vague_score)
-        self.assertTrue(any("matches a saved experience-level preference" in item for item in explanation))
+        self.assertTrue(any("matches a selected experience-level preference" in item for item in explanation))
         skill_score, skill_explanation, _, _ = discovery_relevance_score(
             {"title": "Software Engineer", "description": "Python experience preferred.", "location_status": "eligible"},
             prefs, ["Python"])
@@ -287,6 +295,29 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "preliminary_matches")
         self.assertEqual([row["title"] for row in result["results"]], ["Software Engineer"])
 
+    def test_prompt_early_career_synonyms_and_explicit_exclusions_are_understood(self):
+        constraints=prompt_constraints("new-grad, entry-level, junior, associate, Software Engineer I; exclude senior positions and internships")
+        self.assertEqual(constraints["levels"],["New Graduate","Entry Level","Junior","Associate"])
+        self.assertTrue(constraints["exclude_senior"])
+        self.assertTrue(constraints["exclude_internships"])
+
+    def test_prompt_refinement_does_not_conflict_with_additional_saved_employment_options(self):
+        prefs=self.prefs(employment_types=["Full-time","Internship"])
+        effective=apply_prompt_preferences("Full-time new-graduate jobs; exclude internships and senior roles",prefs)
+        self.assertEqual(effective["employment_types"],["Full-time"])
+        self.assertEqual(effective["location"],"United States")
+        self.assertTrue(effective["_prompt_exclude_internships"])
+        self.assertTrue(effective["_prompt_exclude_senior"])
+        self.assertEqual(prefs["employment_types"],["Full-time","Internship"])
+
+    def test_explicit_prompt_senior_and_internship_restrictions_are_hard_filters(self):
+        prefs=apply_prompt_preferences("Software Engineer I full-time jobs; exclude internships and senior positions",self.prefs())
+        terms=jobs.search_terms("software engineering",prefs)
+        senior=posting(90,"Senior Software Engineer")
+        intern=posting(91,"Software Engineer Intern",metadata=[{"name":"Employment Type","value":"Internship"}])
+        self.assertEqual(jobs.assess_job(senior,prefs,terms)[1],"experience_level")
+        self.assertEqual(jobs.assess_job(intern,prefs,terms)[1],"employment_type")
+
     def test_saved_location_and_instruction_restrictions_are_hard_filters(self):
         prefs = self.prefs(instructions="remote only")
         terms = jobs.search_terms("software roles", prefs)
@@ -333,6 +364,21 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["postings_retrieved"], 1)
         self.assertEqual(result["diagnostics"]["preliminary_matches"], 1)
         self.assertEqual(result["results"][0]["review_status"], "needs_review")
+
+    def test_search_marks_new_and_previously_seen_roles_and_description_coverage(self):
+        description=("As a new graduate software engineer, you will build and maintain reliable product services. "
+            "You will collaborate with product and design, write tested code, review changes, improve system performance, "
+            "and learn the team's architecture. A bachelor's degree in computer science or a related field is preferred. "
+            "This full-time role is open to candidates graduating in 2026 or 2027.")
+        value=posting(991,"Software Engineer I",content=description)
+        with self._mock_feeds({"cloudflare":[value]}):
+            first=jobs.discover("new graduate software engineering jobs",self.prefs())
+            second=jobs.discover("new graduate software engineering jobs",self.prefs())
+        self.assertEqual(first["results"][0]["discovery_status"],"newly_discovered")
+        self.assertTrue(first["results"][0]["description_available"])
+        self.assertEqual(first["results"][0]["eligibility_classification"],"needs_review")
+        self.assertEqual(first["results"][0]["matching_status"],"not_analyzed")
+        self.assertEqual(second["results"][0]["discovery_status"],"previously_seen")
 
     def test_type_error_in_one_employer_does_not_stop_remaining_feeds(self):
         sources=[EmployerSource(name,"greenhouse",token,f"https://boards.greenhouse.io/{token}")

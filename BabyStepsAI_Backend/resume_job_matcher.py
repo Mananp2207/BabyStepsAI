@@ -40,6 +40,8 @@ GEMINI_TIMEOUT = (5, 120)
 MATCHING_JSON_REPAIR_INSTRUCTION = "The prior output was not valid for the requested schema. Return exactly one valid JSON object matching the schema in the prompt. Do not use Markdown, comments, or extra text."
 MIN_JOBS_PER_BATCH = 3
 MAX_JOBS_PER_BATCH = 5
+MATCH_SLOW_WARNING_SECONDS = 180
+MATCH_OWNERLESS_RECOVERY_SECONDS = 120
 MAX_PROFILE_CHARS = 9000
 MAX_DESCRIPTION_CHARS = 11000
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ollama-job-match")
@@ -157,6 +159,7 @@ def initialize():
             ("heartbeat_at","TEXT"),
             ("lease_expires_at","TEXT"),
             ("current_job_key","TEXT NOT NULL DEFAULT ''"),
+            ("current_job_started_at","TEXT"),
             ("last_successful_job_key","TEXT NOT NULL DEFAULT ''"),
             ("cancel_requested","INTEGER NOT NULL DEFAULT 0"),
             ("provider","TEXT NOT NULL DEFAULT 'ollama'"),
@@ -683,9 +686,30 @@ def _persist_state(job_key, resume_id, status, result=None, error=None):
                     str(error)[:800] if error else None, timestamp, status, USER, job_key, resume_id))
 
 
+def _finish_session_job(session_id,owner_token,job_key,*,completed=False):
+    """Persist a checkpoint immediately after one job reaches a terminal state."""
+    if not session_id or not owner_token:return
+    stamp=now()
+    with database() as db:
+        db.execute("""UPDATE job_match_sessions SET current_job_key='',current_job_started_at=NULL,
+            last_successful_job_key=CASE WHEN ? THEN ? ELSE last_successful_job_key END,updated_at=?
+            WHERE session_id=? AND user_id=? AND owner_token=? AND current_job_key=?""",
+            (int(completed),job_key,stamp,session_id,USER,owner_token,job_key))
+
+
 def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None, owner_token=None,
                    provider="ollama",provider_model=None):
     saved_prefs = preferences() or {}
+    workflow_prefs=None
+    if session_id:
+        with database() as db:
+            session_row=db.execute("SELECT workflow_id FROM job_match_sessions WHERE session_id=? AND user_id=?",(session_id,USER)).fetchone()
+            columns={row[1] for row in db.execute("PRAGMA table_info(user_workflows)")} if session_row and session_row["workflow_id"] else set()
+            workflow_row=db.execute("SELECT diagnostics_json FROM user_workflows WHERE workflow_id=? AND user_id=?",
+                (session_row["workflow_id"],USER)).fetchone() if "diagnostics_json" in columns else None
+        if workflow_row:
+            try:workflow_prefs=json.loads(workflow_row["diagnostics_json"] or "{}").get("workflow_preferences")
+            except (TypeError,json.JSONDecodeError):workflow_prefs=None
     feeds = {}
     for job_key in job_keys:
         if session_id:
@@ -696,17 +720,20 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
                 return
             if owner_token:
                 with database() as db:
-                    db.execute("UPDATE job_match_sessions SET current_job_key=?,updated_at=? WHERE session_id=? AND user_id=? AND owner_token=?",
-                               (job_key,now(),session_id,USER,owner_token))
+                    stamp=now()
+                    db.execute("UPDATE job_match_sessions SET current_job_key=?,current_job_started_at=?,updated_at=? WHERE session_id=? AND user_id=? AND owner_token=?",
+                               (job_key,stamp,stamp,session_id,USER,owner_token))
         _persist_state(job_key, resume_id, "processing")
         job, feed_error = _find_feed_job(job_key, feeds)
         if feed_error:
             _persist_state(job_key, resume_id, "failed", error=feed_error)
+            _finish_session_job(session_id,owner_token,job_key)
             continue
-        prefs = infer_prompt_preferences(job.get("_search_prompt", ""), saved_prefs)
+        prefs = workflow_prefs or infer_prompt_preferences(job.get("_search_prompt", ""), saved_prefs)
         relevant, _, _ = relevance_for_job(normalize_job_record(job, job.get("_source_platform", "greenhouse")), prefs)
         if not relevant:
             _persist_state(job_key, resume_id, "excluded", error="Excluded before AI analysis: posting is unrelated to saved career preferences.")
+            _finish_session_job(session_id,owner_token,job_key)
             continue
         try:
             result = (analyze_with_ollama(profile,profile_status,prefs,job) if provider=="ollama"
@@ -722,14 +749,16 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
                     WHERE user_id=? AND job_key=? AND resume_id=?""",
                     (profile_fingerprint(profile, resume_id), stable_fingerprint(pref_data),
                      job_fingerprint(dict(stored) if stored else job), matching_engine_version(provider,provider_model), USER, job_key, resume_id))
+            _finish_session_job(session_id,owner_token,job_key,completed=True)
         except Exception as error:
             # Keep errors useful without logging resume or job description content.
             _persist_state(job_key, resume_id, "failed", error=f"Match analysis failed: {type(error).__name__}: {error}")
+            _finish_session_job(session_id,owner_token,job_key)
 
 
 def _release_match_owner(db,session_id,token,*,status=None,error=None):
     db.execute("""UPDATE job_match_sessions SET status=COALESCE(?,status),error=?,owner_token='',owner_pid=NULL,
-        owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,current_job_key='',updated_at=?
+        owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,current_job_key='',current_job_started_at=NULL,updated_at=?
         WHERE session_id=? AND user_id=? AND owner_token=?""",
         (status,str(error)[:800] if error else None,now(),session_id,USER,token))
 
@@ -782,13 +811,16 @@ def _session_worker(session_id, resume_id, profile_status, profile, owner_token=
                 batch=pending[:int(session["batch_size"])]
                 if not batch:
                     failed=sum(row["status"]=="failed" for row in rows)
-                    status="paused" if failed else "completed"
+                    # Failures are terminal, explicitly classified outcomes.
+                    # Keep the session and workflow completion states aligned;
+                    # the dashboard exposes a bounded retry action separately.
+                    status="completed"
                     _release_match_owner(db,session_id,owner_token,status=status,
-                                         error="Some jobs need retry; completed results were preserved." if failed else None)
+                                         error="Some jobs failed; completed results were preserved and failed analyses can be retried." if failed else None)
                     return
-                db.execute("""UPDATE job_match_sessions SET status='running',current_job_key=?,
+                db.execute("""UPDATE job_match_sessions SET status='running',current_job_key=?,current_job_started_at=?,
                     heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE session_id=? AND owner_token=?""",
-                    (batch[0],stamp,_match_lease_expiry(),stamp,session_id,owner_token))
+                    (batch[0],stamp,stamp,_match_lease_expiry(),stamp,session_id,owner_token))
             _process_batch(batch,resume_id,profile_status,profile,session_id,owner_token,provider,provider_model)
             with database() as db:
                 session=db.execute("SELECT status,owner_token,cancel_requested FROM job_match_sessions WHERE session_id=? AND user_id=?",
@@ -825,7 +857,8 @@ def _progress(session_id=None, job_keys=None):
                 session = db.execute("SELECT * FROM job_match_sessions WHERE user_id=? ORDER BY updated_at DESC LIMIT 1", (USER,)).fetchone()
         if not session:
             return {"status": "idle", "total": 0, "completed": 0, "failed": 0, "pending": 0,
-                    "potential_match": 0, "needs_review": 0, "not_eligible": 0, "excluded": 0, "results": []}
+                    "potential_match": 0, "needs_review": 0, "not_eligible": 0, "excluded": 0, "results": [],
+                    "worker_health":"idle","recovery_available":False,"current_elapsed_seconds":None}
         keys = json.loads(session["job_keys_json"])
         if job_keys is not None:
             keys = [key for key in keys if key in set(job_keys)]
@@ -835,7 +868,7 @@ def _progress(session_id=None, job_keys=None):
     classification_counts = {name: sum(1 for item in results if item.get("classification") == name)
                              for name in ("potential_match", "needs_review", "not_eligible")}
     public_results = [{key: value for key, value in item.items()
-                       if key not in {"resume_id", "job_key", "created_at", "updated_at"}}
+                       if key not in {"resume_id", "created_at", "updated_at"}}
                       for item in results]
     current_job=None
     if session["current_job_key"]:
@@ -850,9 +883,47 @@ def _progress(session_id=None, job_keys=None):
                 ON o.user_id=m.user_id AND o.job_key=m.job_key WHERE m.user_id=? AND m.resume_id=? AND m.job_key=?""",
                 (USER,session["resume_id"],session["last_successful_job_key"])).fetchone()
         if last:checkpoint={"company":last["company"],"title":last["title"],"at":last["updated_at"]}
+    stamp=datetime.now(timezone.utc)
+    def age_seconds(value):
+        if not value:return None
+        try:
+            parsed=datetime.fromisoformat(value)
+            if parsed.tzinfo is None:parsed=parsed.replace(tzinfo=timezone.utc)
+            return max(0,int((stamp-parsed).total_seconds()))
+        except (TypeError,ValueError):return None
+    heartbeat_age=age_seconds(session["heartbeat_at"])
+    current_elapsed=age_seconds(session["current_job_started_at"])
+    lease_expired=bool(session["lease_expires_at"] and session["lease_expires_at"]<=stamp.isoformat())
+    local_owner=bool(session["owner_token"] and session["owner_host"]==socket.gethostname())
+    owner_alive=_pid_is_alive(session["owner_pid"]) if local_owner else None
+    active_status=session["status"] in {"queued","running"}
+    recovery_available=False
+    if active_status and not session["owner_token"]:
+        recovery_available=(age_seconds(session["updated_at"]) or 0)>=MATCH_OWNERLESS_RECOVERY_SECONDS
+        worker_health="stalled_recoverable" if recovery_available else "owner_missing"
+    elif active_status and local_owner and owner_alive is False and lease_expired:
+        recovery_available=(age_seconds(session["updated_at"]) or 0)>=MATCH_OWNERLESS_RECOVERY_SECONDS
+        worker_health="stalled_recoverable" if recovery_available else "lease_expired_waiting"
+    elif active_status and local_owner and owner_alive is True:
+        worker_health=("slow_processing" if current_elapsed is not None and
+                       current_elapsed>=MATCH_SLOW_WARNING_SECONDS else "active")
+        if lease_expired or (heartbeat_age is not None and heartbeat_age>MATCH_HEARTBEAT_SECONDS*3):
+            worker_health="heartbeat_late"
+    elif active_status and session["owner_token"]:
+        worker_health="owner_unverified"
+    elif session["status"] in {"paused","interrupted"}:
+        worker_health="paused_checkpoint"
+    else:
+        worker_health=session["status"]
+    last_progress=session["heartbeat_at"] or session["updated_at"]
     return {"session_id":session["session_id"],"workflow_id":session["workflow_id"],"status": session["status"],
             "provider":session["provider"] or "ollama","provider_model":session["provider_model"] or MODEL,
             "owner_state":"owned" if session["owner_token"] else "unowned",
+            "owner_pid":session["owner_pid"],"owner_host":session["owner_host"],"owner_pid_alive":owner_alive,
+            "heartbeat_at":session["heartbeat_at"],"heartbeat_age_seconds":heartbeat_age,
+            "lease_expires_at":session["lease_expires_at"],"current_job_started_at":session["current_job_started_at"],
+            "current_elapsed_seconds":current_elapsed,"last_progress_at":last_progress,
+            "worker_health":worker_health,"recovery_available":recovery_available,
             "current_job":current_job,"last_successful_checkpoint":checkpoint,"error":session["error"],
             "total": len(keys), "completed": counts["completed"],
             "failed": counts["failed"], "pending": counts["queued"] + counts["processing"],
@@ -881,7 +952,7 @@ def _recover_expired_match_owners(db,stamp):
         if not lease or lease>stamp:continue
         if row["owner_host"]!=socket.gethostname() or _pid_is_alive(row["owner_pid"]):continue
         changed=db.execute("""UPDATE job_match_sessions SET status='interrupted',error='worker_lease_expired',
-            owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,current_job_key='',updated_at=?
+            owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,current_job_key='',current_job_started_at=NULL,updated_at=?
             WHERE session_id=? AND user_id=? AND owner_token=? AND status IN ('queued','running','paused')
             AND lease_expires_at=?""",(stamp,row["session_id"],USER,row["owner_token"],lease)).rowcount
         if changed:
@@ -1019,10 +1090,12 @@ def recover_match_session(session_id,confirmed_abandoned=False):
         lease=row["lease_expires_at"]
         if lease and lease>stamp:
             raise HTTPException(409,"active_worker: the matching worker lease is still valid.")
+        if row["owner_token"] and row["owner_host"]!=socket.gethostname():
+            raise HTTPException(409,"owner_unverified: this matching worker belongs to another host and cannot be safely recovered here.")
         if row["owner_pid"] and row["owner_host"]==socket.gethostname() and _pid_is_alive(row["owner_pid"]):
             raise HTTPException(409,"active_worker: the recorded matching worker process is still alive.")
         db.execute("""UPDATE job_match_sessions SET status='interrupted',error='abandoned_session_recovered',
-            owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,current_job_key='',updated_at=?
+            owner_token='',owner_pid=NULL,owner_host='',heartbeat_at=NULL,lease_expires_at=NULL,current_job_key='',current_job_started_at=NULL,updated_at=?
             WHERE session_id=? AND user_id=? AND status IN ('queued','running','paused')""",(stamp,session_id,USER))
         try:keys=json.loads(row["job_keys_json"] or '[]')
         except (TypeError,json.JSONDecodeError):keys=[]
@@ -1129,6 +1202,14 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
     # Fetch feeds outside any SQLite transaction; the connector cache reuses
     # discovery payloads where available.
     saved_preferences = preferences() or {}
+    workflow_preferences=None
+    if workflow_id:
+        with database() as db:
+            columns={row[1] for row in db.execute("PRAGMA table_info(user_workflows)")}
+            workflow_row=db.execute("SELECT diagnostics_json FROM user_workflows WHERE workflow_id=? AND user_id=?",(workflow_id,USER)).fetchone() if "diagnostics_json" in columns else None
+        if workflow_row:
+            try:workflow_preferences=json.loads(workflow_row["diagnostics_json"] or "{}").get("workflow_preferences")
+            except (TypeError,json.JSONDecodeError):workflow_preferences=None
     feed_cache = {}
     relevant_keys = []
     excluded_keys = []
@@ -1138,7 +1219,7 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
         if error:
             excluded_keys.append((key, error))
             continue
-        job_prefs = infer_prompt_preferences(job.get("_search_prompt", ""), saved_preferences)
+        job_prefs = workflow_preferences or infer_prompt_preferences(job.get("_search_prompt", ""), saved_preferences)
         relevant, _, _ = relevance_for_job(normalize_job_record(job, job.get("_source_platform", "greenhouse")), job_prefs,
                                            job.get("_search_prompt", ""))
         if not relevant:
@@ -1229,7 +1310,7 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
             owner_token=uuid.uuid4().hex
             db.execute("""UPDATE job_match_sessions SET status='queued',error=NULL,batch_size=?,workflow_id=CASE
                 WHEN workflow_id='' THEN ? ELSE workflow_id END,provider=?,provider_model=?,owner_token=?,owner_pid=?,
-                owner_host=?,heartbeat_at=?,lease_expires_at=?,cancel_requested=0,current_job_key='',updated_at=?
+                owner_host=?,heartbeat_at=?,lease_expires_at=?,cancel_requested=0,current_job_key='',current_job_started_at=NULL,updated_at=?
                 WHERE session_id=? AND user_id=?""",
                 (request.batch_size,workflow_id or '',provider,provider_model,owner_token,os.getpid(),socket.gethostname(),
                  timestamp,_match_lease_expiry(),timestamp,session_id,USER))
@@ -1296,7 +1377,7 @@ def resume_matches(session_id:str|None=None,workflow_id:str|None=None):
             db.execute(f"UPDATE job_match_results SET status='queued',error=NULL,updated_at=? WHERE user_id=? AND resume_id=? AND job_key IN ({slots}) AND status IN ('failed','processing')",
                        (timestamp,USER,resume_id,*keys))
         db.execute("""UPDATE job_match_sessions SET status='queued',cancel_requested=0,error=NULL,owner_token=?,owner_pid=?,
-            owner_host=?,heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE session_id=? AND user_id=? AND owner_token=''""",
+            owner_host=?,heartbeat_at=?,lease_expires_at=?,current_job_key='',current_job_started_at=NULL,updated_at=? WHERE session_id=? AND user_id=? AND owner_token=''""",
             (token,os.getpid(),socket.gethostname(),timestamp,_match_lease_expiry(),timestamp,session_id,USER))
     try:executor.submit(_session_worker,session_id,resume_id,profile_status,profile,token,
                         row["provider"] or "ollama",row["provider_model"] or _provider_model(row["provider"] or "ollama"))

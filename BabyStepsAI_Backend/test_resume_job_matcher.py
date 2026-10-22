@@ -349,6 +349,80 @@ class ResumeJobMatcherTests(unittest.TestCase):
                                                  {"title": "Software Engineer", "content": "Python"})
         self.assertEqual(result.classification, "potential_match")
         self.assertEqual(post.call_count, 2)
+        self.assertTrue(all(call.kwargs.get("timeout")==matcher.OLLAMA_TIMEOUT for call in post.call_args_list))
+
+    def test_progress_reports_slow_but_live_request_without_recovery(self):
+        from datetime import timedelta
+        stamp=matcher.datetime.now(matcher.timezone.utc)
+        started=(stamp-timedelta(minutes=5)).isoformat()
+        heartbeat=(stamp-timedelta(seconds=5)).isoformat()
+        lease=(stamp+timedelta(minutes=2)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at)
+                VALUES(?,?,'resume-v1','processing',?,?)""",(jobs.USER,"greenhouse:cloudflare:42",started,started))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,
+                current_job_key,current_job_started_at,created_at,updated_at)
+                VALUES('slow-live',?,'resume-v1','running',?,3,1,'wf',?,?,?,?,?,?,?, ?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"]),"live-token",__import__('os').getpid(),
+                 matcher.socket.gethostname(),heartbeat,lease,"greenhouse:cloudflare:42",started,started,heartbeat))
+        progress=matcher._progress("slow-live")
+        self.assertEqual(progress["worker_health"],"slow_processing")
+        self.assertFalse(progress["recovery_available"])
+        self.assertTrue(progress["owner_pid_alive"])
+        self.assertGreaterEqual(progress["current_elapsed_seconds"],300)
+        self.assertEqual(progress["current_job"]["title"],"Software Engineer")
+        self.assertEqual(progress["last_progress_at"],heartbeat)
+
+    def test_progress_offers_recovery_only_for_expired_dead_local_owner(self):
+        from datetime import timedelta
+        stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES('dead-progress',?,'resume-v1','running','[]',3,0,'wf','dead-token',99999999,?,?,?, ?,?)""",
+                (jobs.USER,matcher.socket.gethostname(),stale,stale,stale,stale))
+        progress=matcher._progress("dead-progress")
+        self.assertEqual(progress["worker_health"],"stalled_recoverable")
+        self.assertTrue(progress["recovery_available"])
+        with patch.object(matcher,"_pid_is_alive",return_value=True):
+            active=matcher._progress("dead-progress")
+        self.assertFalse(active["recovery_available"])
+        self.assertEqual(active["worker_health"],"heartbeat_late")
+
+    def test_terminal_failed_job_does_not_leave_completed_workflow_session_paused(self):
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher,"analyze_with_ollama",side_effect=RuntimeError("local model timed out")):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+            for _ in range(200):
+                progress=matcher._progress(response["session_id"])
+                if progress["status"]=="completed":break
+                time.sleep(.01)
+        self.assertEqual(progress["status"],"completed")
+        self.assertEqual(progress["failed"],1)
+        self.assertEqual(progress["pending"],0)
+        self.assertIn("failed analyses can be retried",progress["error"])
+
+    def test_recovery_refuses_an_expired_owner_on_an_unverified_remote_host(self):
+        from datetime import timedelta
+        from fastapi import HTTPException
+        stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES('remote-owner',?,'resume-v1','running','[]',3,0,'wf','remote-token',99999999,'other-host',?,?,?,?)""",
+                (jobs.USER,stale,stale,stale,stale))
+        with self.assertRaises(HTTPException) as caught:
+            matcher.recover_match_session("remote-owner",True)
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("another host",caught.exception.detail)
+        with jobs.database() as db:
+            row=db.execute("SELECT status,owner_token FROM job_match_sessions WHERE session_id='remote-owner'").fetchone()
+        self.assertEqual(tuple(row),("running","remote-token"))
 
     def test_ollama_connection_failure_is_retried_and_saved_as_error(self):
         with patch.object(matcher.time, "sleep"), patch.object(matcher.requests, "post",
@@ -648,6 +722,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(progress["completed"],12)
         self.assertEqual(progress["pending"],0)
         self.assertEqual(model.call_count,12)
+        self.assertEqual({item["job_key"] for item in progress["results"]},set(keys))
         retry=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3),workflow_id="workflow-12")
         self.assertEqual(retry["session_id"],response["session_id"])
         self.assertEqual(retry["status"],"completed")

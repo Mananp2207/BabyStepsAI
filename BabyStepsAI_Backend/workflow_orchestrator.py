@@ -24,6 +24,7 @@ import application_answer_assistant
 import career_preferences
 import candidate_verification
 import job_search_agent
+import job_relevance
 import resume_job_matcher
 import job_description_enricher
 from ui_theme import apply_ui_theme
@@ -114,6 +115,10 @@ class WorkflowStart(BaseModel):
     prompt: str = Field(min_length=3,max_length=1500)
 
 
+class PreferenceResolution(BaseModel):
+    choice: str = Field(pattern="^(saved|prompt)$")
+
+
 class DiscoveryRecovery(BaseModel):
     confirm_abandoned: bool = False
 
@@ -188,19 +193,15 @@ def _ensure_snapshot(workflow_id):
         raise HTTPException(409,"Resume, verified profile, or career preferences changed during this workflow. Start a new workflow to refresh matching safely.")
 
 
-def prompt_conflicts(prompt: str, preferences: dict) -> list[str]:
-    """Report direct prompt/preference contradictions; never rewrite saved choices."""
-    text=prompt.casefold()
+def _prompt_conflict_details(prompt: str, preferences: dict) -> list[dict]:
+    """Return only explicit contradictions, with actionable field-level context."""
+    from job_relevance import prompt_constraints
+    constraints=prompt_constraints(prompt)
     conflicts=[]
     saved_location=str(preferences.get("location") or "").strip()
     if saved_location and saved_location.casefold() not in {"any","anywhere","global"}:
         from job_relevance import COUNTRY_ALIASES, US_STATES
-        requested=[]
-        for country,aliases in COUNTRY_ALIASES.items():
-            if any(re_search(r"(?<!\w)"+re_escape(alias)+r"(?!\w)",text) for alias in aliases):
-                requested.append(country)
-        for state in US_STATES:
-            if re_search(r"(?<!\w)"+re_escape(state)+r"(?!\w)",text): requested.append(state)
+        requested=[constraints["location"]] if constraints["location"] else []
         saved_canonical={country for country,aliases in COUNTRY_ALIASES.items()
                          if any(re_search(r"(?<!\w)"+re_escape(alias)+r"(?!\w)",saved_location.casefold()) for alias in aliases)}
         if any(re_search(r"(?<!\w)"+re_escape(state)+r"(?!\w)",saved_location.casefold()) for state in US_STATES):
@@ -208,21 +209,52 @@ def prompt_conflicts(prompt: str, preferences: dict) -> list[str]:
         if re_search(r"(?:^|[,\s])(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)(?:$|[,\s])",saved_location):
             saved_canonical.add("united states")
         requested=list(dict.fromkeys(requested))
-        if requested and (not saved_canonical or not set(requested).intersection(saved_canonical)):
-            conflicts.append(f"Prompt location ({', '.join(dict.fromkeys(requested))}) conflicts with saved location ({saved_location}).")
+        requested_key={value.casefold() for value in requested}
+        saved_states={state for state in US_STATES if re_search(r"(?<!\w)"+re_escape(state)+r"(?!\w)",saved_location.casefold())}
+        requested_states={state for state in US_STATES if re_search(r"(?<!\w)"+re_escape(state)+r"(?!\w)",str(constraints["location"]).casefold())}
+        state_mismatch=bool(saved_states and requested_states and not saved_states.intersection(requested_states))
+        location_mismatch=bool(requested and (not saved_canonical or not requested_key.intersection(saved_canonical)))
+        if requested_states and "united states" in saved_canonical:location_mismatch=False
+        if requested_states and "united states" in saved_canonical:location_mismatch=False
+        if requested and (state_mismatch or location_mismatch):
+            conflicts.append({"field":"location","saved_preference":saved_location,"requested_preference":", ".join(requested),
+                "reason":"The requested location is outside the saved location preference.","resolution":"Choose saved preferences or use the prompt location for this workflow only."})
     types={str(value).casefold() for value in preferences.get("employment_types",[])}
-    if re_search(r"\b(include|only|looking for|find)\s+(?:paid\s+)?internships?\b",text) and types and not any("intern" in value for value in types):
-        conflicts.append("Prompt asks to include internships, but saved employment preferences exclude them.")
-    if re_search(r"\b(exclude|no|without|skip)\s+internships?\b",text) and types and types<= {"internship","intern","internships"}:
-        conflicts.append("Prompt excludes internships, but saved employment preferences allow only internships.")
+    requested_types={value.casefold() for value in constraints["employment_types"]}
+    if "full-time" in requested_types and types and not any("full" in value for value in types):
+        conflicts.append({"field":"employment_types","saved_preference":", ".join(sorted(preferences.get("employment_types",[]))),
+            "requested_preference":"Full-time only","reason":"The prompt requests full-time work, while saved employment preferences do not allow full-time roles.",
+            "resolution":"Choose saved preferences or use the prompt employment types for this workflow only."})
+    if "Internship" in constraints["employment_types"] and types and not any("intern" in value for value in types):
+        conflicts.append({"field":"employment_types","saved_preference":", ".join(sorted(preferences.get("employment_types",[]))),
+            "requested_preference":"Include internships","reason":"The prompt explicitly includes internships, while saved employment preferences exclude them.",
+            "resolution":"Choose saved preferences or use the prompt employment types for this workflow only."})
+    only_internships=bool(types) and types<={"internship","intern","internships"}
+    if constraints["exclude_internships"] and only_internships:
+        conflicts.append({"field":"employment_types","saved_preference":", ".join(sorted(preferences.get("employment_types",[]))),
+            "requested_preference":"Exclude internships","reason":"Saved preferences allow only internships, which the prompt explicitly excludes.",
+            "resolution":"Choose saved preferences or use the prompt employment types for this workflow only."})
     levels={str(value).casefold() for value in preferences.get("levels",[])}
-    asks_senior=bool(re_search(r"\b(senior|staff|principal|lead)\b",text))
-    excludes_senior=bool(re_search(r"\b(exclude|no|without|skip)\s+(?:senior|staff|principal|lead)\b",text))
-    if asks_senior and levels and not any(any(term in level for term in ("senior","staff","principal","lead")) for level in levels):
-        conflicts.append("Prompt asks for senior-level roles, but saved experience preferences exclude them.")
-    if excludes_senior and levels and all(any(term in level for term in ("senior","staff","principal","lead")) for level in levels):
-        conflicts.append("Prompt excludes senior roles, but saved experience preferences allow only senior roles.")
+    senior_terms=("senior","staff","principal","lead","manager","director","vp")
+    saved_senior=any(any(term in level for term in senior_terms) for level in levels)
+    saved_early=any(any(term in level for term in ("graduate","entry","junior","associate")) for level in levels)
+    asks_senior="Senior" in constraints["levels"]
+    asks_early=any(level in constraints["levels"] for level in ("New Graduate","Entry Level","Junior","Associate"))
+    if levels and asks_senior and saved_early and not saved_senior:
+        conflicts.append({"field":"levels","saved_preference":", ".join(preferences.get("levels",[])),
+            "requested_preference":"Include senior-level roles","reason":"The prompt requests senior roles while saved preferences select early-career levels only.",
+            "resolution":"Choose saved preferences or use prompt experience levels for this workflow only."})
+    if levels and asks_early and saved_senior and not saved_early:
+        conflicts.append({"field":"levels","saved_preference":", ".join(preferences.get("levels",[])),
+            "requested_preference":"Early-career roles","reason":"The prompt requests early-career roles while saved preferences select senior levels only.",
+            "resolution":"Choose saved preferences or use prompt experience levels for this workflow only."})
     return conflicts
+
+
+def prompt_conflicts(prompt: str, preferences: dict) -> list[str]:
+    """Backward-compatible human-readable conflict list."""
+    return [f"{item['reason']} Saved: {item['saved_preference']}. Requested: {item['requested_preference']}."
+            for item in _prompt_conflict_details(prompt,preferences)]
 
 
 def re_search(pattern,text):
@@ -322,11 +354,21 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
             _write(workflow_id,resume_id=resume_id,resume_version=version,profile_version=profile_version,
                    preferences_version=pref_version)
             prompt=row["prompt"]
-            conflicts=prompt_conflicts(prompt,prefs)
-            if conflicts:
-                _save_diagnostics(workflow_id,clarification_required=conflicts)
+            try:prior_diagnostics=json.loads(row.get("diagnostics_json") or "{}")
+            except (TypeError,json.JSONDecodeError):prior_diagnostics={}
+            resolution=prior_diagnostics.get("preference_resolution") or {}
+            conflicts=_prompt_conflict_details(prompt,prefs)
+            if conflicts and not resolution.get("choice"):
+                _save_diagnostics(workflow_id,clarification_required=[item["reason"] for item in conflicts],
+                                  preference_conflicts=conflicts)
                 _write(workflow_id,status="needs_clarification",current_stage="needs_clarification")
                 return
+            if resolution.get("choice")=="saved":
+                ignored_fields=[item["field"] for item in conflicts]
+                effective_prefs=job_relevance.apply_prompt_preferences(prompt,prefs,ignore_fields=ignored_fields)
+            else:
+                effective_prefs=prior_diagnostics.get("workflow_preferences") or job_relevance.apply_prompt_preferences(prompt,prefs)
+            _save_diagnostics(workflow_id,workflow_preferences=effective_prefs)
             if not _checkpoint(workflow_id,"discovering"):return
             # Reuse the persisted discovery run when restarting from its
             # discovering checkpoint. job_search_agent resumes only sources
@@ -337,7 +379,7 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
                               or str(uuid.uuid4()))
             _write(workflow_id,discovery_run_id=discovery_run_id)
             _save_diagnostics(workflow_id,discovery_run_id=discovery_run_id)
-            result=discover_fn(prompt,prefs,run_id=discovery_run_id,workflow_id=workflow_id)
+            result=discover_fn(prompt,effective_prefs,run_id=discovery_run_id,workflow_id=workflow_id)
             if result.get("status") in {"cancelled","interrupted"}:
                 current=_row(workflow_id)
                 if current and current["cancel_requested"]:
@@ -350,10 +392,11 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
             source_note=("No active, healthy, live-verified employer sources are currently eligible for discovery."
                          if diagnostics.get("companies_checked",diagnostics.get("sources_checked",0))==0 else "")
             with database() as db:
-                state={"discovery":diagnostics,"discovery_status":result.get("status"),"source_note":source_note}
                 prior=_row(workflow_id)
-                try:state["activity"]=json.loads(prior["diagnostics_json"] or "{}").get("activity",[])
-                except (TypeError,json.JSONDecodeError):pass
+                try:state=json.loads(prior["diagnostics_json"] or "{}")
+                except (TypeError,json.JSONDecodeError):state={}
+                state.update({"discovery":diagnostics,"discovery_status":result.get("status"),"source_note":source_note,
+                              "workflow_preferences":effective_prefs})
                 db.execute("UPDATE user_workflows SET job_keys_json=?,discovered_count=?,diagnostics_json=?,current_stage='matching',status='running',updated_at=? WHERE workflow_id=?",
                            (json.dumps(keys),len(keys),json.dumps(state),now(),workflow_id))
             row=_row(workflow_id)
@@ -415,6 +458,14 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
                             "failed":progress.get("failed",0),"pending":progress.get("pending",0),
                             "provider":progress.get("provider"),"provider_model":progress.get("provider_model"),
                             "owner_state":progress.get("owner_state"),
+                            "worker_health":progress.get("worker_health"),
+                            "recovery_available":progress.get("recovery_available",False),
+                            "current_job_started_at":progress.get("current_job_started_at"),
+                            "current_elapsed_seconds":progress.get("current_elapsed_seconds"),
+                            "last_progress_at":progress.get("last_progress_at"),
+                            "heartbeat_age_seconds":progress.get("heartbeat_age_seconds"),
+                            "lease_expires_at":progress.get("lease_expires_at"),
+                            "owner_pid_alive":progress.get("owner_pid_alive"),
                             "current_job":progress.get("current_job"),"last_successful_checkpoint":progress.get("last_successful_checkpoint"),
                             "error":progress.get("error")})
                     _write(workflow_id,matched_count=matches,failed_count=sum(item["status"]=="failed" for item in rows))
@@ -534,6 +585,16 @@ def _serialize(row):
     for key in ("job_keys_json","diagnostics_json"):
         try:item[key.removesuffix("_json")]=json.loads(item.pop(key) or ("[]" if key=="job_keys_json" else "{}"))
         except (TypeError,json.JSONDecodeError):item[key.removesuffix("_json")]=[] if key=="job_keys_json" else {}
+    if item.get("status")=="needs_clarification":
+        diagnostics=item.get("diagnostics") or {}
+        try:
+            current_preferences=career_preferences.get_preferences() or {}
+            actual_conflicts=_prompt_conflict_details(item.get("prompt",""),current_preferences)
+            diagnostics["preference_conflicts"]=actual_conflicts
+            diagnostics["clarification_required"]=[entry["reason"] for entry in actual_conflicts]
+            item["diagnostics"]=diagnostics
+        except Exception:
+            pass
     item["submission_enabled"]=False
     item["job_outcomes"]=_job_outcomes(item)
     item["outcome_counts"]={key:sum(job.get(key,False) for job in item["job_outcomes"])
@@ -651,7 +712,9 @@ def _job_outcomes(workflow):
 def start_workflow(payload:WorkflowStart,request:Request):
     _local_only(request);settings=_authorization()
     resume_id,resume_version,profile_version,pref_version,prefs=_versions()
-    conflicts=prompt_conflicts(payload.prompt,prefs)
+    conflict_details=_prompt_conflict_details(payload.prompt,prefs)
+    conflicts=[item["reason"] for item in conflict_details]
+    prompt_preferences=job_relevance.apply_prompt_preferences(payload.prompt,prefs)
     active_discovery=job_search_agent.active_discovery()
     if active_discovery:
         associated=None
@@ -699,8 +762,9 @@ def start_workflow(payload:WorkflowStart,request:Request):
                 profile_version,preferences_version,diagnostics_json,discovery_run_id,created_at,updated_at)
                 VALUES(?,?,?,'needs_clarification','needs_clarification',?,?,?,?,?,?,?,?)""",
                 (workflow_id,USER,payload.prompt,resume_id,resume_version,profile_version,pref_version,
-                 json.dumps({"clarification_required":conflicts,"discovery_run_id":discovery_run_id}) if conflicts else
-                 json.dumps({"discovery_run_id":discovery_run_id}),discovery_run_id,stamp,stamp))
+                 json.dumps({"clarification_required":conflicts,"preference_conflicts":conflict_details,
+                     "prompt_preferences":prompt_preferences,"discovery_run_id":discovery_run_id}) if conflicts else
+                 json.dumps({"workflow_preferences":prompt_preferences,"discovery_run_id":discovery_run_id}),discovery_run_id,stamp,stamp))
     except sqlite3.IntegrityError as error:
         with database() as db:
             active=db.execute("SELECT * FROM user_workflows WHERE user_id=? AND status IN ('queued','running','paused','needs_clarification') LIMIT 1",(USER,)).fetchone()
@@ -719,7 +783,52 @@ def start_workflow(payload:WorkflowStart,request:Request):
             _write(workflow_id,status="failed",current_stage="failed",failed_count=1,completed_at=now())
             raise HTTPException(503,detail) from error
     return {**(_serialize(_row(workflow_id)) or {}),"clarification_required":conflicts,
+            "preference_conflicts":conflict_details,
             "automatic_preparation_authorized":bool(settings.get("allow_automated_form_preparation"))}
+
+
+@router.post("/api/workflows/{workflow_id}/resolve-preferences",status_code=202)
+def resolve_workflow_preferences(workflow_id:str,payload:PreferenceResolution,request:Request):
+    _local_only(request);_authorization()
+    row=_row(workflow_id)
+    if not row:raise HTTPException(404,"Workflow not found.")
+    if row["status"]!="needs_clarification":raise HTTPException(409,"This workflow is no longer waiting for preference clarification.")
+    current_resume,current_resume_version,current_profile,current_pref_version,current_preferences=_versions()
+    resume_or_profile_changed=(row["resume_id"]!=current_resume or row["resume_version"]!=current_resume_version or
+                               row["profile_version"]!=current_profile)
+    preferences_changed=int(row["preferences_version"] or 0)!=current_pref_version
+    if resume_or_profile_changed or (preferences_changed and payload.choice!="saved"):
+        raise HTTPException(409,"The resume or verified profile changed, or saved preferences changed while choosing a prompt-only override. Start a new workflow to refresh matching safely.")
+    if preferences_changed:
+        # The user explicitly chose the edited saved preferences. Refresh this
+        # pre-discovery workflow's preference snapshot; no jobs have been selected.
+        _write(workflow_id,preferences_version=current_pref_version)
+        row=_row(workflow_id)
+    try:diagnostics=json.loads(row["diagnostics_json"] or "{}")
+    except (TypeError,json.JSONDecodeError):diagnostics={}
+    saved=current_preferences if preferences_changed else (career_preferences.get_preferences() or {})
+    conflicts=_prompt_conflict_details(row["prompt"],saved)
+    if payload.choice=="saved":
+        effective=job_relevance.apply_prompt_preferences(row["prompt"],saved,
+            ignore_fields=[item["field"] for item in conflicts])
+    else:
+        effective=job_relevance.apply_prompt_preferences(row["prompt"],saved)
+    diagnostics.update({"workflow_preferences":effective,
+        "preference_resolution":{"choice":payload.choice,"resolved_at":now(),
+            "conflicts":conflicts,"saved_preferences_unchanged":True},
+        "clarification_required":[]})
+    with database() as db:
+        changed=db.execute("UPDATE user_workflows SET diagnostics_json=?,status='queued',current_stage='queued',pause_requested=0,updated_at=? WHERE workflow_id=? AND user_id=? AND status='needs_clarification'",
+                           (json.dumps(diagnostics,sort_keys=True),now(),workflow_id,USER)).rowcount
+    if not changed:raise HTTPException(409,"Another request already resolved this workflow. Refresh its status.")
+    try:
+        if not _submit(workflow_id):raise RuntimeError("worker already owns this workflow")
+    except Exception as error:
+        _save_diagnostics(workflow_id,failure=f"Workflow could not start after preference resolution ({type(error).__name__}). Retry Resume.")
+        _write(workflow_id,status="paused",current_stage="queued")
+        raise HTTPException(503,"Preference choice was saved for this workflow, but its worker could not start. Retry Resume; saved preferences were not changed.") from error
+    return {"workflow":_serialize(_row(workflow_id)),"choice":payload.choice,
+            "saved_preferences_changed":False,"submission_enabled":False}
 
 
 def _review_question_kind(text):
@@ -1076,16 +1185,17 @@ def workflow_page():return HTMLResponse(apply_ui_theme(WORKFLOW_PAGE))
 WORKFLOW_PAGE=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Job search workflow — BabyStepsAI</title>
 <style>:root{--ink:#17263b;--muted:#66758a;--line:#dfe7f1;--surface:#fff;--wash:#f4f7fb;--brand:#2563eb}*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1060px;margin:26px auto;padding:0 18px}h1{font-size:clamp(25px,4vw,36px);line-height:1.2;margin:10px 0}.muted{color:var(--muted)}.panel,.metric{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px;margin:14px 0}.prompt{width:100%;min-height:105px;font:inherit;border:1px solid var(--line);border-radius:10px;padding:12px;background:var(--surface);color:var(--ink);resize:vertical}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}button{font:inherit;font-weight:650;padding:9px 14px;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--ink);cursor:pointer}button.primary{background:var(--brand);color:white;border-color:var(--brand)}button:disabled{opacity:.5;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.metric strong{display:block;font-size:24px}.metric span{color:var(--muted);font-size:14px}.stage{font-weight:700;text-transform:capitalize}.bar{height:8px;background:#e7edf5;border-radius:99px;overflow:hidden;margin:9px 0}.bar i{display:block;height:100%;background:var(--brand);width:0;transition:width .2s}.notice{padding:11px;border-radius:9px;background:#eef4ff}.outcomes{display:grid;gap:10px}.outcome{border:1px solid var(--line);border-radius:12px;padding:13px}.outcome-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.badge{font-size:12px;background:var(--wash);border-radius:99px;padding:4px 9px;white-space:nowrap}.outcome p{margin:7px 0;font-size:13px}.outcome button{margin-top:4px}.recent{margin:0;padding-left:20px}.error{color:#a22}@media(max-width:600px){.wrap{padding:0 12px}.panel{padding:14px}}</style></head><body><main class="wrap"><p class="muted">One prompt · verified employer feeds · eligibility checks · application dry runs</p><h1>Your job search workflow</h1><p class="muted">Search and review suitable roles in one flow. Application preparation requires separate authorization. BabyStepsAI stops before final submission.</p>
 <section class="panel"><label for="prompt"><strong>What kind of work are you looking for?</strong></label><textarea id="prompt" class="prompt" maxlength="1500" placeholder="Find entry-level software engineering jobs in the United States. Exclude internships and senior positions."></textarea><div class="actions"><button id="start" class="primary">Start workflow</button><button id="pause" disabled>Pause</button><button id="resume" disabled>Resume</button><button id="cancel" disabled>Cancel</button><button id="recover" hidden>Recover abandoned search</button><button id="recoverMatch" hidden>Recover abandoned matching</button></div><p id="message" class="muted" role="status" aria-live="polite"></p></section>
-<section class="panel"><h2>Progress</h2><div class="stage" id="stage">No workflow started</div><div class="bar"><i id="progress"></i></div><div class="grid" id="metrics"></div><p id="diagnostics" class="notice" hidden></p></section><section class="panel"><h2>Matching Details</h2><p class="muted">Every selected opening shows its matching status, eligibility classification, and any recorded failure. Retries use saved jobs and do not repeat employer discovery.</p><button id="retry-failed" hidden>Retry failed analyses</button><div id="job-outcomes" class="outcomes"></div></section><section class="panel"><h2>Recent activity</h2><ol id="activity" class="recent"></ol></section><section class="panel"><h2>Application preparation</h2><p class="muted">Queued jobs are prepared one at a time using confirmed profile facts and your active resume. Missing or sensitive questions pause that job while the queue continues. Review prepared applications before any future submission functionality.</p><div id="application-state" class="grid"></div><p class="muted"><a href="/applications">Open application history</a> · <a href="/application-settings">Review permissions</a> · <a href="/candidate-profile">Verify your profile</a></p></section></main>
+<section class="panel"><h2>Progress</h2><div class="stage" id="stage">No workflow started</div><div class="bar"><i id="progress"></i></div><div class="grid" id="metrics"></div><p id="diagnostics" class="notice" hidden></p><section id="preference-conflicts" class="outcomes" hidden aria-live="polite"></section></section><section class="panel"><h2>Matching Details</h2><p class="muted">Every selected opening shows its matching status, eligibility classification, and any recorded failure. Retries use saved jobs and do not repeat employer discovery.</p><button id="retry-failed" hidden>Retry failed analyses</button><div id="job-outcomes" class="outcomes"></div></section><section class="panel"><h2>Recent activity</h2><ol id="activity" class="recent"></ol></section><section class="panel"><h2>Application preparation</h2><p class="muted">Queued jobs are prepared one at a time using confirmed profile facts and your active resume. Missing or sensitive questions pause that job while the queue continues. Review prepared applications before any future submission functionality.</p><div id="application-state" class="grid"></div><p class="muted"><a href="/applications">Open application history</a> · <a href="/application-settings">Review permissions</a> · <a href="/candidate-profile">Verify your profile</a></p></section></main>
 <script>
 const $=s=>document.querySelector(s);let current=null,resumePending=false;
 const labels={analyzed:'Analyzed by AI',reused:'Current results reused',excluded:'Excluded by filters or missing content',needs_review:'Needs review',not_eligible:'Not eligible',failed:'Failed jobs',pending:'Pending jobs',retryable:'Retryable analyses',discovered:'Jobs discovered',potential_match:'Potential matches',queued:'Applications queued',prepared:'Ready for review',failed_steps:'Failed steps'};
 function errorText(value){if(typeof value==='string')return value;if(value&&typeof value==='object'&&!Array.isArray(value)){const action=value.action==='resume'?' Use Resume to continue the existing workflow.':value.action==='view'?' Open the current workflow to view progress.':'';return (value.message||'The server could not complete this request.')+action}if(Array.isArray(value))return value.map(item=>{const where=Array.isArray(item.loc)?item.loc.filter(part=>part!=='body').join(' → '):'';return (where?where+': ':'')+(item.msg||'Invalid request')}).join(' ');return 'The server could not complete this request.'}
 async function call(url,opt={}){let r;try{r=await fetch(url,{...opt,headers:{Accept:'application/json','Content-Type':'application/json',...(opt.headers||{})}})}catch(_e){throw Error('Could not reach BabyStepsAI. Check that the local server is running and try again.')}const type=r.headers.get('content-type')||'';let d;if(type.includes('json')){try{d=await r.json()}catch(_e){throw Error('BabyStepsAI returned an unreadable response. Check the server log and try again.')}}else{const body=await r.text();if(!r.ok)throw Error('Request failed (HTTP '+r.status+'). '+(body.slice(0,180)||'Check the server log.'));throw Error('BabyStepsAI returned an unexpected response. Check the server log and try again.')}if(!r.ok){const error=Error(errorText(d.detail)||('Request failed (HTTP '+r.status+').'));error.detail=d.detail;throw error}return d}
 function metric(name,value){const d=document.createElement('div');d.className='metric';const strong=document.createElement('strong');strong.textContent=value??0;const span=document.createElement('span');span.textContent=name;d.append(strong,span);return d}
+function renderPreferenceConflicts(w){const root=$('#preference-conflicts'),items=w?.diagnostics?.preference_conflicts||[];root.replaceChildren();root.hidden=w?.status!=='needs_clarification';if(root.hidden)return;const heading=document.createElement('h2');heading.textContent=items.length?'Resolve preference conflicts':'Preference check';root.append(heading);if(!items.length){const note=document.createElement('p');note.textContent='No current conflicts were found. Continue with the compatible prompt refinements.';root.append(note)}for(const item of items){const card=document.createElement('article');card.className='outcome';for(const [label,value] of [['Saved preference',item.saved_preference],['Requested preference',item.requested_preference],['Why this conflicts',item.reason],['Resolution',item.resolution]]){const p=document.createElement('p');p.textContent=label+': '+(value||'');card.append(p)}root.append(card)}const actions=document.createElement('div');actions.className='actions';const options=items.length?[['Use saved preferences','saved'],['Use prompt preferences for this workflow only','prompt']]:[['Continue with requested prompt preferences','prompt']];for(const [label,choice] of options){const button=document.createElement('button');button.textContent=label;button.onclick=async()=>{button.disabled=true;try{const result=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/resolve-preferences',{method:'POST',body:JSON.stringify({choice})});$('#message').textContent=items.length?(choice==='saved'?'Saved preferences selected for conflicting fields. Other prompt filters remain active.':'Prompt preferences selected for this workflow only. Saved preferences are unchanged.'):'No conflicts remain. Workflow started with the compatible prompt filters.';render(result.workflow);refresh()}catch(e){$('#message').textContent=e.message;button.disabled=false}};actions.append(button)}const edit=document.createElement('a');edit.href='/careers';edit.textContent='Edit saved preferences';edit.className='button-link';actions.append(edit);root.append(actions)}
 function outcomeLabel(j){if(j.analyzed)return 'Analyzed by AI';if(j.reused)return 'Current matching result reused';if(j.pending)return j.unresolved_description?'Description missing — unresolved':'Pending matching';if(j.failed)return 'Failed';if(j.needs_review)return 'Needs review';if(j.not_eligible)return 'Not eligible';if(j.excluded)return j.description_available?'Excluded by preferences or relevance':'Description missing — unresolved';return 'Needs review'}
 function renderOutcomes(w){const root=$('#job-outcomes'),rows=w.job_outcomes||[];if(!rows.length){root.textContent='No saved jobs in this workflow yet.';return}root.replaceChildren(...rows.map(j=>{const card=document.createElement('article');card.className='outcome';const head=document.createElement('div');head.className='outcome-head';const title=document.createElement('strong');title.textContent=(j.company||'Employer')+' · '+(j.title||j.job_key);const badge=document.createElement('span');badge.className='badge';badge.textContent=outcomeLabel(j);head.append(title,badge);const classification=document.createElement('p');classification.textContent='Eligibility: '+(j.classification||'Unclassified');const desc=document.createElement('p');desc.textContent=j.description_available?'Description available'+(j.description_source?' · Source: '+j.description_source:''):'Description unavailable'+(j.description_error?' · '+j.description_error:'');const reason=document.createElement('p');reason.className='muted';reason.textContent=j.reason||'';card.append(head,classification,desc);if(j.reason)card.append(reason);if((!j.description_available||j.failed)&&w.workflow_id){const retry=document.createElement('button');retry.textContent=j.failed?'Retry analysis':(j.description_available?'Retry matching':'Retry description + matching');retry.onclick=async()=>{retry.disabled=true;try{const d=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/enrich',{method:'POST',body:JSON.stringify({job_keys:[j.job_key]})});const success=(d.enrichment?.succeeded||0)+(d.enrichment?.available||0);$('#message').textContent=success?(j.description_available?'Matching-only workflow started; discovery was not repeated.':'Description retrieved. A matching-only workflow started; discovery was not repeated.'):'Description retry finished: '+(d.enrichment?.results?.[0]?.reason||'no public description was available.');refresh()}catch(e){$('#message').textContent=e.message;retry.disabled=false}};card.append(retry)}return card}))}
-function render(w){current=w;if(!w){$('#stage').textContent='No workflow started';$('#metrics').replaceChildren();return}$('#prompt').value=w.prompt||'';$('#stage').textContent=(w.status||'').replaceAll('_',' ')+' · '+(w.current_stage||'').replaceAll('_',' ');const order=['queued','authorizing','discovering','matching','queueing','completed'];$('#progress').style.width=Math.max(4,100*Math.max(0,order.indexOf(w.current_stage))/(order.length-1))+'%';const counts=w.outcome_counts||{},outcomes=w.job_outcomes||[],enrichment=w.diagnostics?.enrichment||{};const retryFailed=$('#retry-failed'),failedKeys=outcomes.filter(j=>j.failed&&j.description_available).map(j=>j.job_key);retryFailed.hidden=!failedKeys.length||!['completed','paused','failed'].includes(w.status);retryFailed.textContent='Retry '+failedKeys.length+' failed matching job'+(failedKeys.length===1?'':'s')+' without rediscovery';retryFailed.disabled=false;retryFailed.onclick=async()=>{retryFailed.disabled=true;try{const result=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/enrich',{method:'POST',body:JSON.stringify({job_keys:failedKeys})});$('#message').textContent=result.matching_workflow_id?'Matching-only retry started for '+failedKeys.length+' saved jobs. Employer discovery was not repeated.':'No saved descriptions were ready to retry.';refresh()}catch(error){$('#message').textContent=error.message;retryFailed.disabled=false}};const values=[['Employers searched',w.diagnostics?.discovery?.sources_checked||w.diagnostics?.eligible_sources||0],['Descriptions available',outcomes.filter(j=>j.description_available).length],['Descriptions missing',outcomes.filter(j=>!j.description_available).length],['Enrichment attempted',enrichment.attempted||0],['Enrichment succeeded',enrichment.succeeded||0],['Enrichment failed',enrichment.failed||0],['Awaiting reassessment',w.review_counts?.awaiting_reassessment||0],['Approved for dry run',w.review_counts?.approved_for_dry_run||0],['Applications needing input',w.application_counts?.needs_user_input||0],['Failed or unsupported applications',Number(w.application_counts?.failed||0)+Number(w.application_counts?.unsupported||0)],...Object.entries(labels).map(([key,label])=>[label,key==='discovered'?w.discovered_count:key==='potential_match'?w.potential_match_count:key==='queued'?w.queued_count:key==='prepared'?w.prepared_count:key==='failed_steps'?w.failed_count:counts[key]||0])];$('#metrics').replaceChildren(...values.map(([k,v])=>metric(k,v)));renderOutcomes(w);renderEligibilityReviews(w);const app=w.application_counts||w.diagnostics?.application_states||{};$('#application-state').replaceChildren(...[['Queued',app.queued||0],['Preparing',Number(app.opening||0)+Number(app.inspecting||0)+Number(app.filling||0)+Number(app.uploading_resume||0)],['Needs your input',app.needs_user_input||0],['Ready for review',app.ready_for_review||0]].map(([k,v])=>metric(k,v)));const d=w.diagnostics||{},liveMatching={...(d.matching||{}),...(w.matching_progress||{})},events=d.activity||[];$('#activity').replaceChildren(...events.slice(-8).reverse().map(e=>{const li=document.createElement('li'),date=new Date(e.at);li.textContent=(Number.isNaN(date.getTime())?'':date.toLocaleString()+' · ')+(e.stage||e.status||'Workflow update').replaceAll('_',' ');return li}));const discovery=d.discovery||{},feeds=(discovery.feed_failures||[]).map(f=>`${f.company} (${f.source_platform||'source'}${f.stage?' · '+f.stage:''}): ${f.reason}`).join(' '),details=[];if(discovery.current_source?.company)details.push('Checking '+discovery.current_source.company);if(discovery.last_successful_checkpoint?.company)details.push('Last successful source: '+discovery.last_successful_checkpoint.company);if(liveMatching?.provider)details.push('Provider: '+liveMatching.provider+(liveMatching.provider_model?' · '+liveMatching.provider_model:''));if(w.matching_worker_state==='resume_requested')details.push('Resume requested · waiting for a worker to claim the saved checkpoint');else if(w.matching_worker_state==='running')details.push('Matching worker running');else if(w.matching_worker_state==='stopping')details.push('Pause requested · matching worker is stopping');if(w.matching_checkpoint_mismatch)details.push('The linked matching checkpoint belongs to another workflow. Its history is preserved; Resume will use an independent checkpoint for these saved jobs.');if(liveMatching?.status)details.push('AI matching '+liveMatching.status+' ('+(liveMatching.fresh_completed||liveMatching.completed||0)+'/'+(liveMatching.total||0)+')');if(liveMatching&&Number.isFinite(Number(liveMatching.pending)))details.push(liveMatching.pending+' jobs pending analysis');if(w.job_outcomes?.length)details.push(...w.job_outcomes.filter(j=>j.excluded||j.not_eligible||j.failed||j.pending||j.needs_review).map(j=>`${j.company||'Employer'} — ${j.title||j.job_key}: ${j.status==='excluded'?'Excluded: '+(j.reason||'filtered'):j.failed?'Failed: '+(j.reason||'analysis failed'):j.pending?(j.unresolved_description?'Description missing — unresolved':'Pending analysis'):j.not_eligible?'Not eligible':j.needs_review?'Needs review':''}`));if(liveMatching?.current_job?.title)details.push('Analyzing '+liveMatching.current_job.title+(liveMatching.current_job.company?' at '+liveMatching.current_job.company:''));if(liveMatching?.last_successful_checkpoint?.title)details.push('Last matching checkpoint: '+liveMatching.last_successful_checkpoint.title+(liveMatching.last_successful_checkpoint.company?' at '+liveMatching.last_successful_checkpoint.company:''));if(liveMatching?.error)details.push(liveMatching.error);if(feeds)details.push(feeds);const primary=d.clarification_required?.join(' ')||d.failure||d.recovery||d.source_note||'';if(primary)details.unshift(primary);const text=details.join(' · ');$('#diagnostics').hidden=!text;$('#diagnostics').textContent=text;$('#pause').disabled=!['queued','running'].includes(w.status);const resumableMatchFailure=w.status==='failed'&&Number(w.discovered_count||0)>0&&String(d.failure||'').includes('Another match analysis is already active');const matcherOwned=w.matching_worker_state==='running';if(resumePending&&matcherOwned){resumePending=false;$('#message').textContent='Matching worker running.'}else if(resumePending&&w.status==='paused'&&!w.pause_requested){resumePending=false;$('#message').textContent=liveMatching?.error||d.failure||'Resume did not start matching. Review the Matching Details and retry.'}$('#resume').disabled=resumePending||!(w.status==='paused'||resumableMatchFailure);$('#resume').textContent=resumePending?'Resume requested…':(resumableMatchFailure?'Resume matching':'Resume');$('#recoverMatch').hidden=!(liveMatching?.recovery_available&&liveMatching?.session_id);$('#recoverMatch').dataset.sessionId=liveMatching?.session_id||'';$('#cancel').disabled=['completed','cancelled','failed'].includes(w.status);$('#start').disabled=['queued','running','paused'].includes(w.status)}
+function render(w){current=w;if(!w){$('#stage').textContent='No workflow started';$('#metrics').replaceChildren();return}$('#prompt').value=w.prompt||'';$('#stage').textContent=(w.status||'').replaceAll('_',' ')+' · '+(w.current_stage||'').replaceAll('_',' ');const order=['queued','authorizing','discovering','matching','queueing','completed'];$('#progress').style.width=Math.max(4,100*Math.max(0,order.indexOf(w.current_stage))/(order.length-1))+'%';const counts=w.outcome_counts||{},outcomes=w.job_outcomes||[],enrichment=w.diagnostics?.enrichment||{};const retryFailed=$('#retry-failed'),failedKeys=outcomes.filter(j=>j.failed&&j.description_available).map(j=>j.job_key);retryFailed.hidden=!failedKeys.length||!['completed','paused','failed'].includes(w.status);retryFailed.textContent='Retry '+failedKeys.length+' failed matching job'+(failedKeys.length===1?'':'s')+' without rediscovery';retryFailed.disabled=false;retryFailed.onclick=async()=>{retryFailed.disabled=true;try{const result=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/enrich',{method:'POST',body:JSON.stringify({job_keys:failedKeys})});$('#message').textContent=result.matching_workflow_id?'Matching-only retry started for '+failedKeys.length+' saved jobs. Employer discovery was not repeated.':'No saved descriptions were ready to retry.';refresh()}catch(error){$('#message').textContent=error.message;retryFailed.disabled=false}};const values=[['Employers searched',w.diagnostics?.discovery?.sources_checked||w.diagnostics?.eligible_sources||0],['Descriptions available',outcomes.filter(j=>j.description_available).length],['Descriptions missing',outcomes.filter(j=>!j.description_available).length],['Enrichment attempted',enrichment.attempted||0],['Enrichment succeeded',enrichment.succeeded||0],['Enrichment failed',enrichment.failed||0],['Awaiting reassessment',w.review_counts?.awaiting_reassessment||0],['Approved for dry run',w.review_counts?.approved_for_dry_run||0],['Applications needing input',w.application_counts?.needs_user_input||0],['Failed or unsupported applications',Number(w.application_counts?.failed||0)+Number(w.application_counts?.unsupported||0)],...Object.entries(labels).map(([key,label])=>[label,key==='discovered'?w.discovered_count:key==='potential_match'?w.potential_match_count:key==='queued'?w.queued_count:key==='prepared'?w.prepared_count:key==='failed_steps'?w.failed_count:counts[key]||0])];$('#metrics').replaceChildren(...values.map(([k,v])=>metric(k,v)));renderOutcomes(w);renderPreferenceConflicts(w);renderEligibilityReviews(w);const app=w.application_counts||w.diagnostics?.application_states||{};$('#application-state').replaceChildren(...[['Queued',app.queued||0],['Preparing',Number(app.opening||0)+Number(app.inspecting||0)+Number(app.filling||0)+Number(app.uploading_resume||0)],['Needs your input',app.needs_user_input||0],['Ready for review',app.ready_for_review||0]].map(([k,v])=>metric(k,v)));const d=w.diagnostics||{},liveMatching={...(d.matching||{}),...(w.matching_progress||{})},events=d.activity||[];$('#activity').replaceChildren(...events.slice(-8).reverse().map(e=>{const li=document.createElement('li'),date=new Date(e.at);li.textContent=(Number.isNaN(date.getTime())?'':date.toLocaleString()+' · ')+(e.stage||e.status||'Workflow update').replaceAll('_',' ');return li}));const discovery=d.discovery||{},feeds=(discovery.feed_failures||[]).map(f=>`${f.company} (${f.source_platform||'source'}${f.stage?' · '+f.stage:''}): ${f.reason}`).join(' '),details=[];if(discovery.current_source?.company)details.push('Checking '+discovery.current_source.company);if(discovery.last_successful_checkpoint?.company)details.push('Last successful source: '+discovery.last_successful_checkpoint.company);if(liveMatching?.provider)details.push('Provider: '+liveMatching.provider+(liveMatching.provider_model?' · '+liveMatching.provider_model:''));if(w.matching_worker_state==='resume_requested')details.push('Resume requested · waiting for a worker to claim the saved checkpoint');else if(w.matching_worker_state==='running')details.push('Matching worker running');else if(w.matching_worker_state==='stopping')details.push('Pause requested · matching worker is stopping');if(w.matching_checkpoint_mismatch)details.push('The linked matching checkpoint belongs to another workflow. Its history is preserved; Resume will use an independent checkpoint for these saved jobs.');if(liveMatching?.status)details.push('AI matching '+liveMatching.status+' ('+(liveMatching.fresh_completed||liveMatching.completed||0)+'/'+(liveMatching.total||0)+')');if(liveMatching&&Number.isFinite(Number(liveMatching.pending)))details.push(liveMatching.pending+' jobs pending analysis');if(w.job_outcomes?.length)details.push(...w.job_outcomes.filter(j=>j.excluded||j.not_eligible||j.failed||j.pending||j.needs_review).map(j=>`${j.company||'Employer'} — ${j.title||j.job_key}: ${j.status==='excluded'?'Excluded: '+(j.reason||'filtered'):j.failed?'Failed: '+(j.reason||'analysis failed'):j.pending?(j.unresolved_description?'Description missing — unresolved':'Pending analysis'):j.not_eligible?'Not eligible':j.needs_review?'Needs review':''}`));if(liveMatching?.current_job?.title)details.push('Analyzing '+liveMatching.current_job.title+(liveMatching.current_job.company?' at '+liveMatching.current_job.company:''));if(liveMatching?.last_successful_checkpoint?.title)details.push('Last matching checkpoint: '+liveMatching.last_successful_checkpoint.title+(liveMatching.last_successful_checkpoint.company?' at '+liveMatching.last_successful_checkpoint.company:''));if(liveMatching?.last_successful_checkpoint?.at)details.push('Last successful progress update: '+new Date(liveMatching.last_successful_checkpoint.at).toLocaleString());if(liveMatching?.current_elapsed_seconds!=null){const elapsed=Number(liveMatching.current_elapsed_seconds),duration=elapsed>=3600?Math.floor(elapsed/3600)+'h '+Math.floor(elapsed%3600/60)+'m':elapsed>=60?Math.floor(elapsed/60)+'m '+elapsed%60+'s':elapsed+'s';details.push('Current job processing for '+duration)}if(liveMatching?.last_progress_at)details.push('Last worker heartbeat: '+new Date(liveMatching.last_progress_at).toLocaleString());if(liveMatching?.worker_health==='slow_processing')details.push('This request is taking longer than usual, but the worker process is alive and renewing its lease. Recovery is disabled while it is active.');else if(liveMatching?.worker_health==='heartbeat_late')details.push('The worker process is still alive, but its heartbeat or lease is late. BabyStepsAI will not take ownership away from a live worker.');else if(liveMatching?.worker_health==='stalled_recoverable')details.push('Matching is stalled: the lease expired and the local worker is not running. Completed job results are preserved; recover the checkpoint, then Resume matching.');else if(liveMatching?.worker_health==='owner_unverified')details.push('Worker ownership is on another or unverified host. Recovery is disabled to avoid interrupting active matching.');if(liveMatching?.error)details.push(liveMatching.error);if(feeds)details.push(feeds);const primary=d.clarification_required?.join(' ')||d.failure||d.recovery||d.source_note||'';if(primary)details.unshift(primary);const text=details.join(' · ');$('#diagnostics').hidden=!text;$('#diagnostics').textContent=text;$('#pause').disabled=!['queued','running'].includes(w.status);const resumableMatchFailure=w.status==='failed'&&Number(w.discovered_count||0)>0&&String(d.failure||'').includes('Another match analysis is already active');const matcherOwned=w.matching_worker_state==='running';if(resumePending&&matcherOwned){resumePending=false;$('#message').textContent='Matching worker running.'}else if(resumePending&&w.status==='paused'&&!w.pause_requested){resumePending=false;$('#message').textContent=liveMatching?.error||d.failure||'Resume did not start matching. Review the Matching Details and retry.'}$('#resume').disabled=resumePending||!(w.status==='paused'||resumableMatchFailure);$('#resume').textContent=resumePending?'Resume requested…':(resumableMatchFailure?'Resume matching':'Resume');$('#recoverMatch').hidden=!(liveMatching?.recovery_available&&liveMatching?.session_id);$('#recoverMatch').dataset.sessionId=liveMatching?.session_id||'';$('#cancel').disabled=['completed','cancelled','failed'].includes(w.status);$('#start').disabled=['queued','running','paused'].includes(w.status)}
 async function renderEligibilityReviews(w){let section=document.getElementById('eligibility-reviews');if(!section){section=document.createElement('section');section.className='panel';section.id='eligibility-reviews';section.innerHTML='<h2>Jobs Requiring Your Review</h2><p class="muted">Confirm factual information once, then reassess saved openings. Confirmed mandatory conflicts stay blocked.</p><div id="eligibility-questions"></div><div id="eligibility-jobs" class="outcomes"></div>';document.getElementById('job-outcomes').parentElement.after(section)}if(!w?.workflow_id){section.hidden=true;return}section.hidden=false;try{const data=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/eligibility-reviews'),questions=document.getElementById('eligibility-questions'),root=document.getElementById('eligibility-jobs');questions.replaceChildren();root.replaceChildren();for(const q of data.questions||[]){const box=document.createElement('div');box.className='outcome';const title=document.createElement('strong');title.textContent='Confirm once · '+q.key.replaceAll('_',' ');const prompt=document.createElement('p');prompt.textContent=q.question;box.append(title,prompt);if(['work_authorization','sponsorship','education','work_arrangement'].includes(q.key)){const note=document.createElement('p');note.textContent=['work_authorization','sponsorship'].includes(q.key)?'Sensitive facts must be confirmed in Candidate Profile and are never copied to an AI prompt by this form.':'Update this structured fact in the matching profile or career preferences page.';const link=document.createElement('a');link.href=q.key==='work_arrangement'?'/careers':'/candidate-profile';link.textContent=q.key==='work_arrangement'?'Open Career Preferences':'Open Candidate Profile';box.append(note,link);questions.append(box);continue}const input=document.createElement('input');input.type='text';input.maxLength=4000;input.placeholder='Your confirmed answer';input.setAttribute('aria-label',q.question);const reuse=document.createElement('input');reuse.type='checkbox';const reuseLabel=document.createElement('label');reuseLabel.append(reuse,document.createTextNode(' Allow reuse in future applications'));const save=document.createElement('button');save.textContent='Confirm Information';save.onclick=async()=>{const job=q.jobs?.[0]?.job_key;if(!job||!input.value.trim()){document.getElementById('message').textContent='Enter and confirm an answer before saving.';return}save.disabled=true;try{const result=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/eligibility-review',{method:'POST',body:JSON.stringify({job_key:job,action:'confirm',question_key:q.key,question:q.question,answer:input.value,reusable:reuse.checked,confirmed:true})});document.getElementById('message').textContent=result.message;renderEligibilityReviews(w)}catch(e){document.getElementById('message').textContent=e.message;save.disabled=false}};box.append(input,reuseLabel,save);questions.append(box)}for(const job of data.jobs||[]){const card=document.createElement('article');card.className='outcome';const head=document.createElement('div');head.className='outcome-head';const title=document.createElement('strong');title.textContent=job.employer+' · '+job.title;const badge=document.createElement('span');badge.className='badge';badge.textContent=job.review_status+' · '+job.reassessment_status;head.append(title,badge);card.append(head);const meta=document.createElement('p');meta.textContent='Location: '+job.location+' · Eligibility: '+job.classification+' · Preparation: '+job.application_preparation_status;card.append(meta);for(const [label,items] of [['Required qualifications',job.required_qualifications?.map(x=>x.requirement+' — '+x.status)],['Preferred qualifications',job.preferred_qualifications?.map(x=>x.requirement+' — '+x.status)],['Verified candidate evidence',job.verified_candidate_evidence],['Missing candidate evidence',job.missing_candidate_evidence],['Confirmed conflicts',job.confirmed_conflicts],['Uncertain requirements',job.uncertain_requirements]])if(items?.length){const p=document.createElement('p');p.textContent=label+': '+items.join('; ');card.append(p)}const explanation=document.createElement('p');explanation.className='muted';explanation.textContent=job.ai_explanation;card.append(explanation);const actions=document.createElement('div');actions.className='actions';const details=document.createElement('button');details.textContent='Review Job';details.onclick=()=>{const expanded=card.dataset.expanded==='true';card.dataset.expanded=String(!expanded);explanation.hidden=expanded};actions.append(details);for(const [label,action] of [['Reassess','reassess'],['Approve Dry Run','approve_dry_run'],['Reject','reject'],['Defer','defer']]){const button=document.createElement('button');button.textContent=label;button.disabled=false;button.onclick=async()=>{button.disabled=true;try{const result=await call('/api/workflows/'+encodeURIComponent(w.workflow_id)+'/eligibility-review',{method:'POST',body:JSON.stringify({job_key:job.job_key,action})});document.getElementById('message').textContent=result.message||'Review action saved.';if(action==='approve_dry_run'){const queued=await call('/api/applications/queue',{method:'POST',body:JSON.stringify({job_keys:[job.job_key]})});document.getElementById('message').textContent=queued.queued?'Eligible opening entered the dry-run queue.':'Queue blocked: '+(queued.skipped?.[0]?.reason||'review eligibility and preparation permissions.')}await renderEligibilityReviews(w);refresh()}catch(e){document.getElementById('message').textContent=e.message;button.disabled=false}};actions.append(button)}card.append(actions);root.append(card)}}catch(e){section.hidden=false;document.getElementById('eligibility-jobs').textContent='Eligibility review details are temporarily unavailable: '+e.message}}
 async function refresh(){try{const d=await call('/api/workflows/current');render(d.workflow);if(d.workflow&&(['queued','running'].includes(d.workflow.status)||Object.keys(d.workflow.application_counts||{}).some(k=>['queued','opening','inspecting','filling','uploading_resume'].includes(k))))setTimeout(refresh,1200)}catch(e){$('#message').textContent=e.message}}
 $('#start').onclick=async()=>{if($('#start').disabled)return;$('#start').disabled=true;try{$('#message').textContent='Checking permissions and starting…';const d=await call('/api/workflows',{method:'POST',body:JSON.stringify({prompt:$('#prompt').value})});render(d);$('#message').textContent=d.clarification_required?.length?'Resolve the prompt and saved preference conflict before starting.':(d.automatic_preparation_authorized?'Workflow started.':'Workflow started; application preparation is not authorized, so eligible jobs will remain for review.');refresh()}catch(e){$('#message').textContent=e.message;$('#start').disabled=false;const detail=e.detail||{};if(detail.recovery_available&&detail.discovery_run_id){$('#recover').hidden=false;$('#recover').dataset.runId=detail.discovery_run_id}refresh()}};
