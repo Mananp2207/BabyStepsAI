@@ -111,18 +111,50 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
     deliberately independent of candidate verification and application filling.
     """
     fields = [item for item in (fields or []) if isinstance(item, dict)]
+    inspection_meta = next((item for item in fields if item.get("__inspection_meta__")), {})
+    ignored_controls = [item for item in (inspection_meta.get("ignored_controls") or []) if isinstance(item,dict)]
+    fields = [item for item in fields if not item.get("__inspection_meta__")]
     controls = [item for item in (controls or []) if isinstance(item, dict)]
-    required = [str(item.get("label") or "Unlabeled required field")[:160]
-                for item in fields if item.get("required")]
-    upload_fields = [str(item.get("label") or "File upload")[:160]
+    questions_by_key = {}
+    for index, item in enumerate(fields):
+        question = re.sub(r"\s+", " ", str(item.get("question") or item.get("label") or "")).strip()[:160]
+        kind = str(item.get("kind") or "unknown")[:40]
+        key = "question:"+re.sub(r"[^a-z0-9]+", " ", question.casefold()).strip() if question else (str(item.get("question_key") or "").strip() or "unresolved|"+str(index))
+        group = questions_by_key.setdefault(key, {"question": question, "required": False, "control_types": [], "controls": [], "conditional": False})
+        if question and not group["question"]: group["question"] = question
+        group["required"] = bool(group["required"] or item.get("required"))
+        group["conditional"] = bool(group["conditional"] or item.get("conditional"))
+        if kind not in group["control_types"]: group["control_types"].append(kind)
+        control = {"kind": kind, "required": bool(item.get("required")), "label": str(item.get("label") or "")[:160]}
+        for key_name in ("tag", "input_type", "role", "name", "id", "class_hint", "container_class_hint", "aria_hints", "container_control_count", "possible_custom_selector", "unresolved_reason"):
+            if item.get(key_name) not in (None, "", False): control[key_name] = str(item[key_name])[:120] if not isinstance(item[key_name], bool) else True
+        if kind == "file":
+            control["upload_purpose"] = str(item.get("upload_purpose") or "unspecified")[:40]
+            control["accept"] = str(item.get("accept") or "")[:120]
+        group["controls"].append(control)
+    questions = [item for item in questions_by_key.values() if item.get("question")]
+    required_questions = [item for item in questions if item["required"]]
+    optional_questions = [item for item in questions if not item["required"]]
+    required = [item["question"] for item in required_questions]
+    upload_fields = [str(item.get("question") or item.get("label") or "File upload")[:160]
                      for item in fields if item.get("kind") == "file"]
-    supported_kinds = {"text", "email", "tel", "url", "number", "date", "textarea",
+    supported_kinds = {"text", "email", "tel", "url", "number", "date", "textarea", "contenteditable",
                        "select", "combobox", "checkbox", "radio", "file"}
     supported = [str(item.get("label") or item.get("kind") or "Form field")[:160]
                  for item in fields if item.get("kind") in supported_kinds]
     unsupported = [str(item.get("label") or item.get("kind") or "Custom field")[:160]
                    for item in fields if item.get("kind") not in supported_kinds]
     actions = submission_controls(controls)
+    unresolved_controls = []
+    for item in fields:
+        reasons=[]
+        if not str(item.get("question") or item.get("label") or "").strip(): reasons.append("Applicant question label could not be determined")
+        if item.get("unresolved_reason"): reasons.append(str(item["unresolved_reason"])[:160])
+        if item.get("possible_custom_selector"): reasons.append("Text input has closed-choice wording but no reliable selector semantics")
+        if item.get("kind") not in supported_kinds: reasons.append("Control type is not supported")
+        if reasons:
+            unresolved_controls.append({"question":str(item.get("question") or item.get("label") or "Unlabeled control")[:160],
+                "kind":str(item.get("kind") or "unknown")[:40],"required":("unknown" if item.get("required") is None else bool(item.get("required"))),"reasons":list(dict.fromkeys(reasons))})
     human_actions = []
     if interruption == "human_verification": human_actions.append("CAPTCHA or human verification")
     elif interruption == "authentication_required": human_actions.append("Employer sign-in is required")
@@ -136,7 +168,7 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         outcome = "inaccessible"
     elif not form_detected:
         outcome = "unsupported"
-    elif unsupported:
+    elif unsupported or unresolved_controls:
         outcome = "partially_compatible"
     else:
         outcome = "compatible"
@@ -144,21 +176,42 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         "provider": dict(provider or {}),
         "form_detected": form_detected,
         "fields": [{"label": str(item.get("label") or "")[0:160],
+                    "question": str(item.get("question") or item.get("label") or "")[0:160],
                     "kind": str(item.get("kind") or "unknown")[:40],
                     "required": bool(item.get("required")),
+                    **({"conditional":True} if item.get("conditional") else {}),
+                    **({"upload_purpose":str(item.get("upload_purpose") or "unspecified")[:40]} if item.get("kind")=="file" else {}),
+                    **({"possible_custom_selector":True} if item.get("possible_custom_selector") else {}),
                     **({"accept": str(item.get("accept") or "")[:120]} if item.get("kind") == "file" else {})}
                    for item in fields[:100]],
+        "ignored_controls": ignored_controls[:100],
+        "ignored_control_count": len(ignored_controls),
+        "questions": questions[:100],
+        "required_questions": required_questions[:100],
+        "optional_questions": optional_questions[:100],
+        "unique_question_count": len(questions),
+        "unique_required_question_count": len(required_questions),
+        "unique_optional_question_count": len(optional_questions),
+        "required_control_count": sum(1 for item in fields if item.get("required")),
+        "unresolved_required_control_count": sum(1 for item in unresolved_controls if item.get("required") is not False),
         "supported_fields": supported[:100],
         "unsupported_fields": unsupported[:100],
+        "unresolved_controls": unresolved_controls[:100],
+        "conditional_questions": [item["question"] for item in questions if item.get("conditional")],
+        "conditional_detection_note": "Read-only inspection can identify explicit conditional markers only; it does not activate controls to reveal other conditional questions.",
         "required_fields": required[:100],
         "file_upload_controls": upload_fields[:30],
         "human_actions_required": human_actions,
         "multi_step_detected": multi_step,
         "submission_control_detected": bool(actions),
         "submission_controls": actions[:30],
+        "submission_control_status": ("detected_visible" if any(item.get("visible", True) for item in controls if item.get("action")=="final_submission") else
+                                       "detected_hidden" if any(item.get("action")=="final_submission" for item in controls) else
+                                       "not_detected_unresolved"),
         "inspection_outcome": outcome,
         "reason": ("The page requires a human action before its form can be inspected." if human_actions else
                    "No public application form was detected." if not form_detected else
+                   "Some required fields or control semantics could not be resolved." if unresolved_controls else
                    "Some controls use unsupported or custom semantics." if unsupported else
                    "Public form metadata was inspected without entering or submitting information."),
     }

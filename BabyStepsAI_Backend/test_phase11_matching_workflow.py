@@ -109,6 +109,28 @@ class Phase11MatchingWorkflowTests(unittest.TestCase):
         rendered=workflow_orchestrator._serialize(workflow_orchestrator._row("workflow-test"))
         self.assertEqual(rendered["outcome_counts"]["analyzed"],12)
         self.assertEqual(rendered["outcome_counts"]["pending"],0)
+        # Workflow matching must not silently treat global preparation settings
+        # as consent to enter real employer forms. Authorize each exact job
+        # after a fresh read-only inspection, then queue the selected dry runs.
+        with patch.object(application_agent,"validate_application_url",return_value=None), \
+             patch.object(application_agent,"_schedule_application_queue",return_value=False):
+            for key in self.keys:
+                job=application_agent._get_job(application_agent.DryRunRequest(job_key=key))
+                report={"provider":{"provider":"greenhouse"},"form_detected":True,
+                    "page_classification":"application_form","inspection_outcome":"compatible",
+                    "robots_policy":"verified_allow","required_fields":[],"unsupported_fields":[],
+                    "fields":[],"human_actions_required":[],"submission_control_detected":True,
+                    "submission_control_status":"detected_visible",
+                    "submission_controls":[{"action":"final_submission","label":"Submit application","visible":True}]}
+                application_agent._save_form_inspection(job,report)
+                plan=application_agent.preparation_authorization_plan(key)
+                application_agent.authorize_saved_job_preparation(key,application_agent.PreparationAuthorizationRequest(
+                    confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                    confirmed_application_url=plan["application_url"],
+                    field_keys=[item["key"] for item in plan["candidate_fields"] if item["key"] in {"full_name","email"}],
+                    document_types=["resume"]))
+            queued=application_agent.enqueue_saved_jobs(application_agent.ApplicationQueueRequest(job_keys=self.keys))
+        self.assertEqual(queued["queued"],12)
         with job_search_agent.database() as db:
             results=db.execute("SELECT status,classification,freshness_status FROM job_match_results WHERE user_id=? AND job_key IN (SELECT value FROM json_each(?))",
                                (job_search_agent.USER,json.dumps(self.keys))).fetchall()

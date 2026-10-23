@@ -701,6 +701,17 @@ class ConnectorTests(unittest.TestCase):
             applications.review_saved_job_eligibility(found["results"][0]["job_key"],
                 applications.EligibilityReviewRequest(reviewed=True))
             with patch.object(applications,"validate_application_url",side_effect=lambda url:url),patch.object(applications,"_schedule_application_queue",return_value=False):
+                job=applications._get_job(applications.DryRunRequest(job_key=found["results"][0]["job_key"]))
+                form_report={"provider":{"provider":"ashby"},"form_detected":True,"page_classification":"application_form",
+                    "inspection_outcome":"compatible","robots_policy":"verified_allow","required_fields":[],
+                    "unsupported_fields":[],"fields":[],"human_actions_required":[],
+                    "submission_control_detected":True,"submission_control_status":"detected_visible",
+                    "submission_controls":[{"action":"final_submission","label":"Submit application","visible":True}]}
+                applications._save_form_inspection(job,form_report)
+                plan=applications.preparation_authorization_plan(found["results"][0]["job_key"])
+                applications.authorize_saved_job_preparation(found["results"][0]["job_key"],applications.PreparationAuthorizationRequest(
+                    confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                    confirmed_application_url=plan["application_url"],field_keys=["full_name"],document_types=["resume"]))
                 queue=applications.enqueue_saved_jobs(applications.ApplicationQueueRequest(job_keys=[found["results"][0]["job_key"]]))
             self.assertEqual(queue["queued"],1)
             self.assertFalse(queue["submission_enabled"])

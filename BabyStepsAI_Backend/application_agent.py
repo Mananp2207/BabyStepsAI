@@ -19,10 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 import hashlib
+import asyncio
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from job_search_agent import USER, DB as JOB_DB, fetch_board
 from candidate_verification import (verified_profile_facts, save_application_answer, AnswerUpdate,
@@ -46,6 +47,8 @@ _queue_worker_running = False
 _inspection_lock = threading.Lock()
 _robots_cache_lock = threading.Lock()
 _robots_cache = {}
+_resume_fingerprint_lock=threading.Lock()
+_resume_fingerprint_cache={}
 ROBOTS_CACHE_TTL_SECONDS = 1800
 ROBOTS_MAX_ATTEMPTS = 3
 ROBOTS_MAX_BYTES = 256000
@@ -136,6 +139,16 @@ def initialize():
             id TEXT PRIMARY KEY,user_id TEXT NOT NULL,job_key TEXT NOT NULL,provider TEXT NOT NULL,
             outcome TEXT NOT NULL,report_json TEXT NOT NULL,inspected_at TEXT NOT NULL)""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_form_inspections_user_job ON application_form_inspections(user_id,job_key,inspected_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS application_preparation_authorizations(
+            authorization_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,job_key TEXT NOT NULL,
+            application_url_hash TEXT NOT NULL,resume_id TEXT NOT NULL,match_updated_at TEXT NOT NULL,
+            matching_engine_version TEXT NOT NULL,profile_fingerprint TEXT NOT NULL,
+            answers_fingerprint TEXT NOT NULL,documents_fingerprint TEXT NOT NULL,
+            settings_version INTEGER NOT NULL DEFAULT 0,field_keys_json TEXT NOT NULL,
+            document_types_json TEXT NOT NULL,allow_ai_answers INTEGER NOT NULL DEFAULT 0,
+            allow_cloud_ai INTEGER NOT NULL DEFAULT 0,consent_version TEXT NOT NULL,
+            authorized_at TEXT NOT NULL,revoked_at TEXT)""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_prep_auth_user_job ON application_preparation_authorizations(user_id,job_key,authorized_at)")
         db.execute("INSERT OR IGNORE INTO submission_quota_reservations(id,user_id,application_id,state,created_at,updated_at,confirmed_at) SELECT 'historic:'||id,user_id,id,'succeeded',created_at,updated_at,COALESCE(submitted_at,updated_at) FROM applications WHERE state='submitted'")
         # Older versions left in-flight records without heartbeat timestamps.
         # Recovery is explicit and conservative: never retry automatically.
@@ -387,15 +400,57 @@ def _safe_request(url):
     except ValueError: return False
 
 
-def _guard_browser_request(route):
+def _guard_browser_request(route,policy_state=None):
     request=route.request
     if request.method.upper() not in {"GET","HEAD","OPTIONS"}:
-        route.abort()
+        if policy_state is not None:policy_state.update({"category":"read_only_method_blocked","reason":"A page request attempted a non-read-only HTTP method. No application interaction was performed."})
+        try:route.abort()
+        except (Exception,asyncio.CancelledError):pass
         return
     if not _safe_request(request.url) and not request.url.startswith(("about:","data:")):
-        route.abort()
+        if policy_state is not None and getattr(request,"is_navigation_request",lambda:False)():
+            policy_state.update({"category":"unsafe_destination","reason":"A browser navigation destination failed public URL safety checks."})
+        try:route.abort()
+        except (Exception,asyncio.CancelledError):pass
         return
-    route.continue_()
+    if (policy_state is not None and getattr(request,"is_navigation_request",lambda:False)()
+            and not _mock_allowed(request.url)):
+        permitted,reason,category=_robots_permission(request.url)
+        if not permitted:
+            policy_state.update({"category":category,"reason":reason or "Robots policy did not permit this navigation."})
+            try:route.abort()
+            except (Exception,asyncio.CancelledError):pass
+            return
+    # A page can close while Chromium still has routed subresource requests
+    # queued. Those cancellations are expected during safe cleanup and should
+    # not leak asynchronous Playwright callback tracebacks to logs.
+    try:route.continue_()
+    except (Exception,asyncio.CancelledError):pass
+
+
+def _close_browser_safely(page,browser):
+    """Detach routed requests before closing Chromium's page/context."""
+    if page is not None:
+        try:page.unroute_all(behavior="wait")
+        except TypeError:
+            try:page.unroute_all()
+            except (Exception,asyncio.CancelledError):pass
+        except (Exception,asyncio.CancelledError):pass
+    if browser is not None:
+        try:browser.close()
+        except (Exception,asyncio.CancelledError):pass
+
+
+class _ManagedPlaywrightContext:
+    """Close routed pages before the sync Playwright driver shuts down."""
+    def __init__(self,factory):self.factory=factory;self.manager=None;self.playwright=None;self.page=None;self.browser=None
+    def __enter__(self):
+        self.manager=self.factory();self.playwright=self.manager.__enter__();return self
+    def __getattr__(self,name):return getattr(self.playwright,name)
+    def attach(self,page,browser):self.page=page;self.browser=browser
+    def __exit__(self,exc_type,exc_value,traceback):
+        _close_browser_safely(self.page,self.browser)
+        return self.manager.__exit__(exc_type,exc_value,traceback)
 
 
 def _robots_permission(url):
@@ -507,6 +562,16 @@ class FormInspectionRequest(BaseModel):
 class StandaloneFormCompatibilityRequest(BaseModel):
     application_url: str
 
+class PreparationAuthorizationRequest(BaseModel):
+    confirmed: bool = False
+    confirmed_employer: str = Field(min_length=1,max_length=200)
+    confirmed_title: str = Field(min_length=1,max_length=300)
+    confirmed_application_url: str = Field(min_length=8,max_length=2048)
+    field_keys: list[str] = Field(default_factory=list,max_length=100)
+    document_types: list[str] = Field(default_factory=list,max_length=20)
+    allow_ai_answers: bool = False
+    allow_cloud_ai: bool = False
+
 class EligibilityReviewRequest(BaseModel):
     reviewed: bool = False
 
@@ -551,6 +616,325 @@ def _url_syntax_allowed(url):
     except ValueError:
         pass
     return True
+
+
+PREPARATION_FIELD_LABELS={
+    "full_name":"Full name","preferred_name":"Preferred name","email":"Email","phone":"Phone",
+    "phone_country_code":"Phone country code","location":"Current residence","city":"City",
+    "state_province":"State or province","country":"Country","postal_code":"Postal code",
+    "linkedin":"LinkedIn","github":"GitHub","portfolio":"Portfolio","website":"Personal website",
+    "university":"Education and university","education":"Education history","degree":"Degree",
+    "major":"Major","graduation_date":"Graduation date","graduation_month":"Graduation month",
+    "graduation_year":"Graduation year","work_experience":"Employment history",
+    "internships":"Internship history","technical_skills":"Technical skills","projects":"Projects",
+    "certifications":"Certifications","licenses":"Licenses","availability":"Availability",
+    "earliest_available_date":"Earliest start date","relocation_willingness":"Relocation willingness",
+    "willingness_to_travel":"Travel willingness","work_arrangement_preferences":"Work arrangement preferences",
+    "employment_preferences":"Employment preferences","work_authorization":"Work authorization",
+    "requires_sponsorship":"Sponsorship requirements","salary_expectations":"Salary expectations",
+    "salary_currency":"Salary currency","additional_information":"Additional information",
+}
+PREPARATION_DOCUMENT_TYPES={"resume","transcript","certificate","cover_letter","portfolio"}
+PREPARATION_CONSENT_VERSION="phase12.4-v1"
+
+
+def _sha256_json(value):
+    encoded=json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False,default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _public_url_for_confirmation(url):
+    # Query strings can carry signed links or session tokens. The underlying
+    # saved URL remains fully bound into the authorization fingerprint, but
+    # user-facing confirmation and diagnostics show only the stable public URL.
+    try:return urlparse(str(url or ""))._replace(query="",fragment="").geturl()
+    except ValueError:return ""
+
+
+def _preparation_snapshot(job_key,resume_id,application_url):
+    with connect() as db:
+        match=db.execute("SELECT status,classification,updated_at,freshness_status,matching_model_version FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume_id)).fetchone()
+        opening=db.execute("SELECT company,title,COALESCE(job_url,url) AS posting_url,url,content_fingerprint,description FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,job_key)).fetchone()
+        profile=db.execute("SELECT values_json,confirmed_json,updated_at FROM candidate_verifications WHERE user_id=? AND resume_id=?",(USER,resume_id)).fetchone()
+        resume=db.execute("SELECT stored_name FROM resumes WHERE user_id=? AND id=?",(USER,resume_id)).fetchone()
+        try:answer_rows=db.execute("SELECT question_key,updated_at,confirmed,revoked_at,auto_reuse,sensitive FROM application_answers WHERE user_id=? AND resume_id=? ORDER BY question_key",(USER,resume_id)).fetchall()
+        except sqlite3.OperationalError:answer_rows=[]
+        try:document_rows=db.execute("SELECT document_id,document_type,sha256,updated_at FROM application_documents WHERE user_id=? AND resume_id=? ORDER BY document_id",(USER,resume_id)).fetchall()
+        except sqlite3.OperationalError:document_rows=[]
+        settings=db.execute("SELECT version FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()
+    try:
+        from resume_job_matcher import matching_engine_version
+        engine_version=matching_engine_version()
+    except Exception:engine_version=""
+    resume_file_hash=""
+    if resume:
+        name=str(resume["stored_name"] or "")
+        path=(STORAGE/Path(name).name).resolve()
+        if name and Path(name).name==name and path.parent==STORAGE.resolve() and path.is_file():
+            try:
+                stat=path.stat(); cache_key=(str(resume_id),str(path),stat.st_size,stat.st_mtime_ns)
+                with _resume_fingerprint_lock: resume_file_hash=_resume_fingerprint_cache.get(cache_key,"")
+                if not resume_file_hash:
+                    digest=hashlib.sha256()
+                    with path.open("rb") as source:
+                        for block in iter(lambda:source.read(1024*1024),b""):digest.update(block)
+                    resume_file_hash=digest.hexdigest()
+                    with _resume_fingerprint_lock:
+                        _resume_fingerprint_cache.clear();_resume_fingerprint_cache[cache_key]=resume_file_hash
+            except OSError:resume_file_hash=""
+    return {
+        "resume_id":str(resume_id or ""),
+        "resume_file_hash":resume_file_hash,
+        "application_url_hash":_sha256_json({"application_url":str(application_url),"employer":str(opening["company"] or "") if opening else "",
+            "title":str(opening["title"] or "") if opening else "","posting_url":str(opening["posting_url"] or "") if opening else "",
+            "job_content_fingerprint":str(opening["content_fingerprint"] or "") if opening else "",
+            "description_fingerprint":hashlib.sha256(str(opening["description"] or "").encode("utf-8")).hexdigest() if opening else ""}),
+        "match_updated_at":str(match["updated_at"] or "") if match else "",
+        "matching_engine_version":engine_version,
+        "profile_fingerprint":_sha256_json({"values":profile["values_json"],"confirmed":profile["confirmed_json"],"updated_at":profile["updated_at"],"resume_file_hash":resume_file_hash}) if profile else "",
+        "answers_fingerprint":_sha256_json([dict(row) for row in answer_rows]),
+        "documents_fingerprint":_sha256_json([dict(row) for row in document_rows]),
+        "settings_version":int(settings["version"] or 0) if settings else 0,
+        "match_status":str(match["status"] or "") if match else "",
+        "classification":str(match["classification"] or "") if match else "",
+        "freshness_status":str(match["freshness_status"] or "") if match else "",
+    }
+
+
+def _preparation_options(candidate,answers):
+    fields=[]
+    for key,label in PREPARATION_FIELD_LABELS.items():
+        value=candidate.get(key)
+        if key=="location":
+            value=candidate.get("location") or any(candidate.get(k) for k in ("city","state_province","country","postal_code"))
+        elif key=="university":
+            value=candidate.get("university") or candidate.get("education")
+        elif key=="education":
+            value=candidate.get("education")
+        elif key=="work_authorization":
+            value=candidate.get(key) or candidate.get("country_work_authorizations")
+        elif key=="requires_sponsorship":
+            value=candidate.get(key) or candidate.get("sponsorship_needs_by_country")
+        if value not in (None,"",[],{}):
+            fields.append({"key":key,"label":label,"sensitive":key in {"work_authorization","requires_sponsorship","salary_expectations"}})
+    for key,item in answers.items():
+        if key.startswith("custom:") and item.get("confirmed") and item.get("auto_reuse") and not item.get("sensitive") and item.get("answer"):
+            fields.append({"key":key,"label":"Reusable answer: "+str(item.get("question") or "Saved answer")[:180],"sensitive":False})
+    documents=[{"type":"resume","label":"Active resume"}]
+    seen=set()
+    for item in candidate.get("__application_documents",[]):
+        kind=str(item.get("document_type") or "").casefold()
+        if kind in PREPARATION_DOCUMENT_TYPES-{"resume"} and kind not in seen:
+            seen.add(kind);documents.append({"type":kind,"label":kind.replace("_"," ").title()})
+    return fields,documents
+
+
+def _current_preparation_authorization(job_key,resume_id,application_url):
+    snapshot=_preparation_snapshot(job_key,resume_id,application_url)
+    with connect() as db:
+        rows=db.execute("SELECT * FROM application_preparation_authorizations WHERE user_id=? AND job_key=? AND revoked_at IS NULL ORDER BY authorized_at DESC",(USER,job_key)).fetchall()
+    for row in rows:
+        if (row["resume_id"]==snapshot["resume_id"] and
+            row["application_url_hash"]==snapshot["application_url_hash"] and
+            row["match_updated_at"]==snapshot["match_updated_at"] and
+            row["matching_engine_version"]==snapshot["matching_engine_version"] and
+            row["profile_fingerprint"]==snapshot["profile_fingerprint"] and
+            row["answers_fingerprint"]==snapshot["answers_fingerprint"] and
+            row["documents_fingerprint"]==snapshot["documents_fingerprint"] and
+            int(row["settings_version"] or 0)==snapshot["settings_version"] and
+            snapshot["match_status"]=="completed" and snapshot["freshness_status"]=="current"):
+            try:
+                return {"authorization_id":row["authorization_id"],"field_keys":json.loads(row["field_keys_json"] or "[]"),
+                    "document_types":json.loads(row["document_types_json"] or "[]"),
+                    "allow_ai_answers":bool(row["allow_ai_answers"]),"allow_cloud_ai":bool(row["allow_cloud_ai"]),
+                    "authorized_at":row["authorized_at"],"snapshot":snapshot}
+            except (TypeError,json.JSONDecodeError):continue
+    return None
+
+
+def _scoped_candidate(candidate,scope):
+    allowed=set(scope.get("field_keys") or [])
+    scoped={key:value for key,value in candidate.items() if key.startswith("__") and key!="__application_documents"}
+    for key in allowed:
+        if key in candidate:scoped[key]=candidate[key]
+    if "location" in allowed:
+        for key in ("city","state_province","country","postal_code","location"):
+            if key in candidate:scoped[key]=candidate[key]
+    if "university" in allowed and "education" in candidate:scoped["education"]=candidate["education"]
+    if "work_authorization" in allowed and "country_work_authorizations" in candidate:scoped["country_work_authorizations"]=candidate["country_work_authorizations"]
+    if "requires_sponsorship" in allowed and "sponsorship_needs_by_country" in candidate:scoped["sponsorship_needs_by_country"]=candidate["sponsorship_needs_by_country"]
+    allowed_docs=set(scope.get("document_types") or [])
+    if "__application_documents" in candidate:
+        scoped["__application_documents"]=[item for item in candidate["__application_documents"] if item.get("document_type") in allowed_docs]
+    return scoped
+
+
+def _scoped_answers(answers,scope):
+    allowed=set(scope.get("field_keys") or [])
+    result={key:value for key,value in answers.items() if key.startswith("__")}
+    result.update({key:value for key,value in answers.items() if key in allowed})
+    result["__preparation_authorization"]={key:scope.get(key) for key in
+        ("authorization_id","field_keys","document_types","allow_ai_answers","allow_cloud_ai","authorized_at")}
+    settings=dict(result.get("__settings") or {})
+    # The job-specific scope is narrower than the broad profile-level reuse flag.
+    settings["allow_auto_use_confirmed_answers"]=bool(allowed)
+    result["__settings"]=settings
+    return result
+
+
+def _authorized_preparation_payload(job,resume,candidate,answers):
+    if _mock_allowed(job.get("application_url","")):
+        answers=_application_context(job,answers)
+        return candidate,answers
+    if not job.get("job_key"):
+        raise HTTPException(403,"Real employer preparation requires a saved job with a current, job-specific authorization.")
+    scope=_current_preparation_authorization(job["job_key"],resume["id"],job.get("application_url"))
+    if not scope:
+        raise HTTPException(403,"Authorize this employer, exact application URL, selected profile fields, documents, and AI use before preparation.")
+    candidate=_scoped_candidate(candidate,scope)
+    answers=_application_context(job,answers)
+    answers=_scoped_answers(answers,scope)
+    return candidate,answers
+
+
+def _save_form_inspection(job,report,*,preparation_preflight=False):
+    try:
+        requested=_public_url_for_confirmation(job.get("application_url"))
+        posting=_public_url_for_confirmation(job.get("job_url") or job.get("application_url"))
+        report.update({"job_key":str(job.get("job_key") or "")[:250],"employer":str(job.get("company") or "")[:160],
+            "job_title":str(job.get("title") or "")[:200],"posting_url":posting,
+            "requested_application_url":requested,"inspected_at":now(),"preparation_preflight":bool(preparation_preflight)})
+        with connect() as db:
+            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()),USER,str(job.get("job_key") or "")[:250],str((report.get("provider") or {}).get("provider") or "unknown")[:40],
+                 str(report.get("inspection_outcome") or "unsupported")[:40],json.dumps(report,ensure_ascii=False,separators=(",",":")),report["inspected_at"]))
+    except sqlite3.Error as exc:
+        raise HTTPException(500,"The read-only employer form check ran, but its report could not be saved.") from exc
+    return report
+
+
+def _preparation_inspection_blocker(report):
+    if not report.get("robots_policy")=="verified_allow":return report.get("reason") or "Robots policy did not permit verifying this form."
+    if not report.get("form_detected") or report.get("page_classification")!="application_form":return report.get("reason") or "A job-specific application form could not be verified."
+    if report.get("inspection_outcome") not in {"compatible","partially_compatible"}:return report.get("reason") or "The form needs a human action before preparation."
+    if report.get("human_actions_required"):return "The employer form requires a human action. Resolve it manually before preparation."
+    unsupported=set(report.get("unsupported_fields") or [])
+    required_unsupported=[item.get("label") for item in report.get("fields",[]) if item.get("required") and item.get("label") in unsupported]
+    if required_unsupported:return "Required form controls are not supported: "+", ".join(required_unsupported[:8])
+    unresolved=[item for item in report.get("unresolved_controls",[]) if item.get("required") is not False]
+    if unresolved:return "Required form controls could not be identified reliably: "+", ".join(str(item.get("question") or "Unlabeled field") for item in unresolved[:8])
+    if report.get("submission_control_status") not in {"detected_visible","detected_hidden"}:
+        return "The final submission control could not be identified. Form safety remains unresolved, so preparation is blocked."
+    return ""
+
+
+def _saved_preparation_context(job_key):
+    job=_get_job(DryRunRequest(job_key=job_key))
+    if not job.get("active",1):raise HTTPException(410,"This posting is no longer active.")
+    try:validate_application_url(job.get("application_url"))
+    except ValueError as error:raise HTTPException(400,str(error))
+    if _mock_allowed(job.get("application_url")):
+        raise HTTPException(409,"Local synthetic forms use the separate test mode and do not need real-employer authorization.")
+    resume,candidate,answers=_candidate()
+    with connect() as db:
+        classification,reviewed,unresolved=_eligibility_gate(db,job_key,resume["id"])
+        match=db.execute("SELECT status,classification,updated_at,freshness_status,matching_model_version FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume["id"])).fetchone()
+        inspected=db.execute("SELECT report_json,inspected_at FROM application_form_inspections WHERE user_id=? AND job_key=? ORDER BY inspected_at DESC LIMIT 1",(USER,job_key)).fetchone()
+    if (not match or match["status"]!="completed" or match["freshness_status"]!="current" or
+        classification not in {"potential_match","needs_review"} or unresolved or
+        (classification=="needs_review" and not reviewed)):
+        raise HTTPException(409,"A fresh eligible result or reviewed, resolved eligibility result is required before job-specific authorization.")
+    report=None
+    if inspected:
+        try:report=json.loads(inspected["report_json"] or "{}")
+        except (TypeError,json.JSONDecodeError):report=None
+    current_url=_public_url_for_confirmation(job.get("application_url"))
+    if not isinstance(report,dict) or report.get("requested_application_url")!=current_url:
+        report=None
+    if report:
+        try:
+            inspected_at=datetime.fromisoformat(str(inspected["inspected_at"]).replace("Z","+00:00"))
+            if inspected_at.tzinfo is None:inspected_at=inspected_at.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc)-inspected_at).total_seconds()>86400:report=None
+        except (TypeError,ValueError):report=None
+    fields,documents=_preparation_options(candidate,answers)
+    snapshot=_preparation_snapshot(job_key,resume["id"],job.get("application_url"))
+    return job,resume,candidate,answers,fields,documents,report,snapshot
+
+
+@router.get("/api/applications/saved-jobs/{job_key}/preparation-authorization")
+def preparation_authorization_plan(job_key:str):
+    settings=get_authorization()["settings"]
+    if not settings.get("allow_automated_form_preparation"):
+        raise HTTPException(403,"Enable automated form preparation in Application settings before authorizing a real employer.")
+    job,resume,candidate,answers,fields,documents,report,snapshot=_saved_preparation_context(job_key)
+    blocker=_preparation_inspection_blocker(report) if report else "Read-only form inspection is required before authorizing this employer."
+    existing=_current_preparation_authorization(job_key,resume["id"],job.get("application_url"))
+    return {"job_key":job_key,"employer":str(job.get("company") or "")[:200],"title":str(job.get("title") or "")[:300],
+        "posting_url":_public_url_for_confirmation(job.get("job_url") or job.get("application_url")),
+        "application_url":_public_url_for_confirmation(job.get("application_url")),
+        "provider":detect_application_provider(job.get("application_url")),"eligibility":snapshot["classification"],
+        "candidate_fields":fields,"available_documents":documents,"inspection":report,
+        "inspection_blocker":blocker,"authorization_current":bool(existing),
+        "ai_drafting_enabled":bool(settings.get("allow_ai_drafting")),
+        "provider_selected":settings.get("matching_provider","ollama"),
+        "cloud_provider_configured":bool(os.getenv("GEMINI_API_KEY","" ).strip()) if settings.get("matching_provider")=="gemini" else False,
+        "authorization_version":snapshot["settings_version"]}
+
+
+@router.post("/api/applications/saved-jobs/{job_key}/preparation-authorization")
+def authorize_saved_job_preparation(job_key:str,request:PreparationAuthorizationRequest):
+    if not request.confirmed:raise HTTPException(422,"Confirm the employer, role, and exact application URL before saving authorization.")
+    settings=get_authorization()["settings"]
+    if not settings.get("allow_automated_form_preparation"):
+        raise HTTPException(403,"Enable automated form preparation in Application settings first.")
+    job,resume,candidate,answers,fields,documents,report,snapshot=_saved_preparation_context(job_key)
+    if _public_url_for_confirmation(request.confirmed_application_url)!=_public_url_for_confirmation(job.get("application_url")):
+        raise HTTPException(409,"The application URL changed. Review the current employer link and authorize it again.")
+    if str(request.confirmed_employer).strip()!=str(job.get("company") or "").strip() or str(request.confirmed_title).strip()!=str(job.get("title") or "").strip():
+        raise HTTPException(409,"The saved employer or job title changed. Refresh the job card and confirm again.")
+    blocker=_preparation_inspection_blocker(report) if report else "Read-only form inspection is required before authorizing this employer."
+    if blocker:raise HTTPException(409,blocker)
+    available_fields={str(item["key"]) for item in fields}
+    requested_fields=list(dict.fromkeys(str(key) for key in request.field_keys))
+    if set(requested_fields)-available_fields:raise HTTPException(422,"The selected candidate field list is out of date. Refresh and review the authorization plan.")
+    available_documents={str(item["type"]) for item in documents}
+    requested_documents=list(dict.fromkeys(str(kind).casefold() for kind in request.document_types))
+    if set(requested_documents)-available_documents or set(requested_documents)-PREPARATION_DOCUMENT_TYPES:
+        raise HTTPException(422,"A selected document is not currently available for this resume version.")
+    provider=settings.get("matching_provider","ollama")
+    if request.allow_ai_answers and not settings.get("allow_ai_drafting"):
+        raise HTTPException(403,"Enable AI drafting in Application settings before authorizing generated answers.")
+    if request.allow_ai_answers and provider=="gemini" and not request.allow_cloud_ai:
+        raise HTTPException(409,"Gemini would process the selected facts and job description in the cloud. Authorize that explicitly or turn off AI answers for this job.")
+    if request.allow_cloud_ai and (provider!="gemini" or not os.getenv("GEMINI_API_KEY","" ).strip()):
+        raise HTTPException(409,"Cloud AI authorization requires Gemini to be selected and GEMINI_API_KEY configured.")
+    if request.allow_cloud_ai and not request.allow_ai_answers:
+        raise HTTPException(422,"Authorize AI-generated answers before authorizing cloud AI processing.")
+    stamp=now();authorization_id=str(uuid.uuid4())
+    with connect() as db:
+        db.execute("UPDATE application_preparation_authorizations SET revoked_at=? WHERE user_id=? AND job_key=? AND revoked_at IS NULL",(stamp,USER,job_key))
+        db.execute("""INSERT INTO application_preparation_authorizations(
+            authorization_id,user_id,job_key,application_url_hash,resume_id,match_updated_at,
+            matching_engine_version,profile_fingerprint,answers_fingerprint,documents_fingerprint,
+            settings_version,field_keys_json,document_types_json,allow_ai_answers,allow_cloud_ai,
+            consent_version,authorized_at,revoked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)""",
+            (authorization_id,USER,job_key,snapshot["application_url_hash"],resume["id"],snapshot["match_updated_at"],
+             snapshot["matching_engine_version"],snapshot["profile_fingerprint"],snapshot["answers_fingerprint"],snapshot["documents_fingerprint"],
+             snapshot["settings_version"],json.dumps(requested_fields),json.dumps(requested_documents),int(request.allow_ai_answers),
+             int(request.allow_cloud_ai),PREPARATION_CONSENT_VERSION,stamp))
+    return {"authorized":True,"authorization_id":authorization_id,"authorized_at":stamp,
+        "field_count":len(requested_fields),"document_types":requested_documents,
+        "ai_answers_authorized":request.allow_ai_answers,"cloud_ai_authorized":request.allow_cloud_ai,
+        "message":"Job-specific preparation authorization saved. It is limited to this posting, resume/profile version, match result, selected fields, and selected documents. Submission remains disabled."}
+
+
+@router.delete("/api/applications/saved-jobs/{job_key}/preparation-authorization")
+def revoke_saved_job_preparation(job_key:str):
+    stamp=now()
+    with connect() as db:
+        changed=db.execute("UPDATE application_preparation_authorizations SET revoked_at=? WHERE user_id=? AND job_key=? AND revoked_at IS NULL",(stamp,USER,job_key)).rowcount
+    return {"revoked":bool(changed),"message":"Job-specific preparation authorization revoked. Existing application history is preserved."}
 
 
 @router.get("/api/applications/saved-jobs")
@@ -624,9 +1008,17 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
             "This opening is not eligible according to the latest match." if gate_class=="not_eligible" else
             "Resolve mandatory requirements before preparing; a review cannot override them." if unresolved else
             "Review this match before preparation." if gate_class=="needs_review" and not reviewed else "")
+        is_local=_mock_allowed(str(item.get("url") or ""))
+        scoped_authorization=(_current_preparation_authorization(item.get("job_key"),item.get("active_resume_id"),item.get("url"))
+            if item.get("active_resume_id") and not is_local and gate_class in {"potential_match","needs_review"} and not unresolved else None)
+        item["preparation_authorized"]=bool(is_local or scoped_authorization)
+        item["preparation_authorization_required"]=bool(not is_local and gate_class in {"potential_match","needs_review"} and not unresolved and not scoped_authorization)
         item["preparation_allowed"]=bool(authorized and item["url_syntax_allowed"] and resume_available and item["application_state"]=="not_started" and
             item.get("active",1) and
-            gate_class not in {"not_eligible","not_analyzed","rejected","deferred"} and not unresolved and (gate_class=="potential_match" or (gate_class=="needs_review" and reviewed)))
+            gate_class not in {"not_eligible","not_analyzed","rejected","deferred"} and not unresolved and
+            (gate_class=="potential_match" or (gate_class=="needs_review" and reviewed)) and item["preparation_authorized"])
+        if item["preparation_authorization_required"]:
+            item["preparation_reason"]="Authorize this employer and exact application URL, and choose the profile fields, documents, and AI use for this job."
         # Query strings and fragments may contain signed or session-like tokens.
         # Keep the original private in SQLite for preparation, but don't return it to the dashboard.
         try: item["url"]=urlparse(str(item.get("url") or ""))._replace(query="",fragment="").geturl()
@@ -707,7 +1099,7 @@ def _candidate():
         answers_by_key={}
         for item in ans:
             answers_by_key[item["question_key"]]={"answer":_answer_plaintext(item,db),"question":item["question_text"],
-                "sensitive":bool(item["sensitive"]),"auto_reuse":bool(item["auto_reuse"]),
+                "sensitive":bool(item["sensitive"]),"auto_reuse":bool(item["auto_reuse"]),"confirmed":True,
                 "answer_type":item["answer_type"],"jurisdiction":item["jurisdiction"]}
     stored=Path(str(resume["stored_name"] or ""))
     resume_path=(STORAGE/stored.name).resolve()
@@ -797,6 +1189,10 @@ def _paused():
     return bool(row and row["paused"])
 
 def _label(info): return re.sub(r"[^a-z0-9]+"," "," ".join(str(info.get(k) or "") for k in ("label","name","id","placeholder","aria_label")).casefold()).strip()
+
+def _required_marker(label):
+    """Recognize explicit visual required markers used by employer forms."""
+    return bool(re.search(r"[*✱＊]\s*$|(?<!\w)[*✱＊](?!\w)|\brequired\b\s*$",str(label or ""),re.I))
 
 def _application_context(job,answers):
     context={"company":job.get("company",""),"title":job.get("title",""),"location":job.get("location",""),"source":""}
@@ -1057,16 +1453,41 @@ def _ordinary_open_question(info):
 
 def _fill_page(page,candidate,answers,resume_path,on_upload=None):
     fields=page.locator("input:not([type=hidden]),textarea,select,[role=textbox],[role=checkbox],[role=radio],[contenteditable=true]"); report=[]; missing=[]; drafts=[]; processed_radios=set()
+    try: semantic_fields=[item for item in _visible_form_metadata(page) if isinstance(item,dict) and not item.get("__inspection_meta__")]
+    except Exception: semantic_fields=[]
     for i in range(min(fields.count(),150)):
         field=fields.nth(i); info={}
         try:
             if not field.is_visible() or not field.is_enabled(): continue
-            info=field.evaluate("""el=>{let labels=[...(el.labels||[])].map(x=>x.innerText);let near=el.closest('label')?.innerText||el.parentElement?.innerText||'';let role=el.getAttribute('role')||'';return {tag:el.tagName.toLowerCase(),type:(el.type||(role==='textbox'||el.isContentEditable?'text':role==='checkbox'?'checkbox':role==='radio'?'radio':'')).toLowerCase(),name:el.name||el.getAttribute('name')||'',id:el.id||'',value:el.value||el.getAttribute('value')||el.innerText||'',placeholder:el.placeholder||el.getAttribute('placeholder')||'',aria_label:el.getAttribute('aria-label')||'',accept:el.getAttribute('accept')||'',label:(labels.join(' ')||el.getAttribute('aria-label')||near).slice(0,240),required:el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',max_length:el.maxLength>0?el.maxLength:null,disabled:el.disabled,hidden:el.type==='hidden'||el.getAttribute('aria-hidden')==='true'}}""")
+            info=field.evaluate("""el=>{let labels=[...(el.labels||[])].map(x=>x.innerText);let labelledBy=(el.getAttribute('aria-labelledby')||'').split(/\\s+/).map(id=>document.getElementById(id)?.innerText||'').join(' ');let role=el.getAttribute('role')||'';let explicit=labels.join(' ')||el.getAttribute('aria-label')||labelledBy||el.closest('label')?.innerText||el.closest('fieldset')?.querySelector('legend')?.innerText||'';return {tag:el.tagName.toLowerCase(),type:(el.type||(role==='textbox'||el.isContentEditable?'text':role==='checkbox'?'checkbox':role==='radio'?'radio':'')).toLowerCase(),input_type:(el.getAttribute('type')||'').toLowerCase(),role,name:el.name||el.getAttribute('name')||'',id:el.id||'',value:el.value||el.getAttribute('value')||el.innerText||'',placeholder:el.placeholder||el.getAttribute('placeholder')||'',aria_label:el.getAttribute('aria-label')||'',accept:el.getAttribute('accept')||'',label:(explicit||el.placeholder||el.name||el.id||'').slice(0,240),has_associated_label:!!explicit,required:el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',max_length:el.maxLength>0?el.maxLength:null,disabled:el.disabled,hidden:el.type==='hidden'||el.getAttribute('aria-hidden')==='true',contenteditable:!!el.isContentEditable}}""")
+            info["required"]=bool(info.get("required") or _required_marker(info.get("label")))
+            semantic=next((item for item in semantic_fields if
+                (info.get("id") and item.get("id")==info.get("id")) or
+                (info.get("name") and item.get("name")==info.get("name"))),None)
+            if semantic:
+                info["label"]=semantic.get("question") or info.get("label")
+                info["required"]=bool(semantic.get("required") or _required_marker(info.get("label")))
+                info["role"]=semantic.get("role") or info.get("role")
+                info["accept"]=semantic.get("accept") or info.get("accept")
             if info["type"] in {"submit","button","hidden"} or info.get("hidden"): continue
+            if info.get("role")=="combobox":
+                # Handled below by the exact-option custom combobox path. Do
+                # not type arbitrary text into a selector's backing input.
+                continue
+            closed_choice=bool(re.match(r"^(are you|do you|did you|will you|would you|what archetype|select |choose )",str(info.get("label") or ""),re.I))
+            no_stable_label=info.get("tag")=="input" and not info.get("id") and not info.get("name") and not info.get("role") and not info.get("has_associated_label")
+            if no_stable_label or (closed_choice and info.get("type")=="text" and not info.get("role")):
+                if info["required"]:missing.append("A required control could not be identified safely; review the employer form manually.")
+                report.append({"field":info.get("label") or "Unresolved form control","result":"unresolved_control","required":bool(info["required"])});continue
             matching_answer_key=None
             value,source=_answer(info,candidate,answers)
             settings=answers.get("__settings",{})
             local_mock=bool(answers.get("__is_local_mock"))
+            scope=answers.get("__preparation_authorization") or {}
+            if not local_mock and source=="resume" and "resume" not in (scope.get("document_types") or []):
+                value,source=None,None
+            if not local_mock and isinstance(source,str) and source.startswith("custom:") and source not in (scope.get("field_keys") or []):
+                value,source=None,None
             if source in candidate and not settings.get("allow_auto_use_confirmed_answers",False) and not local_mock:
                 value,source=None,None
             if isinstance(source,str) and source.startswith("custom:") and not settings.get("allow_auto_use_confirmed_answers",False) and not local_mock:
@@ -1130,10 +1551,18 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                         if desired==str(option_info["value"]).casefold() or desired==label or (len(desired)>2 and desired in label): chosen=option; break
                     except Exception: continue
                 if chosen:
-                    chosen.check(); report.append({"field":info.get("label") or "Selection","result":"filled","source":"verified_profile" if source in candidate else "confirmed_answer","required":bool(info.get("required"))})
+                    chosen.check()
+                    if not chosen.is_checked():
+                        missing.append("The selected answer could not be verified for: "+(info.get("label") or info.get("name") or "required selection"))
+                        report.append({"field":info.get("label") or "Selection","result":"verification_failed","required":bool(info.get("required"))});continue
+                    report.append({"field":info.get("label") or "Selection","result":"filled","source":"verified_profile" if source in candidate else "confirmed_answer","required":bool(info.get("required"))})
                 elif info["required"]: missing.append("No confirmed choice matches: "+(info.get("label") or info.get("name") or "required selection"))
                 continue
-            if value is None and _ordinary_open_question(info) and settings.get("allow_ai_drafting"):
+            provider=settings.get("matching_provider","ollama")
+            scoped_ai=bool(local_mock or (scope and scope.get("allow_ai_answers") and
+                (provider!="gemini" or scope.get("allow_cloud_ai"))) or
+                (not scope and settings.get("allow_ai_drafting")))
+            if value is None and _ordinary_open_question(info) and settings.get("allow_ai_drafting") and scoped_ai:
                 try:
                     question=info.get("label") or info.get("placeholder") or "Application question"
                     field_limit=min(int(info["max_length"]) if info.get("max_length") else MAX_ANSWER_CHARS,MAX_ANSWER_CHARS)
@@ -1163,7 +1592,12 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                     aliases={"company careers page":("company website","company careers","employer website","company site"),"linkedin":("linkedin",),"indeed":("indeed",),"handshake":("handshake",)}
                     source_terms=aliases.get(value.casefold(),(value.casefold(),))
                     choice=next((x for x in opts if any(term in x.casefold() for term in source_terms)),None)
-                if choice: field.select_option(label=choice)
+                if choice:
+                    field.select_option(label=choice)
+                    selected_label=field.evaluate("el=>el.selectedOptions?.[0]?.textContent?.trim()||''")
+                    if str(selected_label).strip()!=str(choice).strip():
+                        missing.append("The selected answer could not be verified for: "+(info.get("label") or "required selection"))
+                        report.append({"field":info.get("label") or "Selection","result":"verification_failed","required":bool(info.get("required"))});continue
                 elif info["required"]: missing.append("No matching choice for: "+(info.get("label") or "required selection")); continue
             elif info["type"]!="checkbox": field.fill(value)
             elif info["type"]=="checkbox":
@@ -1176,6 +1610,9 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                 missing.append("The confirmed email address has an invalid format.")
             if info["type"]=="url" and not re.match(r"^https://[^\s]+$",value,re.I):
                 missing.append("A URL field requires a valid HTTPS link.")
+            if info["type"] not in {"file","radio"} and not _verify_field_value(field,info,choice if info["tag"]=="select" and choice else value):
+                missing.append("The entered answer could not be verified for: "+(info.get("label") or info.get("name") or "required field"))
+                report.append({"field":info.get("label") or info.get("name") or "Question","result":"verification_failed","required":bool(info.get("required"))});continue
             report.append({"field":info.get("label") or info.get("name") or "Question","result":"filled",
                            "source":source if source=="ai_draft" else ("verified_profile" if source in candidate else "confirmed_answer"),
                            "required":bool(info.get("required"))})
@@ -1244,18 +1681,56 @@ def _visible_form_metadata(page):
     """Read public form labels and control types only; never read form values."""
     try:
         return page.locator("body").evaluate("""body=>{
-          const selector='input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable="true"]';
-          return [...body.querySelectorAll(selector)].filter(el=>el.getClientRects().length && !el.disabled).slice(0,100).map(el=>{
+          const selector='input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable="true"],[role="button"][aria-haspopup]';
+          const all=[...body.querySelectorAll(selector)].slice(0,150);
+          const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return el.getClientRects().length&&r.width>1&&r.height>1&&r.x>-2000&&r.y>-2000&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&!el.closest('[aria-hidden="true"]')};
+          const ignored=all.filter(el=>!visible(el)).map(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return {tag:el.tagName.toLowerCase(),input_type:(el.getAttribute('type')||'').toLowerCase(),role:el.getAttribute('role')||'',id:(el.id||'').slice(0,100),name:(el.name||el.getAttribute('name')||'').slice(0,100),reason:el.closest('[aria-hidden="true"]')?'aria_hidden':s.display==='none'?'display_none':s.visibility==='hidden'?'visibility_hidden':s.opacity==='0'?'transparent':r.width<=1||r.height<=1?'zero_size':'offscreen'}});
+          const result=all.filter(el=>visible(el)&&!el.disabled).slice(0,100).map(el=>{
+            const clean=x=>String(x||'').replace(/\\s+/g,' ').trim();
             const type=(el.getAttribute('type')||'').toLowerCase();
             const role=(el.getAttribute('role')||'').toLowerCase();
-            let kind=type||({combobox:'combobox',checkbox:'checkbox',radio:'radio',textbox:'text'}[role]||(el.tagName==='INPUT'?'text':el.tagName.toLowerCase()));
+            const combo=role==='combobox'||el.getAttribute('aria-autocomplete')!==null||el.getAttribute('aria-haspopup')==='listbox'||!!el.getAttribute('list')||!!el.closest('[role="combobox"]');
+            let kind=type||({combobox:'combobox',checkbox:'checkbox',radio:'radio',textbox:'text',button:'combobox'}[role]||(el.tagName==='INPUT'?'text':el.tagName.toLowerCase()));
+            if(el.tagName==='INPUT'&&(!type||type==='text')&&combo)kind='combobox';
             if(el.tagName==='TEXTAREA') kind='textarea';
             if(el.tagName==='SELECT') kind='select';
             if(el.isContentEditable) kind='contenteditable';
             const labelledBy=(el.getAttribute('aria-labelledby')||'').split(/\\s+/).map(id=>document.getElementById(id)?.innerText||'').join(' ');
-            const label=[...(el.labels||[])].map(x=>x.innerText||'').join(' ') || el.getAttribute('aria-label') || labelledBy || el.getAttribute('placeholder') || el.closest('label')?.innerText || el.closest('fieldset')?.querySelector('legend')?.innerText || '';
-            return {kind,label:String(label).replace(/\\s+/g,' ').trim().slice(0,160),required:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',inside_form:!!el.closest('form,[role="form"]'),accept:kind==='file'?(el.getAttribute('accept')||'').slice(0,120):''};
+            const semanticContainer=el.closest('fieldset,[role="group"],[role="radiogroup"],[data-field],[data-qa*="field" i],[data-qa*="question" i],[class*="application--field" i],[class*="application-field" i],[class*="field-container" i],[class*="question" i]');
+            const semanticText=clean(semanticContainer?.innerText||'');
+            const container=semanticContainer&&semanticText.length<=500?semanticContainer:el.parentElement?.parentElement||el.parentElement;
+            const controls=container?[...container.querySelectorAll('input:not([type="hidden"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"]')].filter(x=>visible(x)&&!x.disabled).length:1;
+            const candidates=container?[...container.querySelectorAll('legend,label,[data-qa*="label" i],[class*="label" i],[class*="question" i]')].map(x=>String(x.innerText||'').replace(/\\s+/g,' ').trim()).filter(x=>x&&x.length<=240):[];
+            const direct=[...(el.labels||[])].map(x=>x.innerText||'').join(' ')||el.getAttribute('aria-label')||labelledBy||el.closest('label')?.innerText||el.closest('fieldset')?.querySelector('legend')?.innerText||'';
+            const informative=candidates.sort((a,b)=>((/\\?\\s*$/.test(b)||/[*✱＊]\\s*$/.test(b)?4:0)+Math.min(b.length,100)/100)-((/\\?\\s*$/.test(a)||/[*✱＊]\\s*$/.test(a)?4:0)+Math.min(a.length,100)/100))[0]||'';
+            const directText=clean(direct);
+            const groupPrompt=clean(el.closest('fieldset,[role="radiogroup"],[role="group"]')?.querySelector('legend,[aria-label]')?.innerText||el.closest('[role="radiogroup"],[role="group"]')?.getAttribute('aria-label')||'');
+            const noStableSemantics=el.tagName==='INPUT'&&!type&&!el.id&&!(el.name||el.getAttribute('name'))&&!role;
+            const broadContainer=noStableSemantics&&!directText;
+            const question=broadContainer?'':(type==='radio'||role==='radio'||type==='checkbox'||role==='checkbox')?(groupPrompt||informative||directText):(directText&&directText!=='Attach'?directText:informative||directText||'');
+            const normalizedLabel=clean(directText||question||el.getAttribute('placeholder')||'').slice(0,160);
+            const visualRequired=/[*✱＊]\\s*$|\\brequired\\b\\s*$/i.test(clean(question+' '+normalizedLabel));
+            const questionText=clean(question).slice(0,160);
+            const containerToken=container&&(container.id||container.getAttribute('data-field')||container.getAttribute('data-qa'));
+            const questionKey=questionText?(containerToken?'container:'+clean(containerToken).slice(0,120):'question:'+clean(questionText).toLowerCase()):'';
+            const uploadContext=(questionText+' '+normalizedLabel).toLowerCase();
+            const uploadPurpose=kind==='file'?( /resume|curriculum vitae|\\bcv\\b/.test(uploadContext)?'resume':/transcript/.test(uploadContext)?'transcript':/cover letter/.test(uploadContext)?'cover_letter':/certificate/.test(uploadContext)?'certificate':/portfolio|work sample/.test(uploadContext)?'portfolio':'unspecified') : '';
+            const closedQuestion=/^(are you|do you|did you|will you|would you|what archetype|select |choose )/i.test(questionText);
+            const possibleCustom=kind==='text'&&closedQuestion;
+            const classHint=String(el.className&&typeof el.className==='string'?el.className:'').replace(/[^a-zA-Z0-9 _-]/g,' ').replace(/\\s+/g,' ').trim().slice(0,120);
+            const containerClass=String(container?.className&&typeof container.className==='string'?container.className:'').replace(/[^a-zA-Z0-9 _-]/g,' ').replace(/\\s+/g,' ').trim().slice(0,120);
+            const ariaHints={autocomplete:el.getAttribute('aria-autocomplete')||'',haspopup:el.getAttribute('aria-haspopup')||'',controls:(el.getAttribute('aria-controls')||'').slice(0,120),placeholder:(el.getAttribute('placeholder')||'').slice(0,120)};
+            return {kind,label:normalizedLabel,question:questionText,question_key:questionKey,tag:el.tagName.toLowerCase(),input_type:type,role,
+              name:(el.name||el.getAttribute('name')||'').slice(0,120),id:(el.id||'').slice(0,120),
+              required:broadContainer?null:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1'||visualRequired,
+              inside_form:!!el.closest('form,[role="form"]'),accept:kind==='file'?(el.getAttribute('accept')||'').slice(0,120):'',
+              upload_purpose:uploadPurpose,possible_custom_selector:possibleCustom,
+              class_hint:classHint,container_class_hint:containerClass,aria_hints:ariaHints,
+              conditional:!!(el.closest('[data-conditional],[data-conditional-field],[aria-controls]')||container?.matches('[data-conditional],[data-conditional-field]')),
+              unresolved_reason:broadContainer?'Visible control has no stable field semantics and shares a broad container; possible implementation companion, not safely attributable':!questionText?'No associated label or question text was exposed by the visible control':noStableSemantics?'Visible control has no input type, id, name, or ARIA role; possible implementation companion, not confirmed applicant field':'',container_control_count:controls};
           });
+          result.push({__inspection_meta__:true,ignored_controls:ignored.slice(0,100)});
+          return result;
         }""") or []
     except Exception:
         return []
@@ -1264,14 +1739,16 @@ def _visible_form_metadata(page):
 def _inspect_public_controls(page):
     """Inspect button/link semantics, including custom ARIA buttons, without activation."""
     try:
-        controls=page.locator("button,a[href],input[type=button],input[type=submit],[role=button]")
+        controls=page.locator("button,a[href],input[type=button],input[type=submit],input[type=image],[role=button]")
         result=[]
         for index in range(min(controls.count(),100)):
             control=controls.nth(index)
             try:
-                if not control.is_visible(): continue
-                item=control.evaluate("""el=>({tag:el.getAttribute('role')==='button'?'button':el.tagName.toLowerCase(),type:(el.type||el.getAttribute('data-type')||'button').toLowerCase(),label:(el.innerText||el.getAttribute('aria-label')||el.getAttribute('title')||((el.tagName==='INPUT')?el.getAttribute('value'):'')||'').trim().slice(0,180),inside_form:!!el.closest('form')})""")
+                visible=control.is_visible()
+                item=control.evaluate("""el=>({tag:el.getAttribute('role')==='button'?'button':el.tagName.toLowerCase(),type:(el.type||el.getAttribute('data-type')||'button').toLowerCase(),label:(el.innerText||el.getAttribute('aria-label')||el.getAttribute('title')||((el.tagName==='INPUT')?el.getAttribute('value'):'')||'').trim().slice(0,180),inside_form:!!el.closest('form'),disabled:!!el.disabled})""")
                 item["action"]=classify_control(item.get("label"),item.get("tag"),item.get("type"),item.get("inside_form"))
+                item["visible"]=bool(visible)
+                if not visible and item["action"]!="final_submission":continue
                 result.append(item)
             except Exception: continue
         return result
@@ -1300,7 +1777,8 @@ def inspect_public_application_form(url):
         return {"application_url": clean_url, "inspection_outcome": "inaccessible",
                 "provider":provider,"form_detected":False,"page_classification":"not_inspected",
                 "reason": "Another public form inspection is already running. Try again shortly."}
-    browser = context = None
+    browser = context = page = None
+    policy_state={}
     try:
         permitted, policy_reason, policy_category=_robots_permission(url)
         if not permitted:
@@ -1308,18 +1786,40 @@ def inspect_public_application_form(url):
                     "provider":provider,"form_detected":False,"page_classification":"not_inspected",
                     "robots_policy":"not_verified","failure_category":policy_category}
         from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
+        with _ManagedPlaywrightContext(sync_playwright) as p:
             browser = p.chromium.launch(headless=True)
+            p.attach(None,browser)
             context = browser.new_context()
             page = context.new_page()
-            page.route("**/*", _guard_browser_request)
+            p.attach(page,browser)
+            page.route("**/*", lambda route:_guard_browser_request(route,policy_state))
             try:
                 response = page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                # Greenhouse job boards can hydrate application controls after
+                # the document event. Wait briefly for visible controls without
+                # clicking or typing; otherwise inspect the posting as-is.
+                try:
+                    page.wait_for_function("""()=>[...document.querySelectorAll('input:not([type="hidden"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"]')].some(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&!el.disabled})""",timeout=2500)
+                except Exception:
+                    # Hydration waiting is best-effort. Older Playwright builds
+                    # and test doubles may not provide wait_for_timeout.
+                    try:page.wait_for_timeout(350)
+                    except Exception:pass
             except Exception as exc:
+                if policy_state:
+                    return {"application_url":clean_url,"inspection_outcome":"inaccessible","provider":provider,
+                        "form_detected":False,"page_classification":"not_inspected","robots_policy":"not_verified",
+                        "failure_category":policy_state.get("category","navigation_blocked"),
+                        "reason":policy_state.get("reason","The employer navigation was blocked by a safety policy.")}
                 reason = "Employer page could not be opened (" + type(exc).__name__ + "). Check that the public application link is current and accessible."
                 return {"application_url": clean_url, "inspection_outcome": "inaccessible", "provider":provider,
                         "form_detected":False,"page_classification":"not_inspected","robots_policy":"verified_allow",
                         "failure_category":"navigation_error","reason": reason}
+            if policy_state:
+                return {"application_url":clean_url,"inspection_outcome":"inaccessible","provider":provider,
+                    "form_detected":False,"page_classification":"not_inspected","robots_policy":"not_verified",
+                    "failure_category":policy_state.get("category","navigation_blocked"),
+                    "reason":policy_state.get("reason","The public page attempted a request that could not be safely inspected.")}
             # A redirect is subject to the same public HTTPS/IP checks as the
             # original link. No Apply links or form controls are activated.
             try:
@@ -1329,6 +1829,11 @@ def inspect_public_application_form(url):
                         "provider":provider,"form_detected":False,"page_classification":"not_inspected",
                         "robots_policy":"verified_allow","failure_category":"unsafe_destination",
                         "reason": "The employer page redirected to a restricted destination."}
+            permitted,policy_reason,policy_category=_robots_permission(page.url)
+            if not permitted:
+                return {"application_url":clean_url,"inspection_outcome":"inaccessible","provider":provider,
+                    "form_detected":False,"page_classification":"not_inspected","robots_policy":"not_verified",
+                    "failure_category":policy_category,"reason":policy_reason}
             fields = _visible_form_metadata(page)
             controls = _inspect_public_controls(page)
             interruption = _interruption(page)
@@ -1364,12 +1869,6 @@ def inspect_public_application_form(url):
                 "reason": "The public form could not be inspected (" + type(exc).__name__ + ").",
                 "failure_category":"inspection_error"}
     finally:
-        try:
-            if context: context.close()
-        except Exception: pass
-        try:
-            if browser: browser.close()
-        except Exception: pass
         _inspection_lock.release()
 
 
@@ -1413,12 +1912,68 @@ def _required_visible_fields(page):
             field=fields.nth(index)
             if not field.is_visible() or not field.is_enabled():
                 continue
-            info=field.evaluate("""el=>({required:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',label:((el.labels||[]).map(x=>x.innerText).join(' ')||el.getAttribute('aria-label')||el.placeholder||el.name||el.id||el.parentElement?.innerText||'Required field').trim().slice(0,160)})""")
-            if info.get("required"):
+            info=field.evaluate("""el=>({required:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',label:((el.labels||[]).map(x=>x.innerText).join(' ')||el.getAttribute('aria-label')||el.closest('fieldset')?.querySelector('legend')?.innerText||el.placeholder||el.name||el.id||'Unresolved required field').trim().slice(0,160)})""")
+            if info.get("required") or _required_marker(info.get("label")):
                 result.append(info.get("label") or "Required field")
     except Exception:
         return list(dict.fromkeys(result))
     return list(dict.fromkeys(result))
+
+
+def _required_field_issues(page):
+    """Return labels only for visible required controls that remain incomplete.
+
+    Values are examined in the page process but never copied into diagnostics.
+    This second pass catches conditional controls that appeared after the first
+    field scan, including accessible custom controls.
+    """
+    try:
+        return page.locator("body").evaluate("""body=>{
+          const selector='input:not([type="hidden"]):not([type="submit"]):not([type="button"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable="true"]';
+          return [...body.querySelectorAll(selector)].filter(el=>el.getClientRects().length&&!el.disabled).flatMap(el=>{
+            const labels=[...(el.labels||[])].map(x=>x.innerText||'').join(' ');
+            const labelledBy=(el.getAttribute('aria-labelledby')||'').split(/\\s+/).map(id=>document.getElementById(id)?.innerText||'').join(' ');
+            const direct=String(labels||el.getAttribute('aria-label')||labelledBy||el.closest('label')?.innerText||el.closest('fieldset')?.querySelector('legend')?.innerText||'').replace(/\\s+/g,' ').trim();
+            const container=el.closest('fieldset,[role="group"],[role="radiogroup"],[data-field],[data-qa*="field" i],[data-qa*="question" i],[class*="application--field" i],[class*="application-field" i],[class*="field-container" i],[class*="question" i]')||el.parentElement?.parentElement||el.parentElement;
+            const text=String(container?.innerText||'').replace(/\\s+/g,' ').trim();
+            const candidates=container?[...container.querySelectorAll('legend,label,[data-qa*="label" i],[class*="label" i],[class*="question" i]')].map(x=>String(x.innerText||'').replace(/\\s+/g,' ').trim()).filter(x=>x&&x.length<=240):[];
+            const candidate=candidates.sort((a,b)=>((/\\?\\s*$|[*✱＊]\\s*$/.test(b)?4:0)+Math.min(b.length,100)/100)-((/\\?\\s*$|[*✱＊]\\s*$/.test(a)?4:0)+Math.min(a.length,100)/100))[0]||'';
+            const noStable=el.tagName==='INPUT'&&!(el.getAttribute('type')||'')&&!el.id&&!(el.name||el.getAttribute('name'))&&!el.getAttribute('role')&&!direct;
+            const label=String(direct||(text.length<=500?candidate:'')||el.placeholder||el.name||el.id||'Unresolved required field').replace(/\\s+/g,' ').trim().slice(0,160);
+            const required=!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1'||/[*✱＊]\\s*$|(?<!\\w)[*✱＊](?!\\w)|\\brequired\\b\\s*$/i.test(label);
+            if(noStable)return required?['Unresolved required field']:[];
+            if(!required)return [];
+            const type=(el.type||'').toLowerCase(),role=(el.getAttribute('role')||'').toLowerCase();
+            const group=(type==='radio'||role==='radio')?el.name||el.getAttribute('name')||label:null;
+            if(group){const peers=[...body.querySelectorAll('input[type="radio"],[role="radio"]')].filter(x=>(x.name||x.getAttribute('name')||'')===group&&x.getClientRects().length);if(peers.some(x=>x.checked||x.getAttribute('aria-checked')==='true'))return [];}
+            if(type==='checkbox'||role==='checkbox')return (el.checked||el.getAttribute('aria-checked')==='true')?[]:[label];
+            if(type==='file')return el.files?.length?[]:[label];
+            if((type==='select-one'||el.tagName==='SELECT')&&el.selectedOptions?.length)return el.selectedOptions[0].value?[]:[label];
+            const value=el.isContentEditable?el.textContent:(el.value??el.innerText??'');
+            return String(value||'').trim()?[]:[label];
+          });
+        }""") or []
+    except Exception:
+        # The native validity check below remains a second line of defense.
+        return []
+
+
+def _verify_field_value(field,info,expected):
+    """Verify an interaction took effect without returning the entered value."""
+    kind=str(info.get("type") or "").casefold()
+    try:
+        if kind=="checkbox":
+            should_check=str(expected).strip().casefold() in {"yes","true","1","agree"} or str(info.get("value") or "").casefold() in {part.strip().casefold() for part in str(expected).splitlines()}
+            return bool(field.is_checked()) is should_check
+        if info.get("tag")=="select":
+            selected=field.evaluate("el=>el.selectedOptions?.[0]?.textContent?.trim()||''")
+            return str(selected or "").strip()==str(expected or "").strip()
+        if kind in {"text","email","tel","url","number","date","textarea","textbox"}:
+            actual=field.evaluate("el=>('value' in el ? el.value : el.textContent)||''") if info.get("contenteditable") else field.input_value()
+            return str(actual or "").strip()==str(expected or "").strip()
+    except Exception:
+        return False
+    return True
 
 
 def _has_password(page):
@@ -1447,7 +2002,7 @@ def _interruption(page):
 
 def _classify_inspected_page(url,fields,controls,body_text):
     """Distinguish an application form from a job posting or unrelated page."""
-    fields=[item for item in (fields or []) if isinstance(item,dict)]
+    fields=[item for item in (fields or []) if isinstance(item,dict) and not item.get("__inspection_meta__")]
     controls=controls or []
     text=str(body_text or "")[:12000]
     path=(urlparse(str(url or "")).path or "").casefold()
@@ -1513,30 +2068,78 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
         "unanswered_fields":[],"draft_answers":[],"steps":0,"submission_performed":False,"screenshot":None,"message":""}
     if _paused(): _update(app_id,"paused",diagnostic); return
     _update(app_id,"opening",diagnostic)
+    local_mock=_mock_allowed(job.get("application_url",""))
+    policy_state={}
     try:
         validate_application_url(job["application_url"])
+        if not local_mock:
+            scope=_current_preparation_authorization(job.get("job_key"),resume["id"],job["application_url"])
+            if not scope:
+                diagnostic["message"]="Job-specific authorization is missing or stale. Review the employer and authorization plan before continuing."
+                diagnostic["unanswered_fields"]=["Authorize this employer and exact application URL again."]
+                _update(app_id,"needs_user_input",diagnostic);return
+            diagnostic["authorization"]={"status":"current","authorized_at":scope.get("authorized_at"),
+                "selected_field_count":len(scope.get("field_keys") or []),
+                "selected_document_types":list(scope.get("document_types") or []),
+                "ai_answers_authorized":bool(scope.get("allow_ai_answers")),
+                "cloud_ai_authorized":bool(scope.get("allow_cloud_ai")),
+                "consent_version":PREPARATION_CONSENT_VERSION}
+            candidate=_scoped_candidate(candidate,scope)
+            answers=_application_context(job,answers)
+            answers=_scoped_answers(answers,scope)
+            diagnostic["phase"]="read_only_preflight"
+            _update(app_id,"inspecting",diagnostic)
+            preflight=inspect_public_application_form(job["application_url"])
+            preflight=_save_form_inspection(job,preflight,preparation_preflight=True)
+            blocker=_preparation_inspection_blocker(preflight)
+            diagnostic["compatibility_report"]={key:preflight.get(key) for key in
+                ("provider","form_detected","page_classification","inspection_outcome","required_fields","unsupported_fields",
+                 "required_control_count","unique_question_count","unique_required_question_count","unique_optional_question_count",
+                 "questions","unresolved_controls","ignored_controls","ignored_control_count","conditional_questions","conditional_detection_note",
+                 "file_upload_controls","human_actions_required","multi_step_detected","submission_control_detected",
+                 "submission_control_status","robots_policy","reason")}
+            if blocker:
+                diagnostic["message"]=blocker
+                diagnostic["human_actions_required"]=list(preflight.get("human_actions_required") or [])
+                diagnostic["unanswered_fields"]=[blocker]
+                diagnostic["screenshot"]=None
+                _update(app_id,"needs_user_input" if diagnostic["human_actions_required"] else "unsupported",diagnostic);return
         from playwright.sync_api import sync_playwright
         resume_path=STORAGE/resume["stored_name"]
         if not resume_path.is_file(): raise RuntimeError("The active resume file is unavailable.")
-        with sync_playwright() as p:
+        with _ManagedPlaywrightContext(sync_playwright) as p:
             diagnostic["phase"]="browser_launch"
-            browser=p.chromium.launch(headless=browser_headless()); context=browser.new_context(accept_downloads=False); page=context.new_page()
+            browser=p.chromium.launch(headless=browser_headless());p.attach(None,browser)
+            context=browser.new_context(accept_downloads=False); page=context.new_page();p.attach(page,browser)
             page.set_default_timeout(20000)
-            page.route("**/*",_guard_browser_request)
+            page.route("**/*",lambda route:_guard_browser_request(route,policy_state))
             target=job["application_url"]; visited=set()
             for _ in range(4):
                 if target in visited:
                     diagnostic["message"]="The employer page redirected repeatedly. Review the job link manually."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                    browser.close(); _update(app_id,"unsupported",diagnostic); return
+                    _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
                 visited.add(target); validate_application_url(target)
+                if not local_mock:
+                    permitted,reason,category=_robots_permission(target)
+                    if not permitted:
+                        diagnostic["failure_code"]=category
+                        diagnostic["message"]=reason or "Robots policy did not permit this employer page."
+                        diagnostic["unanswered_fields"]=[diagnostic["message"]]
+                        _close_browser_safely(page,browser);_update(app_id,"unsupported",diagnostic);return
                 diagnostic["phase"]="navigation"
                 page.goto(target,wait_until="domcontentloaded",timeout=25000); page.wait_for_timeout(100)
+                if policy_state:
+                    diagnostic["failure_code"]=policy_state.get("category")
+                    diagnostic["message"]=policy_state.get("reason") or "A navigation was blocked by a safety policy."
+                    diagnostic["unanswered_fields"]=[diagnostic["message"]]
+                    _close_browser_safely(page,browser);_update(app_id,"unsupported",diagnostic);return
+                validate_application_url(page.url)
                 _update(app_id,"inspecting",diagnostic)
                 interruption=_interruption(page)
                 if interruption:
                     diagnostic["message"]={"human_verification":"Human verification detected. No bypass was attempted.","authentication_required":"The employer requires sign-in. Complete authentication manually before retrying.","expired_listing":"This job listing appears expired or closed.","automation_restricted":"This employer page says automated application preparation is not permitted. The dry run stopped."}[interruption]
                     diagnostic["screenshot"]=_screenshot(page,app_id)
-                    browser.close(); _update(app_id,"unsupported" if interruption in {"human_verification","expired_listing","automation_restricted"} else "needs_user_input",diagnostic); return
+                    _close_browser_safely(page,browser); _update(app_id,"unsupported" if interruption in {"human_verification","expired_listing","automation_restricted"} else "needs_user_input",diagnostic); return
                 if _has_form_fields(page): break
                 links=_apply_links(page)
                 if not links:
@@ -1547,40 +2150,67 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                             page.wait_for_timeout(150)
                             if page.url==target and not _has_form_fields(page):
                                 diagnostic["message"]="The Apply button did not open a supported form. No submission was attempted."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                                browser.close(); _update(app_id,"unsupported",diagnostic); return
+                                _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
                             target=page.url
                             continue
                         except Exception:
                             diagnostic["message"]="The Apply button could not be followed safely."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                            browser.close(); _update(app_id,"unsupported",diagnostic); return
+                            _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
                     diagnostic["message"]="No supported application form or clearly labeled Apply link was found."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                    browser.close(); _update(app_id,"unsupported",diagnostic); return
+                    _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
                 next_target=links[0]
                 if next_target in visited:
                     diagnostic["message"]="The Apply link loops back to a page already visited."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                    browser.close(); _update(app_id,"unsupported",diagnostic); return
+                    _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
                 validate_application_url(next_target)
+                if not local_mock:
+                    permitted,reason,category=_robots_permission(next_target)
+                    if not permitted:
+                        diagnostic["failure_code"]=category
+                        diagnostic["message"]=reason or "Robots policy did not permit the employer's application link."
+                        diagnostic["unanswered_fields"]=[diagnostic["message"]]
+                        _close_browser_safely(page,browser);_update(app_id,"unsupported",diagnostic);return
                 target=next_target
             else:
                 diagnostic["message"]="The application page could not be reached after several navigation steps."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                browser.close(); _update(app_id,"unsupported",diagnostic); return
+                _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
             diagnostic["form_detected"]=bool(_has_form_fields(page))
             if not diagnostic["form_detected"]:
                 diagnostic["message"]="The application page opened, but no supported form controls were detected. No application was submitted."
                 diagnostic["screenshot"]=_screenshot(page,app_id)
-                browser.close(); _update(app_id,"unsupported",diagnostic); return
+                _close_browser_safely(page,browser); _update(app_id,"unsupported",diagnostic); return
             diagnostic["phase"]="form_filling"
             _update(app_id,"filling",diagnostic); missing=[]
             for step in range(MAX_STEPS):
+                interruption=_interruption(page)
+                if interruption:
+                    messages={"human_verification":"Human verification detected. No bypass was attempted.",
+                        "authentication_required":"The employer requires sign-in. Complete authentication manually before retrying.",
+                        "expired_listing":"This job listing appears expired or closed.",
+                        "automation_restricted":"This employer page says automated application preparation is not permitted. The dry run stopped."}
+                    diagnostic["message"]=messages.get(interruption,"The employer requires a human action.")
+                    diagnostic["human_actions_required"]=[diagnostic["message"]]
+                    diagnostic["unanswered_fields"]=[diagnostic["message"]]
+                    diagnostic["screenshot"]=_screenshot(page,app_id)
+                    _close_browser_safely(page,browser);_update(app_id,"unsupported" if interruption in {"expired_listing","automation_restricted"} else "needs_user_input",diagnostic);return
                 if _paused():
                     diagnostic["message"]="Paused by user; prior field entries in this browser attempt are retained."; diagnostic["screenshot"]=_screenshot(page,app_id)
-                    browser.close(); _update(app_id,"paused",diagnostic); return
+                    _close_browser_safely(page,browser); _update(app_id,"paused",diagnostic); return
                 if not answers.get("__is_local_mock") and not get_authorization()["settings"].get("allow_automated_form_preparation"):
                     diagnostic["message"]="Automated form preparation permission was revoked. The dry run stopped safely."; diagnostic["unanswered_fields"].append("Re-enable form preparation in Application settings to continue.")
-                    diagnostic["screenshot"]=_screenshot(page,app_id); browser.close(); _update(app_id,"needs_user_input",diagnostic); return
+                    diagnostic["screenshot"]=_screenshot(page,app_id); _close_browser_safely(page,browser); _update(app_id,"needs_user_input",diagnostic); return
+                if not local_mock:
+                    current_scope=_current_preparation_authorization(job.get("job_key"),resume["id"],job["application_url"])
+                    saved_scope=answers.get("__preparation_authorization") or {}
+                    if not current_scope or current_scope.get("authorization_id")!=saved_scope.get("authorization_id"):
+                        diagnostic.setdefault("authorization",{})["status"]="revoked_or_stale"
+                        diagnostic["message"]="Job-specific authorization was revoked or changed. No further candidate information will be entered."
+                        diagnostic["unanswered_fields"].append("Review and confirm the current employer-specific authorization.")
+                        diagnostic["screenshot"]=_screenshot(page,app_id);_close_browser_safely(page,browser);_update(app_id,"needs_user_input",diagnostic);return
                 def mark_upload(): _update(app_id,"uploading_resume",diagnostic)
                 filled,unanswered,drafts=_fill_page(page,candidate,answers,resume_path,on_upload=mark_upload)
                 diagnostic["filled_fields"].extend(filled); missing.extend(unanswered); diagnostic["draft_answers"].extend(drafts); diagnostic["steps"]=step+1
+                missing.extend("Required field is still empty: "+str(label) for label in _required_field_issues(page))
                 diagnostic["required_fields"]=list(dict.fromkeys(
                     diagnostic["required_fields"]+_required_visible_fields(page)+
                     [str(item.get("field") or "Required field") for item in filled if item.get("required")]))
@@ -1607,6 +2237,9 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                         before=_step_signature(page)
                         page.locator("button,a[href],input[type=button],input[type=submit]").nth(safe["index"]).click(timeout=1000)
                         page.wait_for_timeout(250)
+                        if policy_state:
+                            missing.append(policy_state.get("reason") or "The next page was blocked by a read-only or robots safety check.")
+                            break
                         if _step_signature(page)==before:
                             missing.append("The application did not advance to its next step using a safe navigation control. Review it manually.")
                             break
@@ -1621,15 +2254,25 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
             except Exception:
                 diagnostic["validation_errors"]=[]
             diagnostic["unanswered_fields"]=list(dict.fromkeys(missing)); diagnostic["screenshot"]=_screenshot(page,app_id)
+            diagnostic["authorization_status"]="current" if local_mock else "current_job_specific_authorization"
+            diagnostic["documents_uploaded"]=sum(1 for item in diagnostic["filled_fields"]
+                if item.get("source") in {"active_resume","private_document"} and item.get("result")=="filled")
+            diagnostic["ai_answers_drafted"]=sum(1 for item in diagnostic["draft_answers"] if item.get("status") in {"grounded_draft","ready_to_review"})
+            diagnostic["required_fields_remaining"]=len(diagnostic["unanswered_fields"])
             if missing:
                 diagnostic["message"]="Required or sensitive questions need your input. The form was not submitted."; state="needs_user_input"
             else:
                 diagnostic["message"]="Dry run complete. Review the form; final submission was not performed."; state="ready_for_review"
-            browser.close(); _update(app_id,state,diagnostic)
+            _close_browser_safely(page,browser); _update(app_id,state,diagnostic)
     except Exception as error:
         name=type(error).__name__
         phase=diagnostic.get("phase")
-        if phase=="browser_launch":
+        if policy_state:
+            diagnostic["failure_code"]=policy_state.get("category") or "navigation_blocked"
+            diagnostic["message"]=policy_state.get("reason") or "A navigation was blocked by a safety policy."
+            diagnostic["unanswered_fields"]=[diagnostic["message"]]
+            _update(app_id,"unsupported",diagnostic,name)
+        elif phase=="browser_launch":
             diagnostic["failure_code"]="browser_launch_failed"
             diagnostic["message"]="Chromium could not start. Check the Playwright browser installation and local browser permissions."
         elif "Timeout" in name:
@@ -1665,11 +2308,14 @@ def _drain_application_queue():
                 row=db.execute("SELECT * FROM applications WHERE user_id=? AND state='queued' ORDER BY queue_priority DESC,created_at ASC LIMIT 1",(USER,)).fetchone()
             if not row: break
             try:
-                resume,candidate,answers=_candidate()
+                resume,base_candidate,base_answers=_candidate()
                 if row["resume_id"]!=resume["id"]:
                     _update(row["id"],"needs_user_input",{"mode":"dry_run","submission_performed":False,"message":"Activate the resume version associated with this queued application before continuing.","unanswered_fields":["The active resume differs from the version selected when this job was queued."]})
                     continue
-                job={"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]}
+                candidate=base_candidate
+                answers=dict(base_answers)
+                job=_get_job(DryRunRequest(job_key=row["job_key"])) if not str(row["job_key"]).startswith("local-mock:") else {"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]}
+                job.update({"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]})
                 if not _mock_allowed(row["application_url"]):
                     with connect() as db:
                         saved=db.execute("SELECT 1 FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,row["job_key"])).fetchone()
@@ -1677,7 +2323,14 @@ def _drain_application_queue():
                     if gate[0]=="not_eligible" or gate[0]=="not_analyzed" or (gate[0] not in {"potential_match","needs_review"}) or ((gate[0]=="needs_review" or gate[2]) and not gate[1]):
                         _update(row["id"],"needs_user_input",{"mode":"dry_run","submission_performed":False,"message":"Eligibility must be analyzed or reviewed again before preparation can continue.","unanswered_fields":["Review the latest AI eligibility result and any unresolved mandatory requirements."]})
                         continue
+                    scope=_current_preparation_authorization(row["job_key"],resume["id"],row["application_url"])
+                    if not scope:
+                        _update(row["id"],"needs_user_input",{"mode":"dry_run","submission_performed":False,"message":"The employer authorization is missing or stale. Confirm this employer, URL, selected fields, documents, and AI processing again.","unanswered_fields":["Current job-specific authorization required."]})
+                        continue
                 answers=_application_context(job,answers)
+                if not _mock_allowed(row["application_url"]):
+                    candidate=_scoped_candidate(candidate,scope)
+                    answers=_scoped_answers(answers,scope)
                 process_application(row["id"],job,resume,candidate,answers)
             except HTTPException as error:
                 _update(row["id"],"needs_user_input",{"mode":"dry_run","submission_performed":False,"message":"Candidate information is needed before this dry run can start.","unanswered_fields":[str(error.detail)[:300]]})
@@ -1716,6 +2369,8 @@ def enqueue_saved_jobs(request:ApplicationQueueRequest):
         except HTTPException as error: skipped.append({"job_key":key,"reason":str(error.detail)[:300]}); continue
         try: validate_application_url(job.get("application_url"))
         except ValueError as error: skipped.append({"job_key":key,"reason":str(error)}); continue
+        if not _mock_allowed(job.get("application_url","")) and not _current_preparation_authorization(key,resume["id"],job.get("application_url")):
+            skipped.append({"job_key":key,"reason":"A current job-specific employer authorization is required before queueing this real application."}); continue
         with connect() as db:
             match=db.execute("SELECT classification,match_score,result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,key,resume["id"])).fetchone()
             posting=db.execute("SELECT discovered_at,location_status FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
@@ -1753,7 +2408,7 @@ def start_dry_run(request:DryRunRequest):
                 raise HTTPException(409,"Review the eligibility result and unresolved mandatory requirements before preparing this opening.")
     if not is_local and not get_authorization()["settings"].get("allow_automated_form_preparation"):
         raise HTTPException(403,"Enable automated form preparation in Application settings before preparing an employer application.")
-    answers=_application_context(job,answers)
+    candidate,answers=_authorized_preparation_payload(job,resume,candidate,answers)
     app_id,state,created=_create(job,resume)
     if state=="skipped_duplicate": return {"application_id":app_id,"status":state,"message":"Already submitted; duplicate prevented."}
     if created: executor.submit(process_application,app_id,job,resume,candidate,answers)
@@ -1862,7 +2517,7 @@ def list_missing_application_questions(application_id:str):
 
 @router.get("/api/applications")
 def list_applications():
-    with connect() as db: rows=db.execute("""SELECT a.id,a.job_key,a.company,a.title,a.state,a.mode,a.diagnostic_json,a.error,a.created_at,a.updated_at,a.started_at,a.state_changed_at,a.attempt_number,
+    with connect() as db: rows=db.execute("""SELECT a.id,a.job_key,a.company,a.title,a.application_url,a.state,a.mode,a.diagnostic_json,a.error,a.created_at,a.updated_at,a.started_at,a.state_changed_at,a.attempt_number,
         (SELECT COALESCE(NULLIF(o.job_url,''),o.url) FROM discovered_openings o WHERE o.user_id=a.user_id AND o.job_key=a.job_key LIMIT 1) AS source_url
         FROM applications a WHERE a.user_id=? ORDER BY a.updated_at DESC LIMIT 250""",(USER,)).fetchall()
     result=[]
@@ -1872,6 +2527,8 @@ def list_applications():
         except (TypeError,json.JSONDecodeError): item["diagnostic"]={}
         try:item["source_url"]=urlparse(str(item.get("source_url") or ""))._replace(query="",fragment="").geturl()
         except ValueError:item["source_url"]=""
+        try:item["application_url"]=urlparse(str(item.get("application_url") or ""))._replace(query="",fragment="").geturl()
+        except ValueError:item["application_url"]=""
         item["action_required_groups"]=_group_questions(item["diagnostic"].get("unanswered_fields",[]))
         item["action_required_count"]=sum(len(group["questions"]) for group in item["action_required_groups"])
         result.append(item)
@@ -2012,6 +2669,8 @@ def resume_one(application_id:str):
                 if gate_class=="not_analyzed": raise HTTPException(409,"Run AI matching before retrying this saved opening.")
                 if gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
                     raise HTTPException(409,"Review the eligibility result and unresolved mandatory requirements before retrying.")
+            scope=_current_preparation_authorization(row["job_key"],resume["id"],row["application_url"])
+            if not scope:raise HTTPException(409,"A current job-specific authorization is required before retrying this real application.")
         if row["state"] not in {"paused","failed","needs_user_input","unsupported"}: raise HTTPException(409,"Application is not resumable.")
         if row["state"] in {"opening","filling","queued"}:
             raise HTTPException(409,"This application already has an active attempt.")
@@ -2029,6 +2688,12 @@ def resume_one(application_id:str):
         else:
             db.execute("UPDATE applications SET state='queued',error=NULL,updated_at=?,state_changed_at=?,heartbeat_at=NULL WHERE id=?",(stamp,stamp,application_id))
             db.execute("UPDATE application_attempts SET state='queued',error=NULL,updated_at=?,state_changed_at=? WHERE application_id=? AND attempt_number=?",(stamp,stamp,application_id,row["attempt_number"]))
+    if not _mock_allowed(row["application_url"]):
+        job=_get_job(DryRunRequest(job_key=row["job_key"]))
+        job.update({"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]})
+        candidate=_scoped_candidate(candidate,scope)
+        answers=_application_context(job,answers)
+        answers=_scoped_answers(answers,scope)
     executor.submit(process_application,application_id,dict(row),resume,candidate,answers)
     return {"application_id":application_id,"status":"queued"}
 
@@ -2090,6 +2755,7 @@ renderApps=function(apps){
     const diagnostic=app.diagnostic||{},card=cards[index];
     if(!card)return;
     if(app.source_url){const link=node('a','sub','Open official posting');link.href=app.source_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link)}
+    if(app.application_url){const link=node('a','sub','Open official application page');link.href=app.application_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link)}
     const panel=document.createElement('details'),summary=node('summary','','Preparation details');
     const body=node('div');
     const provider=diagnostic.provider||{};
@@ -2099,6 +2765,8 @@ renderApps=function(apps){
     body.append(node('p','sub','Fields completed: '+(diagnostic.filled_fields||[]).filter(x=>x.result==='filled').length+' · Required fields: '+(diagnostic.required_fields||[]).length+' · Required items remaining: '+(diagnostic.unanswered_fields||[]).length));
     const uploaded=(diagnostic.filled_fields||[]).filter(x=>x.source==='private_document'||x.source==='active_resume').length;
     body.append(node('p','sub','Documents accepted by form: '+uploaded+' · AI drafts: '+(diagnostic.draft_answers||[]).length+' · Human actions: '+(diagnostic.human_actions_required||[]).length));
+    if(diagnostic.authorization){const auth=diagnostic.authorization;body.append(node('p','sub','Job-specific authorization: '+(auth.status==='current'?'Current':'Needs renewal')+' · Authorized fields: '+(auth.selected_field_count||0)+' · Documents permitted: '+((auth.selected_document_types||[]).join(', ')||'None')+' · AI answers: '+(auth.ai_answers_authorized?'Authorized':'Not authorized')+' · Cloud AI: '+(auth.cloud_ai_authorized?'Authorized':'Not authorized')))}
+    if(diagnostic.phase)body.append(node('p','sub','Current stage: '+String(diagnostic.phase).replaceAll('_',' ')+' · Last checkpoint: '+new Date(app.updated_at).toLocaleString()));
     const unresolved=diagnostic.unanswered_fields||[];
     if(unresolved.length){const list=document.createElement('ul');list.className='sub';unresolved.forEach(value=>{const item=document.createElement('li');item.textContent=value;list.append(item)});body.append(list)}
     if(diagnostic.human_actions_required?.length)body.append(node('p','sub','Employer or sensitive questions are waiting for your explicit action.'));
@@ -2123,10 +2791,14 @@ function appendInspectionReport(card,report){
   const pageKinds={application_form:'Application form',job_posting:'Job posting only · no application form exposed',posting_redirected:'Job URL redirected · posting not verified',public_form_unverified:'Public form found · application purpose unverified',public_page_unverified:'Public page · application form unverified'};
   body.append(node('p','sub','Page classification: '+(pageKinds[report.page_classification]||'Not verified')));
   body.append(node('p','sub','Provider: '+(report.provider?.provider||'Not identified')+' · '+(report.provider?.support_level||'compatibility unknown')+' · Form detected: '+(report.form_detected?'Yes':'No')));
-  body.append(node('p','sub','Required fields: '+((report.required_fields||[]).length)+' · File uploads: '+((report.file_upload_controls||[]).length)+' · Multi-step: '+(report.multi_step_detected?'Detected':'Not detected')+' · Submission control: '+(report.submission_control_detected?'Detected':'Not detected')));
-  if(report.fields?.length){body.append(node('strong','','Detected controls'));const fields=document.createElement('ul');report.fields.forEach(field=>fields.append(node('li','',(field.label||'Unlabeled')+' · '+(field.kind||'unknown')+(field.required?' · required':' · optional'))));body.append(fields)}
+  const submitStatus={detected_visible:'Detected · visible',detected_hidden:'Detected · hidden',not_detected_unresolved:'Not detected · safety unresolved'};
+  body.append(node('p','sub','Unique questions: '+(report.unique_question_count??(report.questions||[]).length)+' · Required questions: '+(report.unique_required_question_count??(report.required_fields||[]).length)+' · Optional questions: '+(report.unique_optional_question_count??0)+' · Required controls: '+(report.required_control_count??(report.required_fields||[]).length)));
+  body.append(node('p',report.submission_control_status==='not_detected_unresolved'?'inspection-diagnostic':'sub','File uploads: '+((report.file_upload_controls||[]).length)+' · Multi-step: '+(report.multi_step_detected?'Detected':'Not detected')+' · Submission control: '+(submitStatus[report.submission_control_status]||'Not verified')));
+  if(report.questions?.length){body.append(node('strong','','Applicant questions'));const fields=document.createElement('ul');report.questions.forEach(question=>fields.append(node('li','',(question.question||'Unresolved question')+' · '+(question.required?'required':'optional')+' · controls: '+(question.control_types||[]).join(', '))));body.append(fields)}
+  if(report.unresolved_controls?.length){body.append(node('strong','','Unresolved controls · may block preparation'));const fields=document.createElement('ul');report.unresolved_controls.forEach(item=>fields.append(node('li','',(item.question||'Unlabeled control')+' · '+(item.kind||'unknown')+' · '+(item.required===true?'required':item.required==='unknown'?'required status unknown':'optional')+' · '+(item.reasons||[]).join('; '))));body.append(fields)}
+  if(report.ignored_controls?.length){body.append(node('strong','','Hidden or non-visible controls excluded from question counts'));const fields=document.createElement('ul');report.ignored_controls.forEach(item=>fields.append(node('li','',(item.tag||'control')+(item.input_type?' · '+item.input_type:'')+(item.role?' · '+item.role:'')+' · '+(item.reason||'not visible'))));body.append(fields)}
   if(report.reason)body.append(node('p','sub',report.reason));
-  for(const [title,items] of [['Required fields',report.required_fields],['File upload controls',report.file_upload_controls],['Supported fields',report.supported_fields],['Unsupported fields',report.unsupported_fields],['Human actions required',report.human_actions_required]])if(items?.length){body.append(node('strong','',title));const list=document.createElement('ul');items.forEach(x=>list.append(node('li','',x)));body.append(list)}
+  for(const [title,items] of [['File upload questions',report.file_upload_controls],['Supported fields',report.supported_fields],['Unsupported fields',report.unsupported_fields],['Human actions required',report.human_actions_required]])if(items?.length){body.append(node('strong','',title));const list=document.createElement('ul');items.forEach(x=>list.append(node('li','',x)));body.append(list)}
   if(report.application_url){const link=node('a','sub','Open inspected application page');link.href=report.application_url;link.target='_blank';link.rel='noopener noreferrer';body.append(link)}
   panel.append(summary,body);card.append(panel);
 }
@@ -2158,6 +2830,66 @@ APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</head>", """<style>
 .compatibility-tool{margin:22px 0;padding:18px;background:var(--bsa-surface);color:var(--bsa-ink);border:1px solid var(--bsa-line);border-radius:14px;box-shadow:0 2px 8px #102a4308}.compatibility-tool label{display:block;color:var(--bsa-ink);font-weight:650;margin:8px 0}.compatibility-input{display:flex;gap:9px;flex-wrap:wrap}.compatibility-input input{flex:1 1 360px;min-width:0;padding:10px 12px;border:1px solid var(--bsa-line);border-radius:8px;background:var(--bsa-surface);color:var(--bsa-ink);font:inherit}.compatibility-tool button{background:var(--bsa-surface);color:var(--bsa-ink);border-color:var(--bsa-line)}.compatibility-tool button.primary{background:var(--brand);color:#fff;border-color:var(--brand)}.compatibility-tool button:focus-visible,.compatibility-input input:focus-visible{outline:3px solid #2563eb;outline-offset:2px}.inspection-diagnostic{font-weight:650}
 html[data-bsa-theme="dark"] .form-inspection-result summary{color:#e7edf6}
 </style></head>""")
+
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</body></html>", """<script>
+const phase124RenderSavedJobs=renderSavedJobs;
+function addAuthorizationControl(card,job){
+  if(job.preparation_authorized){
+    card.append(node('span','pill','Job-specific authorization current'));
+    const revoke=node('button','','Revoke this job authorization');
+    revoke.onclick=async()=>{revoke.disabled=true;try{const result=await req('/api/applications/saved-jobs/'+encodeURIComponent(job.job_key)+'/preparation-authorization',{method:'DELETE'});say(result.message);await renderSavedJobs(true)}catch(error){revoke.disabled=false;say(error.message)}};
+    card.append(revoke);return;
+  }
+  if(!job.preparation_authorization_required)return;
+  const open=node('button','primary','Authorize Preparation');
+  open.title='Review employer, exact URL, selected candidate fields, documents, and AI processing before authorizing.';
+  open.onclick=async()=>{
+    open.disabled=true;open.textContent='Loading authorization plan…';
+    try{
+      const plan=await req('/api/applications/saved-jobs/'+encodeURIComponent(job.job_key)+'/preparation-authorization');
+      const panel=node('section','authorization-panel');panel.setAttribute('aria-label','Job-specific preparation authorization');
+      panel.append(node('h4','', 'Authorize preparation for this job'));
+      panel.append(node('p','sub','Employer: '+plan.employer+' · Job: '+plan.title));
+      panel.append(node('p','sub','Exact application URL: '+plan.application_url));
+      panel.append(node('p','sub','Provider: '+(plan.provider?.provider||'Employer site')+' · Eligibility: '+plan.eligibility));
+      if(plan.inspection)appendInspectionReport(panel,plan.inspection);
+      if(plan.inspection_blocker){panel.append(node('p','authorization-error',plan.inspection_blocker));card.append(panel);open.remove();return}
+      panel.append(node('p','sub','Choose the confirmed profile fields BabyStepsAI may enter. Values are not displayed here.'));
+      const fields=node('div','authorization-options');
+      for(const item of plan.candidate_fields||[]){const label=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.dataset.fieldKey=item.key;label.append(check,document.createTextNode(' '+item.label+(item.sensitive?' · sensitive':'') ));fields.append(label)}
+      panel.append(fields);
+      panel.append(node('p','sub','Choose which authentic files may be uploaded. Resume and additional documents require separate selection.'));
+      const docs=node('div','authorization-options');
+      for(const item of plan.available_documents||[]){const label=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.dataset.documentType=item.type;label.append(check,document.createTextNode(' '+item.label));docs.append(label)}
+      panel.append(docs);
+      const aiLabel=document.createElement('label'),ai=document.createElement('input');ai.type='checkbox';ai.disabled=!plan.ai_drafting_enabled;aiLabel.append(ai,document.createTextNode(' Allow grounded AI answers to be inserted for ordinary written questions'+(plan.ai_drafting_enabled?'':' · enable AI drafting in Application Settings first')));panel.append(aiLabel);
+      if(plan.provider_selected==='gemini'){
+        const cloudLabel=document.createElement('label'),cloud=document.createElement('input');cloud.type='checkbox';cloud.disabled=!plan.cloud_provider_configured;cloudLabel.append(cloud,document.createTextNode(' Separately authorize sending the selected facts and this job description to Google Gemini'+(plan.cloud_provider_configured?'':' · Gemini is not configured')));panel.append(cloudLabel);
+      }
+      const confirmLabel=document.createElement('label'),confirm=document.createElement('input');confirm.type='checkbox';confirmLabel.append(confirm,document.createTextNode(' I authorize BabyStepsAI to use only the selected fields and files for this employer and exact URL, and to stop before final submission. I will handle legal acknowledgments and human verification.'));panel.append(confirmLabel);
+      const status=node('p','sub','This authorization expires when the job URL, match, resume/profile, confirmed answers, documents, or settings version changes.');panel.append(status);
+      const save=node('button','primary','Save Job-Specific Authorization');save.disabled=true;confirm.onchange=()=>{save.disabled=!confirm.checked};
+      save.onclick=async()=>{save.disabled=true;try{
+        const field_keys=[...fields.querySelectorAll('[data-field-key]:checked')].map(x=>x.dataset.fieldKey);
+        const document_types=[...docs.querySelectorAll('[data-document-type]:checked')].map(x=>x.dataset.documentType);
+        await req('/api/applications/saved-jobs/'+encodeURIComponent(job.job_key)+'/preparation-authorization',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmed:confirm.checked,confirmed_employer:plan.employer,confirmed_title:plan.title,confirmed_application_url:plan.application_url,field_keys,document_types,allow_ai_answers:ai.checked,allow_cloud_ai:!!panel.querySelector('input[type=checkbox][data-cloud-ai]:checked')})});
+        say('Job-specific authorization saved. Preparation remains a dry run and will stop before submission.');await renderSavedJobs(true);
+      }catch(error){save.disabled=false;status.textContent=error.message}}
+      panel.append(save);card.append(panel);open.remove();
+    }catch(error){say(error.message);open.disabled=false;open.textContent='Authorize Preparation'}
+  };
+  card.append(open);
+}
+renderSavedJobs=async function(silent=false){
+  await phase124RenderSavedJobs(silent);
+  const data=await req('/api/applications/saved-jobs?'+new URLSearchParams({q:document.querySelector('#job-search').value,eligibility:document.querySelector('#job-eligibility').value}).toString());
+  const cards=document.querySelectorAll('#jobs .job');
+  (data.results||[]).forEach((job,index)=>{const card=cards[index];if(card)addAuthorizationControl(card,job)});
+};
+</script></body></html>""")
+
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("check.type='checkbox';cloudLabel.append(check,document.createTextNode(","check.type='checkbox';check.dataset.cloudAi='true';cloudLabel.append(check,document.createTextNode(")
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace(".form-inspection-result{overflow-wrap:anywhere}",".form-inspection-result{overflow-wrap:anywhere}.authorization-panel{width:100%;padding:14px;border:1px solid var(--bsa-line);border-radius:10px;background:var(--bsa-surface);color:var(--bsa-ink)}.authorization-panel h4{margin:4px 0}.authorization-panel label{display:block;margin:8px 0;color:var(--bsa-ink)}.authorization-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr));gap:4px}.authorization-error{color:#a12b32;font-weight:650}")
 
 MOCK_PAGES={
 "simple":'''<!doctype html><title>Mock simple</title><h1>Software Developer Application</h1><form><label>Full Name <input name="name" required></label><label>Email <input name="email" type="email" required></label><label>Phone <input name="phone" required></label><label>LinkedIn URL <input name="linkedin"></label><label>GitHub URL <input name="github"></label><label>Resume <input name="resume" type="file" required></label><button type="submit">Submit application</button></form>''',

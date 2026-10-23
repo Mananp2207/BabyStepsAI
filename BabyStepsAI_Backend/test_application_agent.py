@@ -27,8 +27,11 @@ class FakeField:
     def evaluate(self, script):
         if "el.files?.length" in script:
             return {"count":1 if self.file else 0,"name":Path(self.file).name if self.file else ""}
+        if "selectedOptions" in script: return getattr(self,"selected","")
         return self.info
     def fill(self, value): self.value = value
+    def input_value(self): return self.value
+    def is_checked(self): return self.checked
     def set_input_files(self, value): self.file = value
     def check(self): self.checked=True
     def uncheck(self): self.checked=False
@@ -137,6 +140,7 @@ class FakePage:
 class FakeBody:
     def __init__(self, text): self.text=text
     def inner_text(self, **_kwargs): return self.text
+    def evaluate(self, _script): return []
 
 class FakeForms:
     def evaluate_all(self,_script): return []
@@ -240,6 +244,24 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertTrue(app["diagnostic"]["form_detected"])
         self.assertEqual(app["diagnostic"]["provider"]["adapter"],"shared_semantic_form")
         self.assertEqual(app["diagnostic"]["filled_fields"][-1]["source"],"active_resume")
+
+    def test_field_readback_mismatch_is_not_reported_as_filled(self):
+        class RejectingField(FakeField):
+            def fill(self, _value): pass
+        class Page:
+            def locator(self, _selector): return FakeFields([RejectingField({"tag":"input","type":"text","name":"name","label":"Full Name","required":True})])
+        candidate={"full_name":"A Candidate"}
+        answers={"__settings":{"allow_auto_use_confirmed_answers":True},"__is_local_mock":True}
+        filled,missing,_=app_agent._fill_page(Page(),candidate,answers,self.storage/"r1.pdf")
+        self.assertEqual(filled[0]["result"],"verification_failed")
+        self.assertTrue(any("could not be verified" in item for item in missing))
+
+    def test_required_conditional_controls_are_checked_after_field_scan(self):
+        class Body:
+            def evaluate(self,_script): return ["Additional eligibility question"]
+        class Page:
+            def locator(self,_selector): return Body()
+        self.assertEqual(app_agent._required_field_issues(Page()),["Additional eligibility question"])
 
     def test_read_only_inspection_persists_report_without_creating_application_attempt(self):
         from unittest.mock import patch
@@ -370,6 +392,20 @@ class ApplicationAgentTests(unittest.TestCase):
         with patch.object(app_agent,"_robots_permission",return_value=(False,"The employer's robots.txt host could not be resolved by this computer. Check DNS or network access and retry.","dns_failure")):
             dns=app_agent.inspect_public_application_form("https://unresolved.example/jobs/1")
         self.assertEqual(dns["failure_category"],"dns_failure"); self.assertIn("DNS",dns["reason"])
+
+    def test_unresolved_required_greenhouse_controls_or_missing_submit_block_preparation(self):
+        base={"robots_policy":"verified_allow","form_detected":True,"page_classification":"application_form",
+              "inspection_outcome":"compatible","human_actions_required":[],"unsupported_fields":[]}
+        missing_submit={**base,"submission_control_status":"not_detected_unresolved"}
+        self.assertIn("submission control could not be identified",app_agent._preparation_inspection_blocker(missing_submit))
+        unresolved={**base,"submission_control_status":"detected_visible",
+                    "unresolved_controls":[{"question":"Are you legally authorized?","required":True,"reasons":["Unknown type"]}]}
+        self.assertIn("Required form controls could not be identified reliably",app_agent._preparation_inspection_blocker(unresolved))
+
+    def test_required_marker_recognizes_suffix_asterisk_used_by_greenhouse(self):
+        self.assertTrue(app_agent._required_marker("Resume/CV*"))
+        self.assertTrue(app_agent._required_marker("Email ✱"))
+        self.assertFalse(app_agent._required_marker("Gender"))
 
     def test_robots_policy_is_parsed_for_each_requested_path(self):
         class Response:
@@ -775,6 +811,116 @@ class ApplicationAgentTests(unittest.TestCase):
         filtered=app_agent.list_saved_application_jobs(q="Austin",eligibility="potential_match")
         self.assertEqual(filtered["count"],1)
 
+    def _make_external_eligible_job(self):
+        key="saved-external"
+        url="https://jobs.ashbyhq.com/example/software-engineer"
+        stamp=app_agent.now()
+        with app_agent.connect() as db:
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,job_url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source,active) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                (USER,key,"Example Employer","Software Engineer I","New York, NY",url,"https://jobs.ashbyhq.com/example/software-engineer",stamp,"Full time","eligible","","","Company Careers Page"))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at,freshness_status,matching_model_version) VALUES(?,?,?,'completed','potential_match',90,'{}',NULL,?,?,'current',?)",
+                (USER,key,"r1",stamp,stamp,matcher.MATCHING_ENGINE_VERSION))
+            report={"provider":{"provider":"ashby","support_level":"accessibility_first"},"form_detected":True,
+                "page_classification":"application_form","inspection_outcome":"compatible","robots_policy":"verified_allow",
+                "requested_application_url":url,"required_fields":["Full name"],"unsupported_fields":[],
+                "submission_control_status":"detected_visible","submission_control_detected":True,
+                "fields":[{"label":"Full name","kind":"text","required":True}],"human_actions_required":[]}
+            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
+                ("inspection-external",USER,key,"ashby","compatible",json.dumps(report),stamp))
+        return key,url
+
+    def test_job_specific_authorization_is_required_for_real_employers(self):
+        key,url=self._make_external_eligible_job()
+        with patch.object(app_agent,"validate_application_url"):
+            with self.assertRaises(HTTPException) as caught:
+                app_agent.start_dry_run(app_agent.DryRunRequest(job_key=key))
+        self.assertEqual(caught.exception.status_code,403)
+        self.assertEqual(app_agent.list_applications(),[])
+        item=next(row for row in app_agent.list_saved_application_jobs()["results"] if row["job_key"]==key)
+        self.assertTrue(item["preparation_authorization_required"])
+        self.assertFalse(item["preparation_allowed"])
+
+    def test_authorization_plan_lists_only_field_names_and_binds_exact_job_versions(self):
+        key,url=self._make_external_eligible_job()
+        with patch.object(app_agent,"validate_application_url"):
+            plan=app_agent.preparation_authorization_plan(key)
+            self.assertNotIn("candidate@example.test",json.dumps(plan))
+            available={item["key"] for item in plan["candidate_fields"]}
+            self.assertIn("full_name",available)
+            saved=app_agent.authorize_saved_job_preparation(key,app_agent.PreparationAuthorizationRequest(
+                confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                confirmed_application_url=plan["application_url"],field_keys=["full_name","email"],
+                document_types=["resume"],allow_ai_answers=False,allow_cloud_ai=False))
+        self.assertTrue(saved["authorized"])
+        self.assertTrue(app_agent._current_preparation_authorization(key,"r1",url))
+        item=next(row for row in app_agent.list_saved_application_jobs()["results"] if row["job_key"]==key)
+        self.assertTrue(item["preparation_allowed"])
+        scoped=app_agent._scoped_candidate(app_agent._candidate()[1],app_agent._current_preparation_authorization(key,"r1",url))
+        self.assertEqual(set(scoped)-{k for k in scoped if k.startswith("__")},{"full_name","email"})
+        self.assertNotIn("phone",scoped)
+
+    def test_authorization_is_invalidated_by_profile_or_settings_change_and_revocable(self):
+        key,url=self._make_external_eligible_job()
+        with patch.object(app_agent,"validate_application_url"):
+            plan=app_agent.preparation_authorization_plan(key)
+            app_agent.authorize_saved_job_preparation(key,app_agent.PreparationAuthorizationRequest(
+                confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                confirmed_application_url=plan["application_url"],field_keys=["full_name"],document_types=["resume"]))
+        self.assertTrue(app_agent._current_preparation_authorization(key,"r1",url))
+        profile.update_verification(profile.VerificationUpdate(values={"full_name":"Candidate Updated","email":"candidate@example.test"},confirmed_fields=["full_name","email"]))
+        self.assertIsNone(app_agent._current_preparation_authorization(key,"r1",url))
+
+    def test_authorization_blocks_gemini_without_separate_cloud_consent(self):
+        key,url=self._make_external_eligible_job()
+        answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(
+            allow_automated_form_preparation=True,allow_ai_drafting=True,matching_provider="gemini"))
+        with patch.object(app_agent,"validate_application_url"),patch.dict(os.environ,{"GEMINI_API_KEY":"test-key"}):
+            plan=app_agent.preparation_authorization_plan(key)
+            with self.assertRaises(HTTPException) as caught:
+                app_agent.authorize_saved_job_preparation(key,app_agent.PreparationAuthorizationRequest(
+                    confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                    confirmed_application_url=plan["application_url"],field_keys=["full_name"],document_types=["resume"],
+                    allow_ai_answers=True,allow_cloud_ai=False))
+        self.assertEqual(caught.exception.status_code,409)
+
+    def test_authorized_real_job_runs_a_fresh_read_only_preflight_before_filling(self):
+        key,url=self._make_external_eligible_job()
+        with patch.object(app_agent,"validate_application_url"):
+            plan=app_agent.preparation_authorization_plan(key)
+            app_agent.authorize_saved_job_preparation(key,app_agent.PreparationAuthorizationRequest(
+                confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                confirmed_application_url=plan["application_url"],field_keys=["full_name"],document_types=["resume"]))
+        report={"provider":{"provider":"ashby"},"form_detected":True,"page_classification":"application_form",
+            "inspection_outcome":"needs_human_action","robots_policy":"verified_allow",
+            "required_fields":["Full name"],"unsupported_fields":[],"human_actions_required":["CAPTCHA or human verification"],
+            "fields":[{"label":"Full name","kind":"text","required":True}]}
+        with patch.object(app_agent,"validate_application_url"),patch.object(app_agent,"inspect_public_application_form",return_value=report):
+            response=app_agent.start_dry_run(app_agent.DryRunRequest(job_key=key))
+        saved=next(row for row in app_agent.list_applications() if row["job_key"]==key)
+        self.assertEqual(response["mode"],"dry_run")
+        self.assertEqual(saved["state"],"needs_user_input")
+        self.assertTrue(saved["diagnostic"]["human_actions_required"])
+        self.assertEqual(saved["diagnostic"]["filled_fields"],[])
+        self.assertEqual(saved["diagnostic"]["authorization"]["status"],"current")
+        self.assertEqual(saved["diagnostic"]["authorization"]["selected_field_count"],1)
+        self.assertFalse(saved["diagnostic"]["submission_performed"])
+
+    def test_scope_filters_confirmed_reusable_answers_and_document_types(self):
+        candidate={"full_name":"Synthetic","skills":["Python"],"__application_documents":[
+            {"document_type":"transcript","path":"/private/transcript.pdf"},
+            {"document_type":"certificate","path":"/private/certificate.pdf"}]}
+        answers={"custom:project":{"answer":"Synthetic project","question":"Describe a project","confirmed":True,"auto_reuse":True},
+            "custom:location":{"answer":"Unknown place","question":"Where do you live?","confirmed":True,"auto_reuse":True},
+            "__settings":{"matching_provider":"ollama"}}
+        scope={"field_keys":["full_name","custom:project"],"document_types":["transcript"],
+            "authorization_id":"auth-test","allow_ai_answers":False,"allow_cloud_ai":False,"authorized_at":"2026-01-01"}
+        filtered_candidate=app_agent._scoped_candidate(candidate,scope)
+        filtered_answers=app_agent._scoped_answers(answers,scope)
+        self.assertEqual(filtered_candidate["full_name"],"Synthetic")
+        self.assertEqual([x["document_type"] for x in filtered_candidate["__application_documents"]],["transcript"])
+        self.assertIn("custom:project",filtered_answers)
+        self.assertNotIn("custom:location",filtered_answers)
+
     def test_prepare_one_saved_job_reads_record_and_runs_only_selected_dry_run(self):
         response=app_agent.prepare_saved_job(app_agent.DryRunRequest(job_key="saved-simple"))
         self.assertEqual(response["status"],"queued")
@@ -1096,6 +1242,18 @@ class ApplicationAgentTests(unittest.TestCase):
         route=Route(); app_agent._guard_browser_request(route)
         self.assertTrue(route.aborted); self.assertFalse(route.continued)
 
+    def test_browser_route_cleanup_tolerates_playwright_cancellation(self):
+        class Request: method="GET"; url="about:blank"
+        class Route:
+            request=Request()
+            def continue_(self):raise app_agent.asyncio.CancelledError()
+        app_agent._guard_browser_request(Route(),{})
+
+    def test_explicit_visual_required_markers_are_recognized_without_matching_question_wording(self):
+        self.assertTrue(app_agent._required_marker("Resume/CV ✱ ATTACH RESUME/CV"))
+        self.assertTrue(app_agent._required_marker("Email *"))
+        self.assertFalse(app_agent._required_marker("Do you require sponsorship?"))
+
     def test_retry_keeps_previous_attempt_diagnostics(self):
         response=self.post("/api/applications/dry-run",json={"job":{"job_key":"preserve-history","company":"Test Co","title":"Software Developer","application_url":"http://127.0.0.1:8000/mock-apps/simple"}})
         app_id=response["application_id"]
@@ -1120,6 +1278,9 @@ class ApplicationAgentTests(unittest.TestCase):
     def test_dashboard_links_missing_answers_and_private_screenshots(self):
         page=app_agent.APPLICATIONS_PAGE
         self.assertIn("Review candidate profile and answers",page)
+        self.assertIn("Authorize Preparation",page)
+        self.assertIn("Job-specific authorization current",page)
+        self.assertIn("Open official application page",page)
         self.assertIn("View private dry-run screenshot",page)
         self.assertIn("/screenshot",page)
 

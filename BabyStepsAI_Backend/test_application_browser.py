@@ -88,6 +88,61 @@ class ApplicationBrowserSafetyTests(unittest.TestCase):
             self.assertTrue(report["multi_step_detected"])
             self.assertTrue(report["submission_control_detected"])
 
+    def test_greenhouse_ziprecruiter_sanitized_structure_groups_duplicate_controls(self):
+        # Sanitized structural fixture from the public Greenhouse page. It
+        # includes visible question labels, repeated implementation controls,
+        # and no applicant-entered values.
+        fields=[]
+        def add(question,kind="text",required=True,**extra):
+            fields.append({"question":question,"label":question,"kind":kind,"required":required,**extra})
+        add("First Name*"); add("Last Name*"); add("Email*","email"); add("Country*")
+        add("Phone","text"); add("Phone*","tel")
+        add("Location (City)*"); add("Location (City)*","combobox")
+        add("School*"); add("School*","combobox")
+        add("Degree*"); add("Degree*","combobox")
+        add("What archetype are you most closely aligned with?*","text",possible_custom_selector=True)
+        add("What archetype are you most closely aligned with?*","combobox")
+        add("What school are you currently attending / did you graduate from?*")
+        add("When is your anticipated graduation date?*"); add("When is your anticipated graduation date?*","combobox")
+        add("Are you open to relocation to Santa Monica, CA?*","text",possible_custom_selector=True)
+        add("Are you open to relocation to Santa Monica, CA?*","combobox")
+        add("Are you legally authorized to work in the United States for our Company?*","text",possible_custom_selector=True)
+        add("Are you legally authorized to work in the United States for our Company?*","combobox")
+        add("Will you now, or in the future, require sponsorship to legally work in the U.S.?*","text",possible_custom_selector=True)
+        add("Will you now, or in the future, require sponsorship to legally work in the U.S.?*","combobox")
+        add("Resume/CV*","file",True,upload_purpose="resume",accept=".pdf,.doc,.docx,.txt,.rtf")
+        add("How did you hear about this opportunity?","text",False)
+        add("Gender","text",False); add("Are you Hispanic/Latino?","combobox",False); add("Veteran Status","combobox",False)
+        controls=[{"label":"Submit application","tag":"button","type":"submit","action":"final_submission","visible":True}]
+        report=summarize_form_metadata(detect_application_provider("https://job-boards.greenhouse.io/ziprecruiter/jobs/8127108"),fields,controls,interruption="human_verification")
+        self.assertEqual(report["provider"]["provider"],"greenhouse")
+        self.assertEqual(report["required_control_count"],24)
+        self.assertEqual(report["unique_required_question_count"],15)
+        self.assertEqual(report["unique_optional_question_count"],4)
+        self.assertEqual(report["required_fields"], [q["question"] for q in report["required_questions"]])
+        self.assertEqual(report["file_upload_controls"],["Resume/CV*"])
+        self.assertEqual(report["fields"][23]["upload_purpose"],"resume")
+        self.assertTrue(report["submission_control_detected"])
+        self.assertEqual(report["submission_control_status"],"detected_visible")
+        self.assertIn("CAPTCHA or human verification",report["human_actions_required"])
+        self.assertNotIn("Gender",report["required_fields"])
+        self.assertGreater(report["unresolved_required_control_count"],0)
+        self.assertEqual(report["inspection_outcome"],"needs_human_action")
+
+    def test_greenhouse_report_keeps_missing_submit_detection_unresolved(self):
+        report=summarize_form_metadata(detect_application_provider("https://job-boards.greenhouse.io/example/jobs/1"),
+            [{"question":"Resume","label":"Resume","kind":"file","required":True}],[])
+        self.assertFalse(report["submission_control_detected"])
+        self.assertEqual(report["submission_control_status"],"not_detected_unresolved")
+
+    def test_hidden_implementation_controls_are_separated_from_question_counts(self):
+        report=summarize_form_metadata(detect_application_provider("https://job-boards.greenhouse.io/example/jobs/1"),[
+            {"__inspection_meta__":True,"ignored_controls":[{"tag":"input","input_type":"text","reason":"aria_hidden"}]},
+            {"question":"Email*","label":"Email*","kind":"email","required":True}],[])
+        self.assertEqual(report["unique_required_question_count"],1)
+        self.assertEqual(report["ignored_control_count"],1)
+        self.assertEqual(report["ignored_controls"][0]["reason"],"aria_hidden")
+
 
 if __name__ == "__main__":
     unittest.main()
