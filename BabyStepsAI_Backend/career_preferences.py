@@ -309,6 +309,7 @@ header, section {
     padding: 22px;
     margin-bottom: 18px;
 }
+.invalid-field{border:2px solid #b42318!important;box-shadow:0 0 0 3px #b4231822}.status-error{color:#a3261d}.status-success{color:#137451}.optional-note{color:#64748b;font-size:13px}.field-hint{display:block;color:#64748b;font-size:12px;margin-top:4px}
 
 header {
     display: flex;
@@ -431,6 +432,7 @@ button {
 
     <a href="/">Back to Resumes</a>
 </header>
+<p class="optional-note">All career preferences are optional. Unset values do not block saving and keep discovery broader; a specific job may still ask for additional eligibility information.</p>
 
 <section>
     <h2>Popular Technology Career Categories</h2>
@@ -487,9 +489,10 @@ button {
 
 <section>
     <h2>Location and Work Preferences</h2>
+    <p class="optional-note">Preferences are optional refinements. Leave a field unset to keep job discovery broader; saving remains available.</p>
 
     <label>
-        Preferred Location
+        Preferred Location <span class="field-hint">Optional</span>
         <input id="location" type="text">
     </label>
 
@@ -531,7 +534,7 @@ button {
         Save My Preferences
     </button>
 
-    <p id="status" role="status"></p>
+    <p id="status" role="status" aria-live="polite"></p>
 </section>
 
 <script>
@@ -551,9 +554,12 @@ async function api(url, options) {
     const data = await response.json();
 
     if (!response.ok) {
-        throw new Error(
-            JSON.stringify(data.detail || data)
-        );
+        const detail=data.detail||data;
+        const message=Array.isArray(detail)?detail.map(x=>{
+            const field=Array.isArray(x.loc)?x.loc.filter(y=>y!=="body").join(" → "):"";
+            return (field?field+": ":"")+(x.msg||"Invalid value");
+        }).join("; "):(typeof detail==="string"?detail:"The request could not be saved. Review the highlighted settings and try again.");
+        const error=new Error(message);error.detail=detail;throw error;
     }
 
     return data;
@@ -786,6 +792,7 @@ $("addCustom").onclick = () => {
 };
 
 $("save").onclick = async () => {
+    const button=$("save"),status=$("status");
     const preferences = {
         categories: [...selectedCategories],
         roles: [...selected],
@@ -799,21 +806,35 @@ $("save").onclick = async () => {
         )
     };
 
+    button.disabled=true;button.setAttribute("aria-busy","true");status.className="";status.textContent="";
+    document.querySelectorAll(".invalid-field").forEach(x=>x.classList.remove("invalid-field"));
     try {
-        await api("/api/career-preferences", {
+        const saved=await api("/api/career-preferences", {
             method: "PUT",
             headers: {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify(preferences)
         });
-
-        $("status").textContent =
-            "Preferences saved successfully!";
+        if(!saved.saved)throw new Error("The server did not confirm that preferences were saved.");
+        const persisted=await api("/api/career-preferences");
+        const keys=["categories","roles","levels","employment_types","location","work_arrangement","instructions","max_applications_per_day"];
+        const canonical=value=>Array.isArray(value)?"["+value.map(canonical).join(",")+"]":value&&typeof value==="object"?"{"+Object.keys(value).sort().map(k=>JSON.stringify(k)+":"+canonical(value[k])).join(",")+"}":JSON.stringify(value);
+        for(const key of keys){if(canonical(persisted[key])!==canonical(preferences[key]))throw new Error("The saved "+key.replaceAll("_"," ")+" could not be verified. No success confirmation was shown.");}
+        status.className="status-success";
+        status.textContent="Preferences saved and verified. Unset preferences remain optional and do not block saving.";
 
     } catch (error) {
-        $("status").textContent =
-            "Save failed: " + error.message;
+        status.className="status-error";status.textContent="Save failed: "+error.message;
+        const detail=error.detail;
+        const firstIssue=Array.isArray(detail)?detail.find(x=>Array.isArray(x.loc)):null;const parts=firstIssue?.loc||[];const loc=parts.length?parts[parts.length-1]:null;
+        const fieldMap={location:$("location"),work_arrangement:$("work"),instructions:$("instructions"),max_applications_per_day:$("limit")};
+        if(fieldMap[loc]){fieldMap[loc].classList.add("invalid-field");fieldMap[loc].setAttribute("aria-invalid","true");fieldMap[loc].focus();}
+        else if(/category/i.test(error.message))document.querySelector("#featured button")?.focus();
+        else if(/experience level/i.test(error.message))document.querySelector("#levels input")?.focus();
+        else if(/employment type/i.test(error.message))document.querySelector("#types input")?.focus();
+    } finally {
+        button.disabled=false;button.removeAttribute("aria-busy");
     }
 };
 

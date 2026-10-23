@@ -320,7 +320,7 @@ class WorkflowOrchestratorTests(unittest.TestCase):
         self.assertIn("/api/workflows/discovery/",script)
         self.assertIn("Analyzed by AI",script)
         self.assertIn("Current results reused",script)
-        self.assertIn("Excluded by filters or missing content",script)
+        self.assertIn("Excluded before AI",script)
         self.assertIn("Pending jobs",script)
         self.assertIn("Matching Details",page)
         self.assertIn("Eligibility: ",script)
@@ -414,6 +414,17 @@ class WorkflowOrchestratorTests(unittest.TestCase):
                      "Use saved preferences","Use prompt preferences for this workflow only","Edit saved preferences",
                      "Continue with requested prompt preferences"):
             self.assertIn(text,workflow.WORKFLOW_PAGE)
+
+    def test_matching_dashboard_counts_selected_jobs_and_shows_checkpoint_diagnostics(self):
+        with workflow.database() as db:
+            db.execute("UPDATE user_workflows SET job_keys_json=?,discovered_count=2 WHERE workflow_id='wf-test'",
+                       (json.dumps(["job-1","job-2"]),))
+        item=workflow._serialize(workflow._row("wf-test"))
+        self.assertEqual(item["outcome_counts"]["selected"],2)
+        self.assertEqual(item["outcome_counts"]["pending"],2)
+        for marker in ("Selected for matching","Excluded before AI","Analyzed successfully",
+                       "last_successful_checkpoint","current_job"):
+            self.assertIn(marker,workflow.WORKFLOW_PAGE)
 
     def test_legacy_clarification_recomputes_and_exposes_resolvable_current_conflicts(self):
         prompt="Find full-time new-graduate jobs in the United States; exclude internships and senior positions."
@@ -655,6 +666,20 @@ class WorkflowOrchestratorTests(unittest.TestCase):
         self.assertTrue(outcome["retryable"])
         self.assertIn("Timeout",outcome["reason"])
         self.assertFalse(outcome["pending"])
+
+    def test_old_completed_match_is_labeled_stale_and_retryable_without_discovery(self):
+        description="This software engineer role describes required qualifications, professional responsibilities, technical skills, candidate requirements, education expectations, preferred experience, team collaboration, product responsibilities, and the detailed day-to-day scope of the position. Candidates work with engineering teams to design, build, test, and maintain production software systems."
+        with workflow.database() as db:
+            db.execute("CREATE TABLE discovered_openings(user_id TEXT,job_key TEXT,company TEXT,title TEXT,description TEXT,description_source TEXT,description_error TEXT)")
+            db.execute("CREATE TABLE job_match_results(user_id TEXT,job_key TEXT,resume_id TEXT,status TEXT,classification TEXT,freshness_status TEXT,matching_model_version TEXT,updated_at TEXT,error TEXT,result_json TEXT)")
+            db.execute("INSERT INTO discovered_openings VALUES(?,?,?,?,?,?,?)",(workflow.USER,"public_html:verified:old","Example","Engineer",description,"company_site",""))
+            db.execute("INSERT INTO job_match_results VALUES(?,?,?,?,?,?,?,?,?,?)",(workflow.USER,"public_html:verified:old","resume-1","completed","needs_review","stale","ollama:old/job-match-v2","old","",json.dumps({"explanation":"Historical result retained."})))
+        outcome=workflow._job_outcomes({"job_keys":["public_html:verified:old"],"resume_id":"resume-1","diagnostics":{}})[0]
+        self.assertTrue(outcome["stale"])
+        self.assertTrue(outcome["retryable"])
+        self.assertTrue(outcome["pending"])
+        self.assertFalse(outcome["analyzed"])
+        self.assertEqual(outcome["reason"],"Historical result retained.")
 
 
 if __name__=="__main__":unittest.main()

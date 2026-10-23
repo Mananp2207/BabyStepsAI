@@ -594,6 +594,7 @@ textarea {
     box-sizing: border-box;
     font: 13px monospace;
 }
+textarea[aria-invalid="true"]{border:2px solid #b42318;box-shadow:0 0 0 3px #b4231822}.save-success{color:#137451}.save-error{color:#a3261d}
 li {
     margin: 12px 0;
 }
@@ -642,7 +643,7 @@ li {
 <div class="panel">
     <h2>AI Candidate Profile</h2>
 
-    <p id="profile-status" role="status">
+    <p id="profile-status" role="status" aria-live="polite">
         Upload a resume to get started.
     </p>
 
@@ -807,10 +808,11 @@ document.getElementById("upload").onsubmit = async event => {
 };
 
 save.onclick = async () => {
+    save.disabled=true;save.setAttribute("aria-busy","true");editor.removeAttribute("aria-invalid");pstatus.className="";
     try {
         const profile = JSON.parse(editor.value);
 
-        await request(
+        const saved=await request(
             "/resumes/" + encodeURIComponent(selected)
             + "/profile",
             {
@@ -821,14 +823,21 @@ save.onclick = async () => {
                 body: JSON.stringify(profile)
             }
         );
-
-        await loadProfile();
-        pstatus.textContent = "Corrections saved.";
+        if(saved.status!=="user_reviewed")throw new Error("The server did not confirm the profile save.");
+        const persisted=await request("/resumes/"+encodeURIComponent(selected)+"/profile");
+        const canonical=value=>Array.isArray(value)?"["+value.map(canonical).join(",")+"]":value&&typeof value==="object"?"{"+Object.keys(value).sort().map(k=>JSON.stringify(k)+":"+canonical(value[k])).join(",")+"}":JSON.stringify(value);
+        if(persisted.status!=="user_reviewed"||canonical(persisted.profile)!==canonical(profile))throw new Error("The saved profile could not be verified. No success confirmation was shown.");
+        editor.value=JSON.stringify(persisted.profile,null,2);
+        pstatus.className="save-success";pstatus.textContent="Profile corrections saved and verified.";
         await refresh();
+        pstatus.className="save-success";pstatus.textContent="Profile corrections saved and verified.";
 
     } catch (error) {
-        pstatus.textContent =
+        pstatus.className="save-error";pstatus.textContent =
             "Save failed: " + error.message;
+        editor.setAttribute("aria-invalid","true");editor.focus();
+    } finally {
+        save.disabled=false;save.removeAttribute("aria-busy");
     }
 };
 

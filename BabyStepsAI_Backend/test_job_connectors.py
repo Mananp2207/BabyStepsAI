@@ -85,6 +85,119 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual(records, [])
         self.assertIn("universal", error)
 
+    def test_direct_public_job_import_supports_structured_provider_pages(self):
+        cases = [
+            ("https://boards.greenhouse.io/acme/jobs/123", "greenhouse", "acme", "123"),
+            ("https://jobs.lever.co/acme/abc-123", "lever", "acme", "abc-123"),
+            ("https://jobs.ashbyhq.com/acme/abc-123", "ashby", "acme", "abc-123"),
+            ("https://careers.smartrecruiters.com/acme/123", "smartrecruiters", "acme", "123"),
+            ("https://jobs.smartrecruiters.com/Acme/123/SoftwareEngineer", "smartrecruiters", "Acme", "SoftwareEngineer"),
+            ("https://acme.wd5.myworkdayjobs.com/External/job/Remote/Software-Engineer_R123", "workday", "acme.wd5.myworkdayjobs.com", "R123"),
+            ("https://careers.acme.example/jobs/abc", "public_html", "careers.acme.example", "https://careers.acme.example/jobs/abc"),
+        ]
+        for url, provider, token, identity in cases:
+            with self.subTest(provider=provider):
+                html = '''<script type="application/ld+json">{"@type":"JobPosting","title":"New Graduate Software Engineer","identifier":{"value":"R123"},"description":"Requirements: Bachelor's degree and 0 years of professional experience.","hiringOrganization":{"@type":"Organization","name":"Acme Systems"},"jobLocation":{"address":{"addressLocality":"Seattle","addressRegion":"WA","addressCountry":"US"}},"employmentType":"FULL_TIME","datePosted":"2026-10-01","url":"%s","applicationUrl":"%s","validThrough":"2027-10-01"}</script>''' % (url, url)
+                def getter(target, **_kwargs):
+                    return SimpleNamespace(status_code=404, headers={}, content=b"", text="", url=target,
+                                           raise_for_status=lambda: None) if target.endswith("/robots.txt") else SimpleNamespace(
+                        status_code=200, headers={}, content=html.encode(), text=html, url=target,
+                        raise_for_status=lambda: None)
+                with patch.object(connectors, "validate_public_https_url", side_effect=lambda value, **_kwargs: value):
+                    detail, error = connectors.fetch_public_job_url(url, getter=getter)
+                self.assertIsNone(error)
+                self.assertEqual(detail["provider"], provider)
+                self.assertEqual(detail["source_token"], token)
+                self.assertEqual(detail["employer"], "Acme Systems")
+                self.assertEqual(detail["title"], "New Graduate Software Engineer")
+                self.assertEqual(detail["employment_type"], "FULL_TIME")
+                self.assertEqual(detail["country"], "US")
+                self.assertTrue(detail["description"])
+                if provider in {"greenhouse", "lever", "ashby", "workday"}:
+                    self.assertEqual(detail["id"], identity)
+                if provider == "smartrecruiters":
+                    self.assertEqual(detail["id"], "R123")
+
+    def test_direct_job_import_rejects_private_url_and_unsafe_redirect(self):
+        with self.assertRaises(ValueError):
+            connectors.validate_public_https_url("https://127.0.0.1/jobs/1", resolve=False)
+        redirect = SimpleNamespace(status_code=302, headers={"Location": "http://127.0.0.1/private"})
+        with self.assertRaises(ValueError):
+            connectors._safe_get("https://careers.example/jobs/1", getter=Mock(return_value=redirect), trusted_initial=True)
+
+    def test_direct_workday_import_is_limited_to_public_structured_postings(self):
+        url="https://tenant.wd1.myworkdayjobs.com/en-US/External/job/Seattle/Engineer_R42"
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(result)
+        self.assertIn("Unsupported Workday public page layout",error)
+
+    def test_workday_public_metadata_identifies_explicit_employer_without_jsonld(self):
+        url="https://tenant.wd5.myworkdayjobs.com/External/job/Seattle/Engineer_R884"
+        page='''<meta property="og:site_name" content="Adobe Careers"><meta property="og:title" content="Software Engineer I | Adobe Careers"><div data-automation-id="jobPostingHeader">Software Engineer I</div><div data-automation-id="jobPostingLocation">Seattle, WA</div><div data-automation-id="jobPostingDescription">Build reliable software. Required: Computer Science degree.</div>'''
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["provider"],"workday")
+        self.assertEqual(result["id"],"R884")
+        self.assertEqual(result["employer"],"Adobe Careers")
+        self.assertEqual(result["employer_identity_source"],"workday_og_site_name")
+        self.assertEqual(result["title"],"Software Engineer I")
+        self.assertIn("Required",result["description"])
+
+    def test_workday_missing_employer_metadata_stays_unresolved(self):
+        url="https://tenant.wd5.myworkdayjobs.com/External/job/Remote/Engineer_R885"
+        page='''<script type="application/ld+json">{"@type":"JobPosting","title":"Software Engineer","description":"Build software"}</script>'''
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["employer"],"")
+        self.assertEqual(result["employer_identity_source"],"unavailable")
+
+    def test_public_job_import_reports_expired_posting(self):
+        url="https://jobs.lever.co/acme/expired"
+        page='''<script type="application/ld+json">{"@type":"JobPosting","title":"Software Engineer","description":"Build software","hiringOrganization":{"name":"Acme"},"validThrough":"2000-01-01","url":"%s"}</script>''' % url
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(result)
+        self.assertIn("expired",error)
+
+    def test_direct_public_import_reports_unsupported_provider_layout(self):
+        url="https://tenant.wd5.myworkdayjobs.com/External/job/Remote/Engineering"
+        page="<html><body>Careers</body></html>"
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(result)
+        self.assertIn("Unsupported Workday public page layout",error)
+        self.assertIn("JavaScript rendering is not attempted",error)
+
+    def test_direct_import_uses_official_posting_page_as_entry_when_no_apply_url_is_published(self):
+        url="https://careers.acme.example/jobs/entry-7"
+        page='''<script type="application/ld+json">{"@type":"https://schema.org/JobPosting","title":"Software Engineer I","identifier":{"value":"entry-7"},"description":"Build software with a team.","hiringOrganization":{"name":"Acme Systems"},"url":"%s"}</script>''' % url
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            detail,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(detail["application_url"],url)
+        self.assertEqual(detail["application_url_source"],"official_posting_page")
+
     def test_live_source_registration_requires_successful_validation_before_activation(self):
         response = discovery.import_employers(discovery.EmployerImportRequest(sources=[
             discovery.EmployerImportItem(name="Pending", source_type="ashby", source_token="verified-token")]),

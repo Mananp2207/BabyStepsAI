@@ -1,6 +1,8 @@
 import unittest
 
 from ui_theme import apply_ui_theme
+from job_search_agent import PAGE
+import candidate_verification
 
 
 class UIThemeTests(unittest.TestCase):
@@ -16,6 +18,27 @@ class UIThemeTests(unittest.TestCase):
     def test_theme_injection_is_idempotent(self):
         once=apply_ui_theme('<html><head></head><body></body></html>')
         self.assertEqual(apply_ui_theme(once),once)
+
+    def test_profile_component_theme_selectors_do_not_skip_shared_controller(self):
+        page=apply_ui_theme(candidate_verification.PROFILE_PAGE)
+        self.assertIn('html[data-bsa-theme="dark"] .chip',page)
+        self.assertIn('class="bsa-theme-toggle"',page)
+        self.assertIn('id="bsa-theme-controller"',page)
+
+    def test_find_jobs_import_panel_has_light_and_dark_contrast_rules(self):
+        page=apply_ui_theme(PAGE)
+        self.assertIn('<main class="panel">',page)
+        self.assertIn('class="import-panel"',page)
+        self.assertIn(':root{color-scheme:light',page)
+        self.assertIn('--bsa-surface:#fff',page)
+        self.assertIn('html[data-bsa-theme="dark"] main',page)
+        self.assertIn('html[data-bsa-theme="dark"] label',page)
+        self.assertIn('html[data-bsa-theme="dark"] input',page)
+        self.assertIn('html[data-bsa-theme="dark"] .diagnostics',page)
+        self.assertIn('html[data-bsa-theme="dark"] .error',page)
+        self.assertIn('html[data-bsa-theme="dark"] hr',page)
+        self.assertIn('id="jobUrl"',page)
+        self.assertIn('id="importJob"',page)
 
 
 if __name__=='__main__': unittest.main()

@@ -58,7 +58,8 @@ CLEARLY_UNRELATED = re.compile(
     r"business development|sales development|recruiter|talent acquisition|customer success manager|"
     r"sales manager|sales representative|account manager|sales engineer|solutions engineer|"
     r"customer engineer|customer success engineer|marketing specialist|financial analyst|"
-    r"administrative assistant)\b", re.I
+    r"administrative assistant|cybersecurity analyst|cyber security analyst|security researcher|"
+    r"security research|red team|penetration tester)\b", re.I
 )
 COUNTRY_ALIASES = {
     "united states": ("united states", "usa", "u.s.a.", "u.s."),
@@ -87,6 +88,7 @@ US_STATES = {
     "virginia": "va", "washington": "wa", "west virginia": "wv", "wisconsin": "wi", "wyoming": "wy",
     "district of columbia": "dc",
 }
+US_STATE_NAMES_BY_ABBREVIATION = {abbreviation: name for name, abbreviation in US_STATES.items()}
 US_CITY_STATE = re.compile(
     r"\b(austin|dallas|houston|san antonio|new york|new york city|los angeles|san francisco|"
     r"san diego|seattle|boston|chicago|atlanta|denver|miami|portland|phoenix|detroit|"
@@ -108,11 +110,40 @@ def normalize_text(value):
     return re.sub(r"[^a-z0-9+#]+", " ", str(value or "").casefold()).strip()
 
 
+def _arrangement(value):
+    text=normalize_text(value)
+    if re.search(r"\b(remote|work from home|telecommut(?:e|ing))\b",text):return "Remote"
+    if re.search(r"\bhybrid\b",text):return "Hybrid"
+    if re.search(r"\b(on site|onsite|in office|in person|office based)\b",text):return "On-site"
+    return ""
+
+
+def _arrangement_only(value):
+    text=normalize_text(value)
+    return bool(text and re.fullmatch(r"(?:remote|work from home|telecommute|telecommuting|hybrid|on site|onsite|in office|in person|office based)",text))
+
+
+def _employment_type(value):
+    """Keep contract/time classifications separate from workplace arrangement."""
+    text=normalize_text(value)
+    if not text or _arrangement_only(text):return ""
+    if re.search(r"\b(intern|internship|co op|coop)\b",text):return "Internship"
+    if re.search(r"\b(part time|parttime)\b",text):return "Part-time"
+    if re.search(r"\b(full time|fulltime)\b",text):return "Full-time"
+    if re.search(r"\b(contract|contractor)\b",text):return "Contract"
+    if re.search(r"\b(temporary|temp)\b",text):return "Temporary"
+    if re.search(r"\b(freelance|freelancer)\b",text):return "Freelance"
+    return ""
+
+
 def normalize_job_record(record, source="unknown", company=None, job_key=None):
     """Adapt connector-specific posting fields to the shared job record shape."""
     location = record.get("location")
     if isinstance(location, dict):
         location = location.get("name", "")
+    raw_employment=record.get("employment_type") or record.get("employmentType")
+    raw_arrangement=(record.get("work_arrangement") or record.get("workplaceType") or
+                     record.get("workplace_type") or record.get("locationType") or "")
     metadata = record.get("metadata") if isinstance(record.get("metadata"), list) else []
     metadata_employment = " ".join(
         str(item.get("value", "")) for item in metadata
@@ -122,7 +153,16 @@ def normalize_job_record(record, source="unknown", company=None, job_key=None):
         str(item.get("value", "")) for item in metadata
         if isinstance(item, dict) and any(term in str(item.get("name", "")).casefold()
                                           for term in ("location", "country", "state", "office", "region"))
+        and not _arrangement_only(item.get("value", ""))
     )
+    if not raw_employment and metadata_employment:raw_employment=metadata_employment
+    if not raw_arrangement:
+        raw_arrangement=next((item.get("value") for item in metadata if isinstance(item,dict) and
+            any(term in str(item.get("name","")).casefold() for term in ("workplace","work arrangement","remote","onsite"))),"")
+    if _arrangement_only(location):
+        raw_arrangement=raw_arrangement or location
+        location=""
+    raw_arrangement=raw_arrangement or raw_employment
     return {
         "source": source,
         "external_id": str(record.get("id") or record.get("external_id") or ""),
@@ -134,8 +174,8 @@ def normalize_job_record(record, source="unknown", company=None, job_key=None):
         "metadata_location": metadata_location,
         "locations": record.get("locations") or record.get("offices") or [],
         "url": str(record.get("url") or record.get("absolute_url") or record.get("apply_url") or ""),
-        "employment_type": str(record.get("employment_type") or record.get("employmentType") or metadata_employment),
-        "work_arrangement": str(record.get("work_arrangement") or ""),
+        "employment_type": _employment_type(raw_employment),
+        "work_arrangement": _arrangement(raw_arrangement),
         "metadata": metadata,
     }
 
@@ -173,6 +213,21 @@ def relevance_for_job(job, preferences, prompt=""):
     """
     title = str(job.get("title", ""))
     description = str(job.get("description") or job.get("content") or "")
+    # Explicitly commercial or non-target roles are filtered before a broad
+    # technical keyword elsewhere in the description can make them appear relevant.
+    if CLEARLY_UNRELATED.search(title):
+        # Explicitly different job families stay out of a broad technical
+        # search, while a user who selected that role family can search it.
+        selected_roles = [normalize_text(role) for role in preferences.get("roles", [])
+                          if isinstance(role, str) and role.strip()]
+        selected_categories = category_names(preferences)
+        normalized_title = normalize_text(title)
+        explicitly_selected = any(role and role in normalized_title for role in selected_roles)
+        cybersecurity_title = bool(re.search(r"\b(cybersecurity|cyber security|security research|red team|penetration test)\b", title, re.I))
+        if cybersecurity_title and ("cybersecurity" in selected_categories or any("security" in role for role in selected_roles)):
+            explicitly_selected = True
+        if not explicitly_selected:
+            return False, "unrelated_role", {"basis":"unrelated_title","matched_aliases":[]}
     aliases = role_aliases(preferences)
     if not aliases:
         prompt_prefs = {"roles": [], "categories": []}
@@ -196,14 +251,22 @@ def relevance_for_job(job, preferences, prompt=""):
     if exact:
         return True, None, {"basis": "title_alias", "matched_aliases": exact}
 
-    if CLEARLY_UNRELATED.search(title):
-        return False, "unrelated_role", {"basis": "unrelated_title", "matched_aliases": []}
-
+    description_norm=normalize_text(description)
+    described=[alias for alias,normalized in normalized_aliases if normalized and normalized in description_norm]
+    if described:
+        return True, "role evidence appears in the description; title is ambiguous", {
+            "basis":"description_alias","matched_aliases":described}
+    # Preserve generic technical titles for review rather than treating an
+    # incomplete title as proof that the role is unrelated.
+    if re.search(r"\b(engineer|developer|programmer|software|technology|technical)\b",title,re.I):
+        return True, "technical role title is ambiguous and needs review", {
+            "basis":"ambiguous_title","matched_aliases":[]}
     return False, "unrelated_role", {"basis": "no_selected_role_evidence", "matched_aliases": []}
 
 
 def _location_values(job):
-    values = [job.get("location", ""), job.get("metadata_location", ""), job.get("title", "")]
+    values = [job.get("location", ""), job.get("metadata_location", "")]
+    values=[value for value in values if not _arrangement_only(value)]
     extras = job.get("locations") or []
     if isinstance(extras, (list, tuple)):
         for item in extras:
@@ -215,7 +278,7 @@ def _location_values(job):
         values.extend(str(item.get("value", "")) for item in metadata if isinstance(item, dict)
                       and any(term in str(item.get("name", "")).casefold()
                               for term in ("location", "country", "state", "office", "region")))
-    return [str(value).strip() for value in values if value]
+    return [str(value).strip() for value in values if value and not _arrangement_only(value)]
 
 
 def _contains_alias(text, alias):
@@ -253,6 +316,19 @@ def _country_hits(values):
     return hits
 
 
+def _state_hits(values, *, allow_bare_abbreviation=False):
+    text=" | ".join(str(value or "") for value in values)
+    hits=set()
+    for name,abbreviation in US_STATES.items():
+        if _contains_alias(text,name):
+            hits.add(name)
+        if re.search(r"(?:,|\b)\s*"+re.escape(abbreviation)+r"\s*(?:,|\b|$)",text,re.I):
+            hits.add(name)
+        if allow_bare_abbreviation and normalize_text(text)==abbreviation:
+            hits.add(name)
+    return hits
+
+
 def evaluate_location(job, requested_location):
     """Return eligible/mismatch/unknown from explicit location evidence.
 
@@ -267,6 +343,17 @@ def evaluate_location(job, requested_location):
     text = " | ".join(values)
     countries = _country_hits(values)
     description = str(job.get("description") or job.get("content") or "")
+    target_states=_state_hits([requested_location],allow_bare_abbreviation=True)
+    if target_states:
+        posting_states=_state_hits(values)
+        matching=target_states & posting_states
+        if matching:
+            state=sorted(matching)[0].title()
+            return "eligible", f"Explicit posting location matches {state}."
+        if posting_states:
+            states=", ".join(sorted(item.title() for item in posting_states))
+            return "mismatch", f"Posting location indicates {states}, not the selected state preference."
+        return "unknown", f"A {', '.join(sorted(x.title() for x in target_states))} preference is saved, but the posting does not identify a state."
     target_country = next((country for country, aliases in COUNTRY_ALIASES.items()
                            if target == country or target in aliases), None)
     if target_country:
@@ -414,14 +501,24 @@ def extract_experience_requirements(description):
 def extract_graduation_windows(description):
     """Return explicit employer graduation windows as evidence, without inferring eligibility."""
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
+    month_names=r"January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?"
+    month_numbers={"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12}
+    month_pattern=re.compile(rf"\b(?:graduate|graduating|graduated)\s+(?:(?:in|by)\s+)?({month_names})\s+(20\d{{2}})\b",re.I)
+    windows=[]
+    for match in month_pattern.finditer(text):
+        month=month_numbers[match.group(1)[:3].casefold()]
+        item={"start_year":int(match.group(2)),"end_year":int(match.group(2)),
+              "start_month":month,"end_month":month,"requirement":match.group(0)}
+        if item not in windows:windows.append(item)
     patterns = (
         re.compile(r"\b(?:class(?:es)? of|graduat(?:e|ing) in)\s+(20\d{2})(?:\s*(?:-|–|to|or)\s*(20\d{2}))?\b", re.I),
         re.compile(r"\bmust (?:have )?graduat(?:e|ed) between\s+(20\d{2})\s+and\s+(20\d{2})\b", re.I),
+        re.compile(r"\bmust have graduated by\s+(20\d{2})\b", re.I),
+        re.compile(r"\bgraduat(?:e|ed) no later than\s+(20\d{2})\b", re.I),
     )
-    windows = []
-    for pattern in patterns:
+    for index,pattern in enumerate(patterns):
         for match in pattern.finditer(text):
-            start, end = match.group(1), match.group(2) or match.group(1)
+            start, end = ("1900",match.group(1)) if index>=2 else (match.group(1), match.group(2) or match.group(1))
             item = {"start_year": int(start), "end_year": int(end), "requirement": match.group(0)}
             if item not in windows:
                 windows.append(item)
@@ -432,7 +529,7 @@ def extract_education_requirements(description):
     """Extract degree evidence into required/preferred/unclear buckets."""
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
     degree = re.compile(r"\b(?:bachelor(?:'s)?|master(?:'s)?|doctoral?|ph\.?d\.?|b\.?s\.?|b\.?a\.?|m\.?s\.?|m\.?a\.?|degree)\b", re.I)
-    headings = re.compile(r"\b(?:nice to have|bonus points|preferred qualifications|preferred experience|requirements|required qualifications|minimum qualifications|basic qualifications)", re.I)
+    headings = re.compile(r"\b(?:nice to have|bonus points|preferred qualifications|preferred experience|requirements|required qualifications|minimum qualifications|basic qualifications|qualifications)", re.I)
     preferred = {"nice to have", "bonus points", "preferred qualifications", "preferred experience"}
     output = {"required": [], "preferred": [], "unclear": []}
     for match in degree.finditer(text):
@@ -447,7 +544,7 @@ def extract_education_requirements(description):
         section = sections[-1] if sections else ""
         if section in preferred:
             bucket = "preferred"
-        elif section in {"requirements", "required qualifications", "minimum qualifications", "basic qualifications"}:
+        elif section in {"requirements", "required qualifications", "minimum qualifications", "basic qualifications", "qualifications"}:
             bucket = "required"
         elif re.search(r"\b(?:required|must have|minimum)\b", sentence, re.I):
             bucket = "required"
@@ -481,15 +578,14 @@ def classify_experience_level(title, description="", employment_type=""):
     reasons = []
     if re.search(r"\b(intern|internship)\b", combined, re.I):
         return "Internship", ["Title or employment metadata identifies an internship."]
-    if re.search(r"\b(new\s*grad|new graduate|university graduate|graduate program|rotational)\b", combined, re.I):
+    if re.search(r"\b(senior|staff|principal|lead|director|manager|vp|head of)\b", title_text, re.I):
+        return "Senior", ["Title identifies a senior or leadership role."]
+    if re.search(r"\b(new\s*grad(?:uate)?|university graduate|university recruiting|university hire|campus recruiting|campus hire|graduate program|rotational(?: engineering)? program)\b", combined, re.I):
         reasons.append("Title identifies a new graduate or graduate program.")
         return "New Graduate", reasons
     if re.search(r"\b(entry[- ]level|junior|associate|early career|graduate software engineer|software engineer i)\b", combined, re.I):
         reasons.append("Title identifies an entry-level or early-career role.")
         return "Early Career", reasons
-    if re.search(r"\b(senior|staff|principal|lead|director|manager|vp|head of)\b", title_text, re.I):
-        reasons.append("Title identifies a senior or leadership role.")
-        return "Senior", reasons
     required = requirements["required"]
     if required:
         lower_bounds = [int(re.match(r"\d+", item["years"]).group()) for item in required]

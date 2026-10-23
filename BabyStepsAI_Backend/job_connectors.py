@@ -290,6 +290,66 @@ class _JsonLdParser(HTMLParser):
                 pass
 
 
+class _WorkdayPublicMetadataParser(HTMLParser):
+    """Read a small allowlist of static, public Workday page metadata."""
+    _CAPTURE_IDS = {"jobPostingHeader": "title", "jobPostingDescription": "description",
+                    "jobPostingLocation": "location"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.metadata = {}
+        self.fields = {"title": [], "description": [], "location": []}
+        self._capture = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.casefold() == "meta":
+            key = (attrs.get("property") or attrs.get("name") or "").casefold()
+            value = (attrs.get("content") or "").strip()
+            if value and key in {"og:site_name", "og:title", "og:description", "description"}:
+                self.metadata[key] = value
+        if tag.casefold() == "link" and (attrs.get("rel") or "").casefold() == "canonical":
+            self.metadata["canonical"] = (attrs.get("href") or "").strip()
+        field = self._CAPTURE_IDS.get(attrs.get("data-automation-id"))
+        if field:
+            self._capture.append((tag.casefold(), field))
+
+    def handle_endtag(self, tag):
+        if self._capture and self._capture[-1][0] == tag.casefold():
+            self._capture.pop()
+
+    def handle_data(self, data):
+        if self._capture:
+            self.fields[self._capture[-1][1]].append(data)
+
+
+def _workday_public_record(document, page_url):
+    """Normalize supported server-rendered Workday markup; never infer tenant name."""
+    parser = _WorkdayPublicMetadataParser()
+    parser.feed(document or "")
+    fields = {key: _plain(" ".join(values)) for key, values in parser.fields.items()}
+    metadata = parser.metadata
+    title = fields["title"] or re.split(r"\s+[|–—]\s+", metadata.get("og:title", ""), maxsplit=1)[0].strip()
+    description = fields["description"] or _plain(metadata.get("og:description") or metadata.get("description") or "")
+    if not title or not description:
+        if title:
+            return None, "Workday public posting was recognized, but its job description is missing from the supported static metadata."
+        if description:
+            return None, "Workday public page exposed description text but no supported job title; the layout is incomplete."
+        return None, "Unsupported Workday public page layout: no supported static job fields or JobPosting JSON-LD were found. JavaScript rendering is not attempted."
+    provider, token, path_id = _job_provider_for_url(page_url)
+    canonical = validate_public_https_url(urljoin(page_url, metadata.get("canonical") or page_url))
+    return {"id": path_id or canonical, "title": title,
+        "employer": metadata.get("og:site_name", "").strip(),
+        "employer_identity_source": "workday_og_site_name" if metadata.get("og:site_name") else "unavailable",
+        "description": description, "location": fields["location"], "country": "",
+        "employment_type": "", "work_arrangement": "", "date_posted": None,
+        "valid_through": None, "url": canonical, "application_url": canonical,
+        "application_url_source": "official_posting_page", "required_qualifications": None,
+        "education_requirements": None, "active": True, "raw": {}, "provider": provider,
+        "source_token": token}, None
+
+
 class _JobLinkParser(HTMLParser):
     """Extract visible, likely posting links without executing page scripts."""
     def __init__(self):
@@ -454,15 +514,199 @@ def _jsonld_jobs(document):
     kind = document.get("@type", [])
     if isinstance(kind, str):
         kind = [kind]
-    if "JobPosting" in kind:
+    if any(str(value).rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1] == "JobPosting" for value in kind):
         output.append(document)
-    for key in ("@graph", "itemListElement"):
-        if isinstance(document.get(key), list):
-            output.extend(_jsonld_jobs(document[key]))
-    nested = document.get("mainEntity")
-    if nested:
-        output.extend(_jsonld_jobs(nested))
+    for key in ("@graph", "itemListElement", "mainEntity", "item", "hasPart"):
+        nested = document.get(key)
+        if nested:
+            output.extend(_jsonld_jobs(nested))
     return output
+
+
+def _job_provider_for_url(url):
+    """Identify only providers whose public posting URL shape is explicit."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host in {"boards.greenhouse.io", "job-boards.greenhouse.io"} and len(parts) >= 3 and parts[1] == "jobs":
+        return "greenhouse", parts[0], parts[2]
+    if host in {"jobs.lever.co", "jobs.eu.lever.co"} and len(parts) >= 2:
+        return "lever", parts[0], parts[1]
+    if host == "jobs.ashbyhq.com" and len(parts) >= 2:
+        return "ashby", parts[0], parts[1]
+    if host in {"careers.smartrecruiters.com", "www.smartrecruiters.com", "jobs.smartrecruiters.com"}:
+        if len(parts) >= 3 and parts[0] == "job":
+            return "smartrecruiters", parts[1], parts[2]
+        if len(parts) >= 2:
+            return "smartrecruiters", parts[0], parts[-1]
+    if host.endswith("myworkdayjobs.com"):
+        # Workday tenants vary in path layout. Keep the observed hostname as
+        # provenance and rely on JobPosting identity; never synthesize an API.
+        identifier = next((part.rsplit("_", 1)[-1] for part in reversed(parts)
+                           if re.search(r"(?:^|_)R\w+$", part, re.I)), "")
+        return "workday", host, identifier
+    return "public_html", host, ""
+
+
+def _jobposting_location(value):
+    locations = value if isinstance(value, list) else [value]
+    labels, countries = [], []
+    for location in locations:
+        if not isinstance(location, dict):
+            continue
+        address = location.get("address") or {}
+        if isinstance(address, str):
+            labels.append(address)
+            continue
+        if not isinstance(address, dict):
+            continue
+        label = ", ".join(str(address.get(key) or "").strip()
+                           for key in ("addressLocality", "addressRegion", "addressCountry")
+                           if str(address.get(key) or "").strip())
+        if label and label not in labels:
+            labels.append(label)
+        country = address.get("addressCountry")
+        if isinstance(country, dict):
+            country = country.get("name") or country.get("@id")
+        if country and str(country) not in countries:
+            countries.append(str(country))
+    return "; ".join(labels), ", ".join(countries)
+
+
+def _jobposting_raw(item, page_url):
+    organization = item.get("hiringOrganization") or {}
+    if isinstance(organization, list):
+        organization = organization[0] if organization else {}
+    if isinstance(organization, str):
+        organization = {"name": organization}
+    if not isinstance(organization, dict):
+        organization = {}
+    identifier = item.get("identifier")
+    if isinstance(identifier, dict):
+        identifier = identifier.get("value") or identifier.get("name")
+    canonical = item.get("url") or page_url
+    canonical = urljoin(page_url, str(canonical))
+    validate_public_https_url(canonical)
+    location, country = _jobposting_location(item.get("jobLocation"))
+    location_type = item.get("jobLocationType") or ""
+    if isinstance(location_type, list):
+        location_type = " ".join(str(value) for value in location_type)
+    location_type = str(location_type).casefold().replace("_", " ")
+    work_arrangement = ("Remote" if "telecommute" in location_type or "remote" in location_type else
+                        "Hybrid" if "hybrid" in location_type else
+                        "On-site" if "onsite" in location_type or "on site" in location_type else "")
+    employment_type = item.get("employmentType") or ""
+    if isinstance(employment_type, list):
+        employment_type = ", ".join(str(value) for value in employment_type)
+    explicit_application_url = item.get("applicationUrl") or item.get("applyUrl") or ""
+    application_url = urljoin(page_url, str(explicit_application_url)) if explicit_application_url else canonical
+    validate_public_https_url(application_url)
+    title = str(item.get("title") or "").strip()
+    description = _plain(item.get("description") or "")
+    if not title:
+        raise ValueError("The public page did not include a job title in structured job data.")
+    organization_url = organization.get("url") or organization.get("sameAs") or ""
+    if isinstance(organization_url, list):
+        organization_url = organization_url[0] if organization_url else ""
+    return {
+        "id": str(identifier or canonical), "title": title,
+        "employer": str(organization.get("name") or "").strip(),
+        "organization_url": urljoin(page_url, str(organization_url)).strip() if organization_url else "",
+        "employer_identity_source": "jobposting_hiring_organization" if organization.get("name") else "unavailable",
+        "description": description, "location": location, "country": country,
+        "employment_type": employment_type, "work_arrangement": work_arrangement,
+        "date_posted": item.get("datePosted"),
+        "valid_through": item.get("validThrough"), "url": canonical,
+        "application_url": application_url,
+        "application_url_source": "structured_application_url" if explicit_application_url else "official_posting_page",
+        "required_qualifications": item.get("qualifications") or item.get("experienceRequirements"),
+        "education_requirements": item.get("educationRequirements"),
+        "active": not bool(item.get("validThrough") and _posting_is_expired(item.get("validThrough"))),
+        "raw": item,
+    }
+
+
+def _posting_is_expired(value):
+    try:
+        expires = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= datetime.now(timezone.utc)
+    except (TypeError, ValueError):
+        return False
+
+
+def fetch_public_job_url(url: str, getter=None):
+    """Read one public job posting without executing scripts or submitting forms.
+
+    This deliberately supports structured JobPosting pages across providers.
+    Workday support is limited to JobPosting JSON-LD and an allowlist of
+    server-rendered public fields. It does not render JavaScript or call
+    tenant-specific/private APIs.
+    """
+    getter = getter or requests.get
+    try:
+        safe_url = canonicalize_job_url(validate_public_https_url(url))
+        allowed, reason = _robots_allow(safe_url, getter)
+        if not allowed:
+            return None, reason or "The posting is disallowed by robots.txt."
+        response = _safe_get(safe_url, getter=getter, timeout=REQUEST_TIMEOUT,
+                             headers={"Accept": "text/html,application/xhtml+xml", "User-Agent": "BabyStepsAI public job reader"})
+        status = getattr(response, "status_code", 200)
+        if status in {401, 403}:
+            return None, "The employer page requires authentication or restricts public access."
+        if status == 410:
+            return None, "The employer reports that this job posting is expired or permanently removed."
+        if status == 404:
+            return None, "The public job posting was not found; it may have expired or the URL may be incorrect."
+        response.raise_for_status()
+        body = getattr(response, "content", b"")
+        if len(body) > MAX_RESPONSE_BYTES:
+            return None, "The job page exceeded the configured response size limit."
+        final_url = getattr(response, "url", "") or safe_url
+        final_url = validate_public_https_url(final_url)
+        parser = _JsonLdParser()
+        parser.feed(getattr(response, "text", "") or "")
+        jobs = []
+        for document in parser.documents:
+            jobs.extend(_jsonld_jobs(document))
+        if not jobs:
+            provider, _, _ = _job_provider_for_url(final_url)
+            if provider == "workday":
+                record, reason = _workday_public_record(getattr(response, "text", "") or "", final_url)
+                if record:
+                    return record, None
+                return None, reason
+            return None, "No supported public JobPosting structured data was found on this page."
+        original = canonicalize_job_url(safe_url)
+        match = next((item for item in jobs if canonicalize_job_url(urljoin(final_url, str(item.get("url") or final_url))) == original), None)
+        item = match or (jobs[0] if len(jobs) == 1 else None)
+        if item is None:
+            return None, "The page contains multiple job records and none could be matched safely to the supplied URL."
+        result = _jobposting_raw(item, final_url)
+        provider, token, path_id = _job_provider_for_url(final_url)
+        if provider == "workday" and not result.get("employer"):
+            metadata_parser = _WorkdayPublicMetadataParser()
+            metadata_parser.feed(getattr(response, "text", "") or "")
+            site_name = metadata_parser.metadata.get("og:site_name", "").strip()
+            if site_name:
+                result["employer"] = site_name
+                result["employer_identity_source"] = "workday_og_site_name"
+        # Preserve identifiers only when present in the posting or URL. For
+        # generic pages the canonical URL itself is a stable source identifier.
+        if path_id and (provider in {"greenhouse", "lever", "ashby", "workday"} or not item.get("identifier")):
+            result["id"] = path_id
+        result.update(provider=provider, source_token=token, source_url=safe_url,
+                      retrieved_url=final_url, robots_checked=True)
+        if not result.get("active", True):
+            return None, "This job posting is expired according to its published valid-through date."
+        return result, None
+    except requests.Timeout:
+        return None, "The public job page request timed out."
+    except requests.RequestException as exc:
+        return None, _http_failure("Public job page", exc)
+    except (ValueError, TypeError) as exc:
+        return None, f"The job page could not be imported safely: {exc}"
 
 
 def _robots_allow(url, getter=None):
@@ -727,7 +971,7 @@ def normalize_job(source_type: str, source: EmployerSource, raw: dict) -> dict:
         url = raw.get("applyUrl") or raw.get("jobAdUrl") or ""
         posting_date = raw.get("releasedDate") or raw.get("postedDate")
         employment = str(raw.get("typeOfEmployment", {}).get("label", "") if isinstance(raw.get("typeOfEmployment"), dict) else "")
-    elif source_type in {"career_page", "public_html", "sitemap", "rss"}:
+    elif source_type in {"career_page", "public_html", "sitemap", "rss", "workday"}:
         external_id = raw.get("id") or raw.get("url")
         title = raw.get("title")
         loc = _get_path(raw, "location", "name") or ""
@@ -745,7 +989,7 @@ def normalize_job(source_type: str, source: EmployerSource, raw: dict) -> dict:
     address = raw.get("address", {})
     postal = address.get("postalAddress", {}) if isinstance(address, dict) else {}
     country = (postal.get("addressCountry") or raw.get("country") or "") if isinstance(postal, dict) else ""
-    if source_type in {"career_page", "public_html", "sitemap", "rss"}:
+    if source_type in {"career_page", "public_html", "sitemap", "rss", "workday"}:
         country = raw.get("country") or country
     work_arrangement = raw.get("workplaceType") or ("Remote" if raw.get("isRemote") is True else "")
     active = raw.get("status", "").casefold() not in {"closed", "inactive", "expired", "archived"}

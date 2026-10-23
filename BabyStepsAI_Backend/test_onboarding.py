@@ -50,6 +50,22 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["ciphertext"],"");self.assertEqual(row["declined"],1)
         with self.assertRaises(Exception):onboarding.onboarding_state(SimpleNamespace(client=SimpleNamespace(host="192.168.1.10")))
 
+    def test_onboarding_step_progress_is_read_back_from_sqlite(self):
+        saved=onboarding.update_onboarding_step("contact",onboarding.OnboardingStep(completed=True),self.request)
+        self.assertTrue(saved["saved"])
+        state=onboarding.onboarding_state(self.request)
+        self.assertTrue(state["steps"]["contact"])
+
+    def test_onboarding_save_feedback_is_accessible_and_optional_contact_does_not_block(self):
+        page=onboarding.ONBOARDING_PAGE
+        self.assertIn("role=\"status\"",page)
+        self.assertIn("aria-busy",page)
+        self.assertIn("Saved — ",page)
+        self.assertIn("verifyProfileSave",page)
+        self.assertNotIn("Enter your name and email, then confirm both details.",page)
+        self.assertIn("Optional disclosure choice saved and verified securely.",page)
+        self.assertIn("ai_allowed:false",page)
+
     async def test_private_document_upload_validates_signature_and_is_not_public_static(self):
         upload=UploadFile(filename="../../transcript.pdf",file=BytesIO(b"%PDF-valid private content"))
         result=await onboarding.upload_application_document(self.request,"transcript",upload)

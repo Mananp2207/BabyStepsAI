@@ -33,12 +33,44 @@ class CandidateVerificationTests(unittest.TestCase):
         else: os.environ["BABYSTEPSAI_KEY_PATH"] = self.old_key_path
         self.temp.cleanup()
 
+    def test_canonical_matching_facts_normalize_degree_and_exclude_academic_year_inference(self):
+        facts=profile.canonical_verified_candidate_facts({
+            "education_entries":[{"degree":"B.S.","major":"Comp Sci","graduation_year_suggestion":"2024"}],
+            "graduation_year_suggestion":"2024",
+            "experience_entries":[
+                {"job_title":"Software Engineer","start_date":"2022-01","end_date":"2023-01"},
+                {"job_title":"Teaching Assistant","start_date":"2020-01","end_date":"2022-01"},
+                {"job_title":"Software Engineering Intern","start_date":"2021-06","end_date":"2021-09"}],
+            "project_entries":[{"name":"Course project","technologies":["Python"]}],
+            "skills":["Python","required","Preferred"]})
+        self.assertEqual(facts["education"][0]["degree_normalized"],"bachelor")
+        self.assertEqual(facts["education"][0]["major_normalized"],"computer science")
+        self.assertNotIn("graduation_year",facts)
+        self.assertEqual(facts["dated_software_experience_months"],13)
+        self.assertEqual(facts["technical_skills"],["Python"])
+        self.assertEqual(len(facts["teaching_experience"]),1)
+        self.assertEqual(len(facts["internships"]),1)
+
+    def test_canonical_matching_facts_normalize_confirmed_month_and_preserve_enrollment_unknown(self):
+        facts=profile.canonical_verified_candidate_facts({
+            "graduation_year":"2026","graduation_month":"December",
+            "education_entries":[{"degree":"B.S.","major":"Computer Science"}]})
+        self.assertEqual(facts["graduation_month"],"12")
+        self.assertEqual(facts["graduation_date"],"2026-12")
+        self.assertIsNone(facts["education"][0]["currently_enrolled"])
+
     def test_resume_facts_are_suggestions_until_each_field_is_confirmed(self):
         data = profile.get_verification()
         skills = next(x for x in data["fields"] if x["key"] == "technical_skills")
         self.assertEqual(skills["value"], ["Python"])
         self.assertFalse(skills["confirmed"])
         self.assertEqual(skills["source"], "resume_suggestion")
+
+    def test_user_entered_unconfirmed_values_are_not_mislabeled_resume_suggestions(self):
+        profile.update_verification(profile.VerificationUpdate(values={"phone":"555-0100"},confirmed_fields=[]))
+        field=next(x for x in profile.get_verification()["fields"] if x["key"]=="phone")
+        self.assertEqual(field["source"],"user_provided")
+        self.assertFalse(field["confirmed"])
 
     def test_individual_fields_and_sensitive_answers_require_explicit_confirmation(self):
         result = profile.update_verification(profile.VerificationUpdate(
@@ -95,6 +127,143 @@ class CandidateVerificationTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             profile.update_verification(profile.VerificationUpdate(values={"graduation_date":"2026-13"}))
 
+    def test_partial_profile_saves_and_completeness_names_required_items(self):
+        result=profile.update_verification(profile.VerificationUpdate(
+            values={"phone":"555-0100","full_name":"A Candidate"},
+            confirmed_fields=["phone","full_name"]))
+        self.assertTrue(result["saved"])
+        persisted={x["key"]:x for x in profile.get_verification()["fields"]}
+        self.assertEqual(persisted["phone"]["value"],"555-0100")
+        self.assertTrue(persisted["phone"]["confirmed"])
+        summary=profile.profile_completeness()
+        self.assertIn("counts",summary)
+        self.assertEqual(summary["counts"]["missing"],2) # Email and active resume file.
+        self.assertGreater(summary["counts"]["optional"],0)
+        self.assertTrue(any(x["key"]=="email" and x["requiredness"]=="required" for x in summary["attention_items"]))
+        self.assertGreater(len(summary["optional"]),0)
+
+    def test_profile_save_rejects_invalid_value_without_claiming_or_persisting_success(self):
+        from fastapi import HTTPException
+        profile.update_verification(profile.VerificationUpdate(values={"full_name":"Before"},confirmed_fields=["full_name"]))
+        with self.assertRaises(HTTPException):
+            profile.update_verification(profile.VerificationUpdate(values={"linkedin":"javascript:alert(1)"},confirmed_fields=[]))
+        persisted={x["key"]:x for x in profile.get_verification()["fields"]}
+        self.assertEqual(persisted["full_name"]["value"],"Before")
+
+    def test_empty_optional_and_whitespace_values_cannot_be_confirmed(self):
+        profile.update_verification(profile.VerificationUpdate(
+            values={"github":"   ","portfolio":"","technical_skills":["  "]},
+            confirmed_fields=["github","portfolio","technical_skills"]))
+        fields={x["key"]:x for x in profile.get_verification()["fields"]}
+        self.assertFalse(fields["github"]["confirmed"])
+        self.assertFalse(fields["portfolio"]["confirmed"])
+        self.assertFalse(fields["technical_skills"]["confirmed"])
+        self.assertEqual(fields["github"]["value"],"")
+
+    def test_clearing_confirmed_value_revokes_reusable_confirmation(self):
+        profile.update_verification(profile.VerificationUpdate(
+            values={"github":"https://github.com/candidate"},confirmed_fields=["github"]))
+        with profile.connect() as db:
+            self.assertEqual(db.execute("SELECT confirmed FROM application_answers WHERE question_key='github'").fetchone()[0],1)
+        profile.update_verification(profile.VerificationUpdate(values={"github":"  "},confirmed_fields=["github"]))
+        field=next(x for x in profile.get_verification()["fields"] if x["key"]=="github")
+        self.assertEqual(field["value"],"")
+        self.assertFalse(field["confirmed"])
+        with profile.connect() as db:
+            answer=db.execute("SELECT confirmed,revoked_at,auto_reuse FROM application_answers WHERE question_key='github'").fetchone()
+        self.assertEqual(answer["confirmed"],0); self.assertIsNotNone(answer["revoked_at"]); self.assertEqual(answer["auto_reuse"],0)
+
+    def test_legacy_empty_confirmation_is_reconciled_and_reusable_answer_revoked(self):
+        with profile.connect() as db:
+            db.execute("INSERT INTO candidate_verifications VALUES('r1',?,?,?,?)",
+                       (USER,json.dumps({"github":"  "}),json.dumps({"github":True}),"2026-01-01"))
+            db.execute("INSERT INTO application_answers(user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at,auto_reuse) VALUES(?,?,?,?,?,0,1,'now','now',1)",
+                       (USER,"r1","github","GitHub URL","https://github.com/old"))
+        field=next(x for x in profile.get_verification()["fields"] if x["key"]=="github")
+        self.assertFalse(field["confirmed"])
+        with profile.connect() as db:
+            saved=json.loads(db.execute("SELECT confirmed_json FROM candidate_verifications WHERE resume_id='r1'").fetchone()[0])
+            answer=db.execute("SELECT confirmed,revoked_at,auto_reuse FROM application_answers WHERE question_key='github'").fetchone()
+        self.assertFalse(saved["github"])
+        self.assertEqual(answer["confirmed"],0); self.assertIsNotNone(answer["revoked_at"]); self.assertEqual(answer["auto_reuse"],0)
+
+    def test_active_answer_cannot_outlive_a_false_profile_confirmation(self):
+        with profile.connect() as db:
+            db.execute("INSERT INTO candidate_verifications VALUES('r1',?,?,?,?)",
+                       (USER,json.dumps({"github":"https://github.com/candidate"}),json.dumps({"github":False}),"2026-01-01"))
+            db.execute("INSERT INTO application_answers(user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at,auto_reuse) VALUES(?,?,?,?,?,0,1,'now','now',1)",
+                       (USER,"r1","github","GitHub URL","https://github.com/candidate"))
+        profile.get_verification()
+        with profile.connect() as db:
+            answer=db.execute("SELECT confirmed,revoked_at,auto_reuse FROM application_answers WHERE question_key='github'").fetchone()
+        self.assertEqual(answer["confirmed"],0); self.assertIsNotNone(answer["revoked_at"]); self.assertEqual(answer["auto_reuse"],0)
+
+    def test_edits_require_reconfirmation_and_invalid_email_or_urls_are_rejected(self):
+        from fastapi import HTTPException
+        profile.update_verification(profile.VerificationUpdate(values={"github":"https://github.com/old"},confirmed_fields=["github"]))
+        profile.update_verification(profile.VerificationUpdate(values={"github":"https://github.com/new"},confirmed_fields=[]))
+        field=next(x for x in profile.get_verification()["fields"] if x["key"]=="github")
+        self.assertEqual(field["value"],"https://github.com/new"); self.assertFalse(field["confirmed"])
+        with self.assertRaises(HTTPException):
+            profile.update_verification(profile.VerificationUpdate(values={"email":"not-an-email"},confirmed_fields=["email"]))
+        profile.update_verification(profile.VerificationUpdate(values={"email":"person@example.org"},confirmed_fields=["email"]))
+        self.assertTrue(next(x for x in profile.get_verification()["fields"] if x["key"]=="email")["confirmed"])
+        with self.assertRaises(HTTPException):
+            profile.update_verification(profile.VerificationUpdate(values={"github":"http://github.com/person"},confirmed_fields=["github"]))
+
+    def test_blank_structured_entries_and_unknown_sensitive_answers_are_not_confirmed(self):
+        profile.update_verification(profile.VerificationUpdate(values={
+            "education_entries":[{"institution":"","degree":"","major":""}],
+            "country_work_authorizations":[{"country":"United States","status":"Unknown"}],
+            "work_authorization":"Not sure"},confirmed_fields=[
+                "education_entries:0","country_work_authorizations:0","work_authorization"]))
+        fields={x["key"]:x for x in profile.get_verification()["fields"]}
+        self.assertEqual(fields["education_entries"]["entry_confirmed"],[False])
+        self.assertFalse(fields["country_work_authorizations"]["entry_confirmed"][0])
+        self.assertFalse(fields["work_authorization"]["confirmed"])
+
+    def test_skill_duplicates_are_normalized_without_discarding_distinct_values(self):
+        profile.update_verification(profile.VerificationUpdate(values={"skills":[" Python ","python","Type  Script","Type Script"]},confirmed_fields=["skills"]))
+        field=next(x for x in profile.get_verification()["fields"] if x["key"]=="skills")
+        self.assertEqual(field["value"],["Python","Type Script"])
+        self.assertTrue(field["confirmed"])
+
+    def test_profile_ui_has_compact_theme_aware_accessible_responsive_statuses(self):
+        page=profile.PROFILE_PAGE
+        for marker in ["profile-field-row","profile-editor-styles","state-confirmed","state-review",
+                       "state-optional","state-invalid","aria-label",":focus-visible",
+                       "max-width:620px","skill-chips","Optional — Not provided",
+                       "entryHasValue(item)","normalizedSkill","profileDirty","beforeunload",
+                       "attachSkillConfirmation","const refresh=()=>{const current=row.querySelector",
+                       "https://github.com/username","Saving profile…","Profile saved successfully."]:
+            self.assertIn(marker,page)
+        self.assertIn('html[data-bsa-theme="dark"] .chip',page)
+        self.assertIn('html[data-bsa-theme="dark"] .state-confirmed',page)
+
+    def test_completeness_separates_saved_job_requirements_from_profile_missing_fields(self):
+        with profile.connect() as db:
+            db.execute("CREATE TABLE discovered_openings(job_key TEXT PRIMARY KEY,title TEXT,company TEXT)")
+            db.execute("CREATE TABLE job_match_results(job_key TEXT,user_id TEXT,status TEXT,result_json TEXT,updated_at TEXT)")
+            db.execute("INSERT INTO discovered_openings VALUES('job-1','Graduate Engineer','Example Co')")
+            db.execute("INSERT INTO job_match_results VALUES('job-1',?,'completed',?,'2026-01-01')",
+                       (USER,json.dumps({"missing_information":["Confirm graduation month before applying."]})))
+        summary=profile.profile_completeness()
+        self.assertEqual(summary["job_specific"][0]["company"],"Example Co")
+        self.assertEqual(summary["job_specific"][0]["requiredness"],"job-specific")
+        self.assertEqual(summary["job_specific"][0]["key"],"education_entries")
+        self.assertFalse(any(x["requiredness"]=="job-specific" for x in summary["attention_items"]))
+
+    def test_profile_page_has_readback_notification_completeness_and_review_action(self):
+        page=profile.PROFILE_PAGE
+        self.assertIn("Saved — ",page)
+        self.assertIn("Review Missing Information",page)
+        self.assertIn("aria-live=\"polite\"",page)
+        self.assertIn(".invalid-field",page)
+        self.assertIn("aria-invalid",page)
+        self.assertIn("Could not verify the saved value",page)
+        self.assertIn("job-specific requirements",page)
+        self.assertIn("Demographic disclosures are always optional",page)
+
     def test_structured_education_experience_internships_projects_and_skills(self):
         profile.update_verification(profile.VerificationUpdate(values={
             "education_entries":[{"institution":"Example U","degree":"B.S.","major":"Computer Science","graduation_date":"2026-12","gpa":"3.8","currently_enrolled":False}],
@@ -131,9 +300,10 @@ class CandidateVerificationTests(unittest.TestCase):
         self.assertFalse(by_key["education_entries"]["entry_confirmed"][0])
 
     def test_custom_confirmed_answer_can_be_edited_and_revoked(self):
-        profile.save_application_answer("work-sample", profile.AnswerUpdate(
+        saved=profile.save_application_answer("work-sample", profile.AnswerUpdate(
             question="Describe your preferred work sample", answer="A small tested project.", confirmed=True
         ))
+        self.assertTrue(saved["persisted_verified"])
         entries = profile.list_answers()
         self.assertEqual(entries[0]["answer"], "A small tested project.")
         profile.save_application_answer("work-sample", profile.AnswerUpdate(

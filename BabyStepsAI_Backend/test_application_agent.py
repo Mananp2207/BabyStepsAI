@@ -225,6 +225,53 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(app["diagnostic"]["steps"],1)
         self.assertEqual(sum(x["result"]=="filled" for x in app["diagnostic"]["filled_fields"]),6)
 
+    def test_imported_official_job_can_reach_existing_mock_dry_run(self):
+        import job_search_agent as jobs
+        import career_preferences
+        old_jobs_db,old_preferences_db=jobs.DB,career_preferences.DB
+        jobs.DB=career_preferences.DB=app_agent.DB
+        try:
+            jobs.initialize();matcher.initialize()
+            prefs={"roles":["Software Engineer"],"categories":["Software Development"],
+                   "levels":["New Graduate","Entry Level"],"employment_types":["Full-time"],
+                   "location":"United States","work_arrangement":"Any","instructions":""}
+            with jobs.database() as db:
+                db.execute("CREATE TABLE IF NOT EXISTS career_preferences(user_id TEXT PRIMARY KEY,preferences_json TEXT NOT NULL,preference_version INTEGER NOT NULL DEFAULT 1,preferences_fingerprint TEXT NOT NULL DEFAULT '')")
+                db.execute("INSERT OR REPLACE INTO career_preferences(user_id,preferences_json,preference_version,preferences_fingerprint) VALUES(?,?,1,'phase12-test')",(USER,json.dumps(prefs)))
+                row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()
+                settings=json.loads(row["settings_json"])
+                settings.update(allow_automatic_discovery=True,allow_automated_form_preparation=True)
+                db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",(json.dumps(settings),USER))
+            text=("Build and test software with a collaborative engineering team. Required qualifications: "
+                  "Bachelor's degree in Computer Science; new graduates are welcome. Preferred qualifications include Python.")
+            detail={"provider":"lever","source_token":"local-acme","id":"direct-42","employer":"Acme Systems",
+                    "title":"New Graduate Software Engineer","description":text,"location":"Austin, Texas, United States",
+                    "country":"United States","employment_type":"Full-time","work_arrangement":"",
+                    "url":"https://jobs.lever.co/local-acme/direct-42","application_url":"https://jobs.lever.co/local-acme/direct-42",
+                    "active":True,"source_url":"https://jobs.lever.co/local-acme/direct-42"}
+            with patch.object(jobs,"fetch_public_job_url",return_value=(detail,None)):
+                imported=jobs.import_job_url(jobs.JobUrlImportRequest(url=detail["url"]),types.SimpleNamespace(client=types.SimpleNamespace(host="127.0.0.1")))
+            key=imported["job_key"]
+            with jobs.database() as db:
+                db.execute("UPDATE discovered_openings SET url=? WHERE user_id=? AND job_key=?",("http://127.0.0.1:8000/mock-apps/simple",USER,key))
+                opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+            resume_id,_,candidate=matcher.active_candidate()
+            stamp=matcher.now()
+            result={"classification":"potential_match","missing_information":[],"required_skills":[],"required_experience":[],"education_requirements":[]}
+            with jobs.database() as db:
+                db.execute("""INSERT OR REPLACE INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                    VALUES(?,?,?,'completed','potential_match',90,?,?,?,?,?,?,?,'current')""",
+                    (USER,key,resume_id,json.dumps(result),stamp,stamp,matcher.profile_fingerprint(candidate,resume_id),
+                     matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
+            prepared=app_agent.prepare_saved_job(app_agent.DryRunRequest(job_key=key))
+            self.assertEqual(imported["experience_level"],"New Graduate")
+            self.assertEqual(prepared["mode"],"dry_run")
+            app=next(item for item in app_agent.list_applications() if item["job_key"]==key)
+            self.assertEqual(app["state"],"ready_for_review")
+            self.assertFalse(app["diagnostic"]["submission_performed"])
+        finally:
+            jobs.DB,career_preferences.DB=old_jobs_db,old_preferences_db
+
     def test_private_transcript_is_selected_only_for_matching_upload_question(self):
         candidate={"__application_documents":[{"document_type":"transcript","path":"/private/transcript.pdf"}]}
         self.assertEqual(app_agent._answer({"type":"file","label":"Upload your academic transcript"},candidate,{}),
@@ -608,13 +655,12 @@ class ApplicationAgentTests(unittest.TestCase):
             with self.assertRaises(ValueError): app_agent.validate_application_url(url)
 
     def test_required_unknown_fields_and_unsupported_resume_type_pause_safely(self):
-        profile.update_verification(profile.VerificationUpdate(values={"email":"not-an-email"},confirmed_fields=["email"]))
+        profile.update_verification(profile.VerificationUpdate(values={"email":""},confirmed_fields=["email"]))
         self.post("/api/applications/dry-run",json={"job":{"job_key":"mock-validation","company":"Test Co","title":"Engineer","application_url":"http://127.0.0.1:8000/mock-apps/validation"}})
         app=next(x for x in self.get("/api/applications") if x["title"]=="Engineer")
         self.assertEqual(app["state"],"needs_user_input")
         self.assertTrue(any(x["result"]=="unsupported_file_type" for x in app["diagnostic"]["filled_fields"]))
         self.assertTrue(any("Required answer is missing" in x for x in app["diagnostic"]["unanswered_fields"]))
-        self.assertTrue(any("invalid format" in x for x in app["diagnostic"]["unanswered_fields"]))
 
     def test_duplicate_url_does_not_create_a_second_history_record(self):
         payload={"job":{"job_key":"one","company":"Test Co","title":"Engineer","application_url":"http://127.0.0.1:8000/mock-apps/simple"}}

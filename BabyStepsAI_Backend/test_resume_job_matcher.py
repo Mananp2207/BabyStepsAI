@@ -158,7 +158,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
     def test_missing_candidate_information_is_needs_review(self):
         result = matcher.apply_safety_rules(valid_result(), {}, "user_reviewed", {}, {"title": "Software Engineer"})
         self.assertEqual(result.classification, "needs_review")
-        self.assertTrue(any("no verified qualifications" in value for value in result.missing_information))
+        self.assertTrue(any("No verified qualifications" in value for value in result.missing_information))
 
     def test_unverified_profile_is_never_a_potential_match(self):
         profile = {"technical_skills": ["Python"]}
@@ -251,19 +251,199 @@ class ResumeJobMatcherTests(unittest.TestCase):
             requirement="3 years professional experience", status="gap", candidate_evidence=[])])
         preferred_gap = valid_result(preferred_experience=[matcher.SkillEvidence(
             requirement="Experience with Kubernetes preferred", status="preferred", candidate_evidence=[])])
-        required = matcher.apply_safety_rules(required_gap, profile, "user_reviewed", {}, {"title": "Software Engineer"})
-        preferred = matcher.apply_safety_rules(preferred_gap, profile, "user_reviewed", {}, {"title": "Software Engineer"})
+        required = matcher.apply_safety_rules(required_gap, profile, "user_reviewed", {}, {"title": "Software Engineer", "content":"Must have 3 years professional experience."})
+        preferred = matcher.apply_safety_rules(preferred_gap, profile, "user_reviewed", {"roles":["Software Engineer"]}, {"title": "Software Engineer", "content":"Python required. Kubernetes experience preferred."})
         self.assertEqual(required.classification, "needs_review")
-        self.assertEqual(preferred.classification, "potential_match")
+        self.assertEqual(preferred.classification, "needs_review")
+        self.assertTrue(any("Experience level is not clear" in item for item in preferred.missing_information))
+        self.assertEqual(preferred.preferred_experience[0].status,"preferred")
 
-    def test_verified_required_conflict_overrides_high_score(self):
+    def test_unverified_year_claim_does_not_create_hard_experience_mismatch(self):
         mismatch = valid_result(match_score=99, required_experience=[matcher.SkillEvidence(
             requirement="8 years professional experience", status="confirmed_mismatch",
             candidate_evidence=["profile states 2 years"] )])
-        checked = matcher.apply_safety_rules(mismatch, {"work_experience": ["2 years"]}, "user_reviewed", {},
-                                             {"title": "Software Engineer"})
-        self.assertEqual(checked.classification, "not_eligible")
-        self.assertEqual(checked.match_score, 99)
+        checked = matcher.apply_safety_rules(mismatch, {"work_experience": [{"job_title":"Tutor","start_date":"2022-01","end_date":"2024-01"}]}, "user_reviewed", {},
+                                             {"title": "Software Engineer", "content":"Must have 8 years of professional experience."})
+        self.assertEqual(checked.classification, "needs_review")
+        self.assertEqual(checked.required_experience[0].status, "unclear")
+        self.assertIn("8 years", checked.experience_assessment)
+
+    def test_dated_software_experience_shortfall_is_a_mandatory_conflict(self):
+        profile={"technical_skills":["Python"],"work_experience":[{
+            "job_title":"Software Engineer","start_date":"2024-01","end_date":"2025-01",
+            "responsibilities":["Built production software"]}]}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
+            {"title":"Software Engineer","content":"Minimum of 3 years of professional software engineering experience required."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertEqual(result.required_experience[0].status,"confirmed_mismatch")
+        self.assertIn("below the posting's 3-year minimum",result.required_experience[0].candidate_evidence[0])
+
+    def test_tutoring_internships_and_graduation_year_do_not_become_software_experience(self):
+        profile={"graduation_year":"2024","work_experience":[{
+            "job_title":"Software Engineering Intern","employment_type":"Internship",
+            "start_date":"2022-01","end_date":"2024-01"}],
+            "teaching_experience":[{"job_title":"Computer Science Tutor",
+                "start_date":"2021-01","end_date":"2024-01"}]}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
+            {"title":"Software Engineer","content":"Must have 2 years of professional software experience."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.required_experience[0].status,"unclear")
+
+    def test_redacted_regression_fixture_corrects_degree_location_and_placeholder_conflicts(self):
+        # Sanitized representation of the supplied contradictory provider output.
+        bad = valid_result(classification="not_eligible", match_score=93,
+            explanation="The candidate does not have a Bachelor's in Computer Science and the preferred location of California is a mismatch.",
+            education_requirements=[matcher.SkillEvidence(requirement="Bachelor's in Computer Science",status="confirmed_mismatch")],
+            preferred_skills=[matcher.SkillEvidence(requirement="Preferred location: California, United States",status="confirmed_mismatch"),
+                              matcher.SkillEvidence(requirement="required",status="gap")],
+            preferred_experience=[matcher.SkillEvidence(requirement="preferred",status="gap")],
+            location_assessment="California is outside the candidate's location preference.")
+        profile={"education":[{"degree":"B.S.","major":"Comp Sci"}],"location":"California, United States","graduation_year":"2026"}
+        job={"title":"Software Engineer I","location":"San Francisco, CA, United States",
+             "content":"Required qualifications: Bachelor's degree in Computer Science. Full-time role."}
+        result=matcher.apply_safety_rules(bad,profile,"user_reviewed",{"location":"California"},job)
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.education_requirements[0].status,"met")
+        self.assertEqual(result.location_assessment,"Explicit posting location matches California.")
+        self.assertFalse(any(x.requirement.casefold() in {"required","preferred"} for x in result.preferred_skills+result.preferred_experience))
+        self.assertTrue(result.evidence_consistency)
+        self.assertNotIn("does not have a Bachelor's",result.explanation)
+
+    def test_graduation_suggestion_is_not_confirmed_eligibility_evidence(self):
+        profile={"graduation_year_suggestion":"2025","education":[{"degree":"B.S.","graduation_year_suggestion":"2025"}]}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
+            {"title":"New Graduate Software Engineer","content":"Applicants must be Class of 2026."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertTrue(any("confirmed graduation year is unknown" in x for x in result.missing_information))
+
+    def test_deterministic_experience_threshold_survives_ai_denial(self):
+        bad=valid_result(experience_assessment="The posting does not specify an experience requirement.",
+            explanation="No specific years of experience are required by this posting.")
+        result=matcher.apply_safety_rules(bad,{"education":[{"degree":"Bachelor's"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Minimum qualifications: 5 years of professional experience."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertIn("5 years",result.experience_assessment)
+        self.assertTrue(any("AI said experience requirements were absent" in x for x in result.evidence_consistency))
+
+    def test_verified_location_state_and_degree_aliases(self):
+        profile={"education":[{"degree":"Bachelor of Science","major":"Computer Sciences"}],"location":"California"}
+        result=matcher.apply_safety_rules(valid_result(education_requirements=[matcher.SkillEvidence(
+            requirement="Bachelor's degree in Computer Science",status="confirmed_mismatch")]),profile,"user_reviewed",
+            {"location":"California"},{"title":"Engineer","location":"San Diego, CA, United States",
+             "content":"Requirements: Bachelor's degree in Computer Science."})
+        self.assertEqual(result.education_requirements[0].status,"met")
+        self.assertEqual(result.location_assessment,"Explicit posting location matches California.")
+
+    def test_matching_engine_v3_stales_v2_without_deleting_history(self):
+        resume_id,_,profile=matcher.active_candidate();prefs=jobs.preferences();key="greenhouse:cloudflare:42"
+        with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key=?",(key,)).fetchone())
+            stamp=matcher.now()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',60,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,key,resume_id,valid_result().model_dump_json(),stamp,stamp,matcher.profile_fingerprint(profile,resume_id),
+                 matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),"qwen2.5:3b/job-match-v1"))
+        matcher.initialize()
+        with jobs.database() as db:
+            row=db.execute("SELECT freshness_status,result_json FROM job_match_results WHERE job_key=? AND resume_id=?",(key,resume_id)).fetchone()
+        self.assertEqual(row["freshness_status"],"stale")
+        self.assertIsNotNone(row["result_json"])
+        self.assertIn("job-match-v5-education-evidence",matcher.matching_engine_version("ollama","test-model"))
+
+    def test_notion_december_new_grad_uses_verified_education_without_false_mismatch(self):
+        description=("Software Engineer, New Grad (Dec 2026). You must graduate in December 2026 and be able to "
+            "start full-time by January or February 2027. Qualifications: Pursuing a bachelor's or master’s degree "
+            "in computer science, engineering, or another related field. Previous internship experience required.")
+        windows=__import__("job_relevance").extract_graduation_windows(description)
+        self.assertTrue(any(w.get("start_month")==12 and w["start_year"]==2026 for w in windows))
+        facts=canonical=__import__("candidate_verification").canonical_verified_candidate_facts({
+            "graduation_year":"2026","graduation_month":"December",
+            "education":[{"degree":"Bachelor's","major":"Computer Science"}]})
+        result=valid_result(education_requirements=[matcher.SkillEvidence(
+            requirement="Pursuing a bachelor's or master's degree in computer science, engineering, or another related field",
+            status="confirmed_mismatch",candidate_evidence=["Bachelors"])] )
+        checked=matcher.apply_safety_rules(result,facts,"user_reviewed",{"location":"California, United States"},
+            {"title":"Software Engineer, New Grad (Dec 2026)","location":"San Francisco, California, United States",
+             "employment_type":"FULL_TIME","content":description})
+        degree=checked.education_requirements[0]
+        self.assertNotEqual(degree.status,"confirmed_mismatch")
+        self.assertEqual(degree.status,"unclear") # the verified record does not confirm active enrollment
+        self.assertEqual(checked.classification,"needs_review")
+        self.assertIn("current enrollment is not confirmed",checked.education_assessment)
+        self.assertTrue(any("internship" in item.casefold() for item in checked.missing_information))
+        self.assertTrue(any("availability" in item.casefold() for item in checked.missing_information))
+        self.assertFalse(any("graduation" in item.casefold() and "unknown" in item.casefold() for item in checked.missing_information))
+
+    def test_bachelor_or_masters_accepts_verified_bachelors_when_enrolled(self):
+        requirement="Pursuing a bachelor's or master's degree in computer science, engineering, or another related field"
+        status,evidence=matcher._degree_requirement_status(requirement,{
+            "education":[{"degree":"Bachelor's","degree_normalized":"bachelor","major":"Computer Science",
+                          "major_normalized":"computer science","currently_enrolled":True}]})
+        self.assertEqual(status,"met")
+        self.assertTrue(evidence)
+
+    def test_deterministic_reassessment_archives_previous_result_and_updates_engine_summary(self):
+        key="greenhouse:cloudflare:42"
+        description=("Graduate by Dec 2026. Start full time by January/February 2027. "
+                     "Qualifications: Pursuing a bachelor's or master's degree in computer science. Previous internship experience.")
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET description=? WHERE job_key=?",(description,key))
+            stamp=matcher.now()
+            result=valid_result(education_requirements=[matcher.SkillEvidence(
+                requirement="Pursuing a bachelor's or master's degree in computer science",
+                status="confirmed_mismatch",candidate_evidence=["Bachelors"])])
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,
+                result_json,created_at,updated_at,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','not_eligible',35,?,?,?,'ollama:qwen2.5:3b/job-match-v4-education-window','stale')""",
+                (jobs.USER,key,"resume-v1",result.model_dump_json(),stamp,stamp))
+        reassessed=matcher.reassess_saved_match_result(key)
+        self.assertEqual(reassessed["classification"],"needs_review")
+        self.assertEqual(reassessed["freshness_status"],"current")
+        self.assertIn("current enrollment is not confirmed",reassessed["match"]["education_assessment"])
+        self.assertNotEqual(reassessed["match"]["education_requirements"][0]["status"],"confirmed_mismatch")
+        with jobs.database() as db:
+            row=db.execute("SELECT freshness_status,matching_model_version FROM job_match_results WHERE job_key=?",(key,)).fetchone()
+            archived=db.execute("SELECT count(*) FROM job_match_result_history WHERE job_key=?",(key,)).fetchone()[0]
+        self.assertEqual(row["freshness_status"],"current")
+        self.assertEqual(archived,1)
+
+    def test_match_progress_targets_session_containing_requested_job(self):
+        stamp=matcher.now()
+        with jobs.database() as db:
+            for sid,key,updated,status in (("unrelated-paused","other:job","2999-01-01T00:00:00+00:00","paused"),
+                                           ("notion-completed","notion:job","2026-10-22T00:00:00+00:00","completed")):
+                db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                    total_jobs,error,created_at,updated_at) VALUES(?,?,?, ?,?,3,1,NULL,?,?)""",
+                    (sid,jobs.USER,"resume-v1",status,json.dumps([key]),stamp,updated))
+        progress=matcher._progress(job_keys=["notion:job"])
+        self.assertEqual(progress["session_id"],"notion-completed")
+        self.assertEqual(progress["status"],"completed")
+
+    def test_stale_result_is_archived_before_reassessment_requeues_it(self):
+        old_result=valid_result(explanation="Historical evidence assessment.").model_dump_json()
+        stamp=matcher.now()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,
+                match_score,result_json,created_at,updated_at,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',66,?,?,?,'ollama:old/job-match-v2','stale')""",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1",old_result,stamp,stamp))
+        feed=[{"id":42,"title":"Software Engineer I","content":"Python required.",
+               "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+               "location":{"name":"San Francisco, CA, United States"},"company_name":"Cloudflare"}]
+        with patch.object(matcher,"fetch_board",return_value=(feed,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        with jobs.database() as db:
+            history=db.execute("SELECT reason,snapshot_json FROM job_match_result_history WHERE job_key=?",
+                               ("greenhouse:cloudflare:42",)).fetchone()
+            current=db.execute("SELECT status,result_json FROM job_match_results WHERE job_key=?",
+                               ("greenhouse:cloudflare:42",)).fetchone()
+        self.assertTrue(response["session_id"])
+        self.assertEqual(history["reason"],"matching_retry_or_stale_reassessment")
+        self.assertIn("Historical evidence assessment",history["snapshot_json"])
+        self.assertEqual(current["status"],"queued")
+        self.assertIsNone(current["result_json"])
 
     def test_missing_required_graduation_and_education_are_needs_review(self):
         profile = {"technical_skills": ["Python"], "education": [{"degree": "B.S."}]}
@@ -287,6 +467,13 @@ class ResumeJobMatcherTests(unittest.TestCase):
                 matcher.analyze_with_ollama({}, "user_reviewed", {}, {"title": "Role", "content": "Description"})
         self.assertEqual(post.call_count, matcher.OLLAMA_ATTEMPTS)
         self.assertEqual(post.call_args.kwargs["json"]["format"]["type"],"object")
+        self.assertIn(matcher.MATCHING_JSON_REPAIR_INSTRUCTION,
+                      post.call_args_list[1].kwargs["json"]["prompt"])
+
+    def test_schema_failure_error_names_invalid_fields_without_echoing_values(self):
+        with self.assertRaisesRegex(ValueError,"classification.*literal_error.*match_score") as caught:
+            matcher._parse_match_text('{"classification":"private-sentinel", "match_score":999}')
+        self.assertNotIn("private-sentinel",str(caught.exception))
 
     def test_json_parser_recovers_fenced_object_with_surrounding_text(self):
         parsed=matcher._parse_match_text("Here is the result:\n```json\n"+valid_result().model_dump_json()+"\n```\nDone.")
@@ -374,6 +561,20 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(progress["current_job"]["title"],"Software Engineer")
         self.assertEqual(progress["last_progress_at"],heartbeat)
 
+    def test_legacy_paused_session_displays_latest_successful_checkpoint(self):
+        stamp=matcher.datetime.now(matcher.timezone.utc).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,
+                created_at,updated_at) VALUES(?,?,'resume-v1','completed','needs_review',?,?)""",
+                (jobs.USER,"greenhouse:cloudflare:42",stamp,stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,
+                batch_size,total_jobs,created_at,updated_at) VALUES('legacy-checkpoint',?,'resume-v1','paused',?,3,1,?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"]),stamp,stamp))
+        progress=matcher._progress("legacy-checkpoint")
+        self.assertEqual(progress["status"],"paused")
+        self.assertEqual(progress["last_successful_checkpoint"]["title"],"Software Engineer")
+        self.assertFalse(progress["recovery_available"])
+
     def test_progress_offers_recovery_only_for_expired_dead_local_owner(self):
         from datetime import timedelta
         stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
@@ -435,12 +636,12 @@ class ResumeJobMatcherTests(unittest.TestCase):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"response": valid_result().model_dump_json()}
-        job = {"title": "Software Engineer", "content": "Python experience required."}
+        job = {"title": "Software Engineer I", "content": "Python experience required."}
         with patch.object(matcher.requests, "post", return_value=response) as post:
             model_result = matcher.analyze_with_ollama({"technical_skills": ["Python"]}, "user_reviewed", {}, job)
-        final = matcher.apply_safety_rules(model_result, {"technical_skills": ["Python"]}, "user_reviewed", {}, job)
+        final = matcher.apply_safety_rules(model_result, {"technical_skills": ["Python"]}, "user_reviewed", {"roles":["Software Engineer"]}, job)
         self.assertEqual(final.classification, "potential_match")
-        self.assertEqual(final.match_score, 84)
+        self.assertEqual(final.match_score, 74)
         self.assertIn("Python experience required", post.call_args.kwargs["json"]["prompt"])
 
     def test_feed_description_cache_reuses_downloaded_payload(self):

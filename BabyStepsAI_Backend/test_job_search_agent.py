@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 from fastapi import HTTPException
@@ -8,6 +9,7 @@ from fastapi import HTTPException
 import job_search_agent as jobs
 from job_connectors import EmployerSource
 from job_relevance import (evaluate_location, extract_experience_requirements, infer_prompt_preferences,
+                           normalize_job_record, relevance_for_job,
                            apply_prompt_preferences, prompt_constraints)
 
 
@@ -42,6 +44,14 @@ class DiscoveryTests(unittest.TestCase):
         jobs.DB = self.old_db
         self.tempdir.cleanup()
 
+    def test_find_jobs_matching_progress_is_scoped_and_explains_pauses(self):
+        page=jobs.find_jobs_page()
+        if hasattr(page,"body"):page=page.body.decode("utf-8")
+        self.assertIn("matchProgressUrl()",page)
+        self.assertIn("session_id=${encodeURIComponent(currentMatchSessionId)}",page)
+        self.assertIn("Checkpoint saved; Resume continues this session without rediscovery.",page)
+        self.assertIn("const pauseLabel=",page)
+
     @staticmethod
     def prefs(**changes):
         result = {
@@ -61,11 +71,17 @@ class DiscoveryTests(unittest.TestCase):
             return value, None
         return patch.object(jobs, "fetch_board", side_effect=fetch)
 
+    @staticmethod
+    def local_request(host="127.0.0.1"):
+        return SimpleNamespace(client=SimpleNamespace(host=host))
+
     def test_find_jobs_dashboard_exposes_coverage_and_eligibility_filters(self):
         page=jobs.PAGE
         for marker in ("coverageMetrics","filterDiscovery","filterEligibility","filterDescription",
                        "Newly discovered","Previously seen","Confirmed ineligible",
-                       "Failed employer sources","Description missing or too incomplete"):
+                       "Failed employer sources","Description missing or too incomplete",
+                       "Import Job from Company Website","jobUrl","analyzeImport","prepareImport",
+                       "enrichImport","/api/jobs/import-url"):
             self.assertIn(marker,page)
 
     def test_related_software_titles_are_kept_for_review(self):
@@ -77,11 +93,159 @@ class DiscoveryTests(unittest.TestCase):
             self.assertIsNone(reason)
             self.assertTrue(review_reasons, title)
 
+    def test_university_hiring_and_rotation_titles_are_classified_as_early_career(self):
+        for title in ("University Recruiting Software Engineer", "University Graduate Software Engineer",
+                      "Software Engineer I", "Rotational Engineering Program"):
+            with self.subTest(title=title):
+                self.assertIn(jobs.classify_experience_level(title)[0], {"New Graduate", "Early Career"})
+        self.assertEqual(jobs.classify_experience_level("Senior Software Engineer, University Recruiting")[0],"Senior")
+
     def test_saved_job_discovery_requires_explicit_authorization(self):
         with self.assertRaises(HTTPException) as caught:
             jobs.search_jobs(jobs.SearchRequest(prompt="Software Engineer"))
         self.assertEqual(caught.exception.status_code,403)
         self.assertIn("Application settings",caught.exception.detail)
+
+    def test_direct_url_import_is_saved_deduplicated_and_available_to_matching(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",
+                       (jobs.USER,json.dumps({"allow_automatic_discovery":True})))
+        description=("Responsibilities include designing and testing reliable software. Required qualifications: "
+                     "Bachelor's degree in Computer Science or a related field; 0 years of professional experience. "
+                     "Preferred qualifications: experience with Python, Java, or distributed systems. "*4)
+        structured={"provider":"lever","source_token":"acme","id":"posting-123","employer":"Acme Systems",
+            "title":"New Graduate Software Engineer","description":description,"location":"Seattle, WA, US","country":"US",
+            "employment_type":"Full-time","date_posted":"2026-10-01","url":"https://jobs.lever.co/acme/posting-123",
+            "application_url":"https://jobs.lever.co/acme/posting-123","active":True,"retrieved_url":"https://jobs.lever.co/acme/posting-123"}
+        changed={**structured,"description":description+" Additional documented preferred experience: cloud infrastructure."}
+        import resume_job_matcher as matcher
+        matcher.initialize()
+        with patch.object(jobs,"fetch_public_job_url",side_effect=[(structured,None),(structured,None),(changed,None)]):
+            first=jobs.import_job_url(jobs.JobUrlImportRequest(url=structured["url"]),self.local_request())
+            second=jobs.import_job_url(jobs.JobUrlImportRequest(url=structured["url"]),self.local_request())
+            third=jobs.import_job_url(jobs.JobUrlImportRequest(url=structured["url"]),self.local_request())
+        with jobs.database() as db:
+            stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at,freshness_status) VALUES(?,?,?,'completed',?,?, 'current')",
+                       (jobs.USER,first["job_key"],"test-resume",stamp,stamp))
+        changed={**changed,"description":changed["description"]+" Location: Seattle, United States."}
+        with patch.object(jobs,"fetch_public_job_url",return_value=(changed,None)):
+            fourth=jobs.import_job_url(jobs.JobUrlImportRequest(url=structured["url"]),self.local_request())
+        self.assertEqual(first["job_key"],"lever:acme:posting-123")
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertTrue(third["duplicate"])
+        self.assertTrue(fourth["duplicate"])
+        self.assertEqual(first["experience_level"],"New Graduate")
+        self.assertEqual(first["eligibility_classification"],"needs_review")
+        with jobs.database() as db:
+            row=db.execute("SELECT count(*),availability_status,imported_source_url,graduation_windows_json,import_eligibility_status,import_review_json FROM discovered_openings WHERE job_key=?",(first["job_key"],)).fetchone()
+            self.assertEqual(row[0],1)
+            self.assertEqual(row["availability_status"],"current")
+            self.assertEqual(row["imported_source_url"],structured["url"])
+            self.assertEqual(json.loads(row["graduation_windows_json"]),[])
+            self.assertEqual(row["import_eligibility_status"],"needs_review")
+            self.assertTrue(json.loads(row["import_review_json"]))
+        saved=jobs.saved_jobs()["results"]
+        imported=next(item for item in saved if item["job_key"]==first["job_key"])
+        self.assertEqual(imported["eligibility_classification"],"needs_review")
+        self.assertIsInstance(imported["review_reasons"],list)
+        self.assertNotIn("import_review_json",imported)
+        with jobs.database() as db:
+            self.assertEqual(db.execute("SELECT freshness_status FROM job_match_results WHERE job_key=?",(first["job_key"],)).fetchone()[0],"stale")
+        found,error=matcher._find_feed_job(first["job_key"],{})
+        self.assertIsNone(error)
+        self.assertEqual(found["company_name"],"Acme Systems")
+        self.assertEqual(found["content"],changed["description"])
+
+    def test_direct_url_import_requires_discovery_authorization(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",(jobs.USER,json.dumps({"allow_automatic_discovery":False})))
+        with patch.object(jobs,"fetch_public_job_url") as fetch:
+            with self.assertRaises(HTTPException) as caught:
+                jobs.import_job_url(jobs.JobUrlImportRequest(url="https://jobs.lever.co/acme/1"),self.local_request())
+        self.assertEqual(caught.exception.status_code,403)
+        fetch.assert_not_called()
+
+    def test_verified_employer_domains_can_resolve_missing_structured_identity(self):
+        stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO employers(employer_id,name,careers_url,source_type,source_token,website_url,
+                connector_status,discovery_status,last_success_at,active,created_at,updated_at)
+                VALUES('verified-workday:adobe','Adobe','https://adobe.wd5.myworkdayjobs.com/External',
+                'workday','adobe-tenant','https://www.adobe.com','healthy','verified',?,1,?,?)""",(stamp,stamp,stamp))
+            row=db.execute("SELECT * FROM employers WHERE employer_id='verified-workday:adobe'").fetchone()
+            db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",
+                       (jobs._source_fingerprint(dict(row)),row["employer_id"]))
+        self.assertEqual(jobs._verified_registered_employer("https://adobe.wd5.myworkdayjobs.com/External/job/x"),"Adobe")
+        self.assertEqual(jobs._verified_registered_employer("https://unregistered.wd5.myworkdayjobs.com/job/x"),"")
+        self.assertEqual(jobs._verified_registered_employer("https://www.adobe.com"),"Adobe")
+
+    def test_direct_import_uses_only_verified_posting_host_not_untrusted_claimed_domain(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",
+                       (jobs.USER,json.dumps({"allow_automatic_discovery":True})))
+        stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO employers(employer_id,name,careers_url,source_type,source_token,website_url,
+                connector_status,discovery_status,last_success_at,active,created_at,updated_at)
+                VALUES('verified-company:adobe','Adobe','https://careers.adobe.com','public_html','adobe',
+                'https://www.adobe.com','healthy','verified',?,1,?,?)""",(stamp,stamp,stamp))
+            row=db.execute("SELECT * FROM employers WHERE employer_id='verified-company:adobe'").fetchone()
+            db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",
+                       (jobs._source_fingerprint(dict(row)),row["employer_id"]))
+        forged={"provider":"public_html","source_token":"jobs.example.net","id":"1","employer":"",
+            "organization_url":"https://www.adobe.com","title":"Software Engineer","description":"Job details",
+            "url":"https://jobs.example.net/opening/1","retrieved_url":"https://jobs.example.net/opening/1","active":True}
+        with patch.object(jobs,"fetch_public_job_url",return_value=(forged,None)):
+            with self.assertRaises(HTTPException) as caught:
+                jobs.import_job_url(jobs.JobUrlImportRequest(url=forged["url"]),self.local_request())
+        self.assertIn("Employer identity is unavailable",caught.exception.detail)
+
+    def test_direct_workday_import_resolves_verified_registered_tenant(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",
+                       (jobs.USER,json.dumps({"allow_automatic_discovery":True})))
+        stamp=jobs.datetime.now(jobs.timezone.utc).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO employers(employer_id,name,careers_url,source_type,source_token,website_url,
+                connector_status,discovery_status,last_success_at,active,created_at,updated_at)
+                VALUES('verified-workday:adobe','Adobe','https://adobe.wd5.myworkdayjobs.com/External',
+                'workday','adobe-tenant','https://www.adobe.com','healthy','verified',?,1,?,?)""",(stamp,stamp,stamp))
+            row=db.execute("SELECT * FROM employers WHERE employer_id='verified-workday:adobe'").fetchone()
+            db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",
+                       (jobs._source_fingerprint(dict(row)),row["employer_id"]))
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",
+                       (jobs.USER,json.dumps({"allow_automatic_discovery":True})))
+        url="https://adobe.wd5.myworkdayjobs.com/External/job/Seattle/Engineer_R889"
+        detail={"provider":"workday","source_token":"adobe.wd5.myworkdayjobs.com","id":"R889",
+            "employer":"","title":"Software Engineer I","description":"Build software.","url":url,
+            "retrieved_url":url,"application_url":url,"active":True}
+        with patch.object(jobs,"fetch_public_job_url",return_value=(detail,None)):
+            result=jobs.import_job_url(jobs.JobUrlImportRequest(url=url),self.local_request())
+        self.assertEqual(result["employer"],"Adobe")
+        self.assertEqual(result["employer_identity_source"],"verified_employer_record")
+
+    def test_expired_direct_import_is_rejected_without_saving(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",
+                       (jobs.USER,json.dumps({"allow_automatic_discovery":True})))
+        expired={"provider":"workday","source_token":"tenant","id":"R1","employer":"Adobe",
+            "title":"Software Engineer","description":"Old posting","url":"https://tenant.wd5.myworkdayjobs.com/job/R1",
+            "application_url":"https://tenant.wd5.myworkdayjobs.com/job/R1","active":False,
+            "retrieved_url":"https://tenant.wd5.myworkdayjobs.com/job/R1"}
+        with patch.object(jobs,"fetch_public_job_url",return_value=(expired,None)):
+            with self.assertRaises(HTTPException) as caught:
+                jobs.import_job_url(jobs.JobUrlImportRequest(url=expired["url"]),self.local_request())
+        self.assertIn("expired",caught.exception.detail)
+        with jobs.database() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM discovered_openings WHERE job_key='workday:tenant:R1'").fetchone()[0],0)
 
     def test_business_development_is_rejected_even_when_language_contains_swe(self):
         prefs = self.prefs()
@@ -112,10 +276,46 @@ class DiscoveryTests(unittest.TestCase):
             self.assertFalse(accepted, title)
             self.assertEqual(reason, "role")
 
-    def test_engineer_keyword_alone_does_not_match_jobs(self):
-        from job_relevance import relevance_for_job
+    def test_ambiguous_technical_title_is_kept_for_review_not_silently_excluded(self):
         relevant, _, _ = relevance_for_job({"title": "Systems Engineer", "description": ""}, {"roles": ["Engineer"], "categories": []})
-        self.assertFalse(relevant)
+        self.assertTrue(relevant)
+        accepted, _, reasons = jobs.assess_job(posting(77,"Systems Engineer"),self.prefs(),jobs.search_terms("",self.prefs()))
+        self.assertTrue(accepted)
+        self.assertTrue(any("related title" in reason or "not clear" in reason for reason in reasons))
+
+    def test_employment_and_work_arrangement_are_normalized_as_separate_dimensions(self):
+        hybrid=normalize_job_record({"title":"Software Engineer","location":{"name":"Hybrid"},
+            "employmentType":"Hybrid","workplaceType":"Hybrid"})
+        self.assertEqual(hybrid["employment_type"],"")
+        self.assertEqual(hybrid["work_arrangement"],"Hybrid")
+        self.assertEqual(hybrid["location"],"")
+        self.assertEqual(evaluate_location(hybrid,"United States")[0],"unknown")
+        mixed=normalize_job_record({"title":"Engineer","employmentType":"Full-time · Hybrid","location":"San Francisco, CA"})
+        self.assertEqual(mixed["employment_type"],"Full-time")
+        self.assertEqual(mixed["work_arrangement"],"Hybrid")
+        onsite=normalize_job_record({"title":"Engineer","employmentType":"In-Office","workplaceType":"In-Office"})
+        self.assertEqual(onsite["employment_type"],"")
+        self.assertEqual(onsite["work_arrangement"],"On-site")
+        unknown=normalize_job_record({"title":"Engineer","employmentType":"Flexible schedule"})
+        self.assertEqual(unknown["employment_type"],"")
+
+    def test_explicit_workplace_metadata_is_enforced_separately_from_employment_type(self):
+        remote=posting(78,"Software Engineer I",employment_type="Full-time",workplaceType="Remote")
+        accepted,reason,_=jobs.assess_job(remote,self.prefs(work_arrangement="Remote"),jobs.search_terms("",self.prefs()))
+        self.assertTrue(accepted)
+        self.assertIsNone(reason)
+        accepted,reason,_=jobs.assess_job(remote,self.prefs(work_arrangement="Hybrid"),jobs.search_terms("",self.prefs()))
+        self.assertFalse(accepted)
+        self.assertEqual(reason,"work_arrangement")
+        self.assertEqual(normalize_job_record(remote)["employment_type"],"Full-time")
+
+    def test_location_requires_geographic_fields_and_accepts_multilocation(self):
+        job={"title":"Software Engineer in California","location":"Remote","work_arrangement":"Remote"}
+        self.assertEqual(evaluate_location(job,"California")[0],"unknown")
+        multi={"locations":[{"name":"London, United Kingdom"},{"name":"San Francisco, CA, United States"}],
+               "work_arrangement":"Hybrid"}
+        self.assertEqual(evaluate_location(multi,"United States")[0],"eligible")
+        self.assertEqual(evaluate_location({"location":"Hybrid","work_arrangement":"Hybrid"},"United States")[0],"unknown")
 
     def test_multiple_selected_categories_are_combined(self):
         prefs = self.prefs(roles=[], categories=["Software Development", "Cybersecurity", "Artificial Intelligence"])
