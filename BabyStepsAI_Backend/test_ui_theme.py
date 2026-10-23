@@ -3,6 +3,7 @@ import unittest
 from ui_theme import apply_ui_theme
 from job_search_agent import PAGE
 import candidate_verification
+import application_agent
 
 
 class UIThemeTests(unittest.TestCase):
@@ -39,6 +40,19 @@ class UIThemeTests(unittest.TestCase):
         self.assertIn('html[data-bsa-theme="dark"] hr',page)
         self.assertIn('id="jobUrl"',page)
         self.assertIn('id="importJob"',page)
+
+    def test_application_compatibility_panel_uses_light_and_dark_theme_tokens(self):
+        page=apply_ui_theme(application_agent.APPLICATIONS_PAGE)
+        self.assertIn('class="compatibility-tool"',page)
+        self.assertIn('--bsa-surface:#fff',page)
+        self.assertIn('--bsa-ink:#17263b',page)
+        self.assertIn('--bsa-surface:#182337',page)
+        self.assertIn('--bsa-ink:#e7edf6',page)
+        self.assertIn('background:var(--bsa-surface)',page)
+        self.assertIn('color:var(--bsa-ink)',page)
+        self.assertIn('border-color:var(--bsa-line)',page)
+        self.assertIn('html[data-bsa-theme="dark"] input',page)
+        self.assertIn('Official employer job URL',page)
 
 
 if __name__=='__main__': unittest.main()

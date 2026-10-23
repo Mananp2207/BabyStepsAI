@@ -43,6 +43,11 @@ def detect_application_provider(url):
 def classify_control(label, tag="button", control_type="submit", inside_form=False):
     """Classify a visible control; unknown behavior is never treated as navigation."""
     text = re.sub(r"\s+", " ", str(label or "")).strip()
+    # Cookie choices, notification prompts, and pagination controls are not
+    # application submission actions even when an employer page marks them as
+    # submit buttons. Keeping these out of the report avoids false warnings.
+    if text.casefold() in {"accept", "deny", "reject", "decline", "create alert", "allow all", "manage preferences"} or re.fullmatch(r"\d+", text):
+        return "other"
     if str(tag).casefold() == "a" and re.fullmatch(r"apply(?: now)?", text, re.I):
         return "apply_link"
     if str(tag).casefold() == "button" and str(control_type).casefold() == "button" and not inside_form and re.fullmatch(r"apply(?: now)?", text, re.I):
@@ -97,3 +102,63 @@ def submission_controls(controls):
         if action in {"final_submission", "ambiguous"}:
             found.append({"label": label[:160], "action": action})
     return found
+
+
+def summarize_form_metadata(provider, fields, controls, interruption=None, expired=False):
+    """Build a value-free compatibility report from public form metadata.
+
+    ``fields`` must contain labels and control attributes only. This helper is
+    deliberately independent of candidate verification and application filling.
+    """
+    fields = [item for item in (fields or []) if isinstance(item, dict)]
+    controls = [item for item in (controls or []) if isinstance(item, dict)]
+    required = [str(item.get("label") or "Unlabeled required field")[:160]
+                for item in fields if item.get("required")]
+    upload_fields = [str(item.get("label") or "File upload")[:160]
+                     for item in fields if item.get("kind") == "file"]
+    supported_kinds = {"text", "email", "tel", "url", "number", "date", "textarea",
+                       "select", "combobox", "checkbox", "radio", "file"}
+    supported = [str(item.get("label") or item.get("kind") or "Form field")[:160]
+                 for item in fields if item.get("kind") in supported_kinds]
+    unsupported = [str(item.get("label") or item.get("kind") or "Custom field")[:160]
+                   for item in fields if item.get("kind") not in supported_kinds]
+    actions = submission_controls(controls)
+    human_actions = []
+    if interruption == "human_verification": human_actions.append("CAPTCHA or human verification")
+    elif interruption == "authentication_required": human_actions.append("Employer sign-in is required")
+    elif interruption == "automation_restricted": human_actions.append("Employer restricts automated access")
+    if expired: human_actions.append("This posting appears to be expired")
+    multi_step = any(item.get("action") in {"safe_next", "ambiguous", "review"} for item in controls)
+    form_detected = bool(fields)
+    if interruption in {"human_verification", "authentication_required", "automation_restricted"}:
+        outcome = "needs_human_action"
+    elif expired:
+        outcome = "inaccessible"
+    elif not form_detected:
+        outcome = "unsupported"
+    elif unsupported:
+        outcome = "partially_compatible"
+    else:
+        outcome = "compatible"
+    return {
+        "provider": dict(provider or {}),
+        "form_detected": form_detected,
+        "fields": [{"label": str(item.get("label") or "")[0:160],
+                    "kind": str(item.get("kind") or "unknown")[:40],
+                    "required": bool(item.get("required")),
+                    **({"accept": str(item.get("accept") or "")[:120]} if item.get("kind") == "file" else {})}
+                   for item in fields[:100]],
+        "supported_fields": supported[:100],
+        "unsupported_fields": unsupported[:100],
+        "required_fields": required[:100],
+        "file_upload_controls": upload_fields[:30],
+        "human_actions_required": human_actions,
+        "multi_step_detected": multi_step,
+        "submission_control_detected": bool(actions),
+        "submission_controls": actions[:30],
+        "inspection_outcome": outcome,
+        "reason": ("The page requires a human action before its form can be inspected." if human_actions else
+                   "No public application form was detected." if not form_detected else
+                   "Some controls use unsupported or custom semantics." if unsupported else
+                   "Public form metadata was inspected without entering or submitting information."),
+    }

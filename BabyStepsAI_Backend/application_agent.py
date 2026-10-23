@@ -4,9 +4,15 @@ import json
 import os
 import re
 import socket
+import ssl
 import sqlite3
 import threading
+import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.robotparser
+import urllib.request
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -21,7 +27,8 @@ from pydantic import BaseModel
 from job_search_agent import USER, DB as JOB_DB, fetch_board
 from candidate_verification import (verified_profile_facts, save_application_answer, AnswerUpdate,
                                     verified_values_from_json, _answer_plaintext)
-from application_browser import apply_targets, classify_control, detect_application_provider, page_interruption, submission_controls
+from application_browser import (apply_targets, classify_control, detect_application_provider,
+                                 page_interruption, submission_controls, summarize_form_metadata)
 from application_answer_assistant import get_authorization, generate_draft, draft_safe_profile, ORDINARY_PROMPT, SENSITIVE_PROMPT, MAX_ANSWER_CHARS
 from ui_theme import apply_ui_theme
 
@@ -36,6 +43,12 @@ _attempt_lock = threading.RLock()
 _active_attempts = set()
 _queue_worker_lock = threading.RLock()
 _queue_worker_running = False
+_inspection_lock = threading.Lock()
+_robots_cache_lock = threading.Lock()
+_robots_cache = {}
+ROBOTS_CACHE_TTL_SECONDS = 1800
+ROBOTS_MAX_ATTEMPTS = 3
+ROBOTS_MAX_BYTES = 256000
 MAX_STEPS = 6
 MOCK_PATH_PREFIX = "/mock-apps/"
 
@@ -119,6 +132,10 @@ def initialize():
             created_at TEXT NOT NULL,updated_at TEXT NOT NULL,confirmed_at TEXT)""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_submission_quota_user_time ON submission_quota_reservations(user_id,state,confirmed_at)")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_submission_quota_app ON submission_quota_reservations(user_id,application_id)")
+        db.execute("""CREATE TABLE IF NOT EXISTS application_form_inspections (
+            id TEXT PRIMARY KEY,user_id TEXT NOT NULL,job_key TEXT NOT NULL,provider TEXT NOT NULL,
+            outcome TEXT NOT NULL,report_json TEXT NOT NULL,inspected_at TEXT NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_form_inspections_user_job ON application_form_inspections(user_id,job_key,inspected_at)")
         db.execute("INSERT OR IGNORE INTO submission_quota_reservations(id,user_id,application_id,state,created_at,updated_at,confirmed_at) SELECT 'historic:'||id,user_id,id,'succeeded',created_at,updated_at,COALESCE(submitted_at,updated_at) FROM applications WHERE state='submitted'")
         # Older versions left in-flight records without heartbeat timestamps.
         # Recovery is explicit and conservative: never retry automatically.
@@ -260,16 +277,109 @@ def _mock_allowed(url):
     p=urlparse(url)
     return p.scheme=="http" and p.hostname in {"127.0.0.1","localhost"} and p.port==8000 and p.path.startswith(MOCK_PATH_PREFIX) and not p.username and not p.password
 
+class ApplicationURLValidationError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code=code
+
+
+def _sanitized_inspection_url(value):
+    """Drop query, fragment, and any userinfo before a URL enters diagnostics."""
+    try:
+        parsed=urlparse(str(value or ""))
+        host=parsed.hostname or ""
+        if not host: return ""
+        if ":" in host and not host.startswith("["): host="["+host+"]"
+        port=parsed.port
+        netloc=host+(":"+str(port) if port else "")
+        return parsed._replace(netloc=netloc,query="",fragment="").geturl()
+    except (TypeError,ValueError):
+        return ""
+
+
+class RobotsRedirectBlocked(urllib.error.URLError):
+    """A robots redirect was rejected by the public-destination guard."""
+
+
+def _robots_reason(category):
+    return {
+        "dns_failure": "The employer's robots.txt host could not be resolved by this computer. Inspection was stopped; check DNS or network access and retry.",
+        "timeout": "The employer's robots.txt request timed out after bounded retries. Inspection was stopped; retry when the host is reachable.",
+        "tls_error": "A secure TLS connection to the employer's robots.txt could not be verified. Inspection was stopped.",
+        "tls_configuration": "Python's verified TLS trust configuration could not be loaded. Install the application requirements or correct the configured CA bundle; inspection was stopped.",
+        "redirect_blocked": "The employer's robots.txt redirected to a destination that failed public URL safety checks. Inspection was stopped.",
+        "http_status": "The employer's robots.txt returned an HTTP error, so permission could not be confirmed. Inspection was stopped.",
+        "policy_missing": "The employer returned HTTP 404 for robots.txt. Because no policy could be verified, inspection was stopped.",
+        "network_error": "The employer's robots.txt could not be reached after bounded retries. Inspection was stopped; check network access and retry.",
+        "malformed_policy": "The employer's robots.txt response was malformed or too large to verify safely. Inspection was stopped.",
+        "unsafe_destination": "The robots.txt destination did not pass public URL safety checks. Inspection was stopped.",
+        "policy_disallowed": "The employer's robots.txt explicitly disallows this read-only inspection path.",
+    }.get(category, "The employer's robots.txt policy could not be verified. Inspection was stopped.")
+
+
+def _robots_tls_failure(cause):
+    exception_name=type(cause).__name__
+    if isinstance(cause,ssl.SSLCertVerificationError):
+        return "TLS certificate verification failed ("+exception_name+"). The server certificate was not trusted; inspection was stopped."
+    return "The TLS handshake failed ("+exception_name+"). Inspection was stopped."
+
+
+def _robots_ssl_context():
+    """Build a certificate-verifying context using explicit CAs or the OS trust store."""
+    explicit_cafile=(os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or
+                     os.environ.get("CURL_CA_BUNDLE"))
+    explicit_capath=os.environ.get("SSL_CERT_DIR")
+    if explicit_cafile or explicit_capath:
+        context=ssl.create_default_context(cafile=explicit_cafile or None,capath=explicit_capath or None)
+    else:
+        try:
+            import truststore
+        except ImportError:
+            # Safe fallback for a partial install. certifi supplies a verified
+            # public CA bundle; production installs truststore from requirements
+            # to honor the macOS Keychain and managed system trust configuration.
+            try:
+                import certifi
+                context=ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                context=ssl.create_default_context()
+        else:
+            context=truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode=ssl.CERT_REQUIRED
+    context.check_hostname=True
+    return context
+
+
+class SafeRobotsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Validate each redirect target before urllib follows it."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination=urllib.parse.urljoin(req.full_url,newurl)
+        try:
+            validate_application_url(destination)
+        except ValueError as exc:
+            raise RobotsRedirectBlocked("robots redirect destination was rejected") from exc
+        return super().redirect_request(req,fp,code,msg,headers,destination)
+
+
 def validate_application_url(url):
-    if not isinstance(url,str) or len(url)>2048: raise ValueError("Application URL is missing or too long.")
-    p=urlparse(url)
+    if not isinstance(url,str) or len(url)>2048:
+        raise ApplicationURLValidationError("invalid_url","Application URL is missing or too long.")
+    try: p=urlparse(url)
+    except ValueError as exc: raise ApplicationURLValidationError("invalid_url","Application URL is malformed.") from exc
     if _mock_allowed(url): return url
-    if p.scheme!="https" or not p.hostname or p.username or p.password: raise ValueError("Application links must use public HTTPS or configured local mock pages.")
+    if p.scheme!="https" or not p.hostname or p.username or p.password:
+        raise ApplicationURLValidationError("invalid_scheme","Application links must use public HTTPS or configured local mock pages.")
     host=p.hostname.rstrip(".").casefold()
-    if host in {"localhost","localhost.localdomain","metadata.google.internal"} or host.endswith(".localhost"): raise ValueError("Private and localhost application destinations are blocked.")
+    if host in {"localhost","localhost.localdomain","metadata.google.internal"} or host.endswith(".localhost"):
+        raise ApplicationURLValidationError("private_destination","Private and localhost application destinations are blocked.")
     try: addresses={x[4][0] for x in socket.getaddrinfo(host,p.port or 443,type=socket.SOCK_STREAM)}
-    except OSError as e: raise ValueError("Application host could not be resolved.") from e
-    if any(not ipaddress.ip_address(a).is_global for a in addresses): raise ValueError("Private, loopback, and metadata-service destinations are blocked.")
+    except socket.gaierror as exc:
+        raise ApplicationURLValidationError("dns_failure","The public host could not be resolved safely.") from exc
+    except OSError as exc:
+        raise ApplicationURLValidationError("dns_failure","The public host could not be resolved safely.") from exc
+    try: private=any(not ipaddress.ip_address(address).is_global for address in addresses)
+    except ValueError as exc: raise ApplicationURLValidationError("invalid_address","The host returned an invalid IP address.") from exc
+    if private: raise ApplicationURLValidationError("private_destination","Private, loopback, and metadata-service destinations are blocked.")
     return url
 
 def _safe_request(url):
@@ -287,6 +397,99 @@ def _guard_browser_request(route):
         return
     route.continue_()
 
+
+def _robots_permission(url):
+    """Return (allowed, reason, category), failing closed on unknown policy.
+
+    Cache only bounded, successfully retrieved policy documents. Permission is always
+    evaluated against the requested path, not cached as a host-wide boolean.
+    """
+    parsed=urlparse(url)
+    robots_url=parsed._replace(path="/robots.txt",params="",query="",fragment="").geturl()
+    content=None
+    with _robots_cache_lock:
+        cached=_robots_cache.get(robots_url)
+        if cached and time.monotonic()-cached[0] < ROBOTS_CACHE_TTL_SECONDS:
+            content=cached[1]
+        elif cached:
+            _robots_cache.pop(robots_url,None)
+    if content is None:
+        request=urllib.request.Request(robots_url,headers={"User-Agent":"BabyStepsAI-ReadOnlyInspector/1.0"})
+        try:
+            tls_context=_robots_ssl_context()
+            opener=urllib.request.build_opener(SafeRobotsRedirectHandler(),urllib.request.HTTPSHandler(context=tls_context))
+        except (ImportError,OSError,ssl.SSLError,ValueError) as exc:
+            return False,"Verified TLS setup failed ("+type(exc).__name__+"). Install BabyStepsAI requirements or check SSL_CERT_FILE / SSL_CERT_DIR; inspection was stopped.","tls_configuration"
+        last_category="network_error"
+        last_detail=""
+        for attempt in range(ROBOTS_MAX_ATTEMPTS):
+            try:
+                validate_application_url(robots_url)
+                with opener.open(request,timeout=5) as response:
+                    status=int(response.status)
+                    raw=response.read(ROBOTS_MAX_BYTES+1)
+                if len(raw)>ROBOTS_MAX_BYTES:
+                    return False,_robots_reason("malformed_policy"),"malformed_policy"
+                if status!=200:
+                    return False,"The employer's robots.txt returned HTTP "+str(status)+", so permission could not be confirmed. Inspection was stopped.","http_status"
+                try: content=raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    return False,_robots_reason("malformed_policy"),"malformed_policy"
+                stripped=content.lstrip().casefold()
+                if stripped.startswith(("<!doctype html","<html","<?xml")):
+                    return False,_robots_reason("malformed_policy"),"malformed_policy"
+                meaningful=[line.split("#",1)[0].strip() for line in content.splitlines()]
+                meaningful=[line for line in meaningful if line]
+                if meaningful and not any(re.match(r"(?i)^user-agent\s*:\s*\S+",line) for line in meaningful):
+                    return False,_robots_reason("malformed_policy"),"malformed_policy"
+                with _robots_cache_lock: _robots_cache[robots_url]=(time.monotonic(),content)
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code==404:
+                    return False,"The employer returned HTTP 404 for robots.txt. Permission could not be verified, so inspection was stopped.","policy_missing"
+                if exc.code in {408,429,500,502,503,504}:
+                    last_category="http_status"
+                    last_detail="The employer's robots.txt returned HTTP "+str(exc.code)+" after bounded retries. Inspection was stopped."
+                else:
+                    return False,"The employer's robots.txt returned HTTP "+str(exc.code)+", so permission could not be confirmed. Inspection was stopped.","http_status"
+            except ApplicationURLValidationError as exc:
+                if exc.code=="dns_failure":
+                    last_category="dns_failure"
+                else:
+                    return False,_robots_reason("unsafe_destination"),"unsafe_destination"
+            except RobotsRedirectBlocked:
+                return False,_robots_reason("redirect_blocked"),"redirect_blocked"
+            except ssl.SSLError as exc:
+                return False,_robots_tls_failure(exc),"tls_error"
+            except (TimeoutError, socket.timeout):
+                last_category="timeout"
+            except urllib.error.URLError as exc:
+                reason=getattr(exc,"reason",None)
+                if isinstance(reason,ssl.SSLError):
+                    return False,_robots_tls_failure(reason),"tls_error"
+                if isinstance(reason,(socket.gaierror,)):
+                    last_category="dns_failure"
+                elif isinstance(reason,(TimeoutError,socket.timeout)):
+                    last_category="timeout"
+                elif isinstance(reason,OSError):
+                    last_category="network_error"
+                else:
+                    last_category="network_error"
+            except OSError as exc:
+                if isinstance(exc,ssl.SSLError):
+                    return False,_robots_tls_failure(exc),"tls_error"
+                if isinstance(exc,socket.gaierror): last_category="dns_failure"
+                elif isinstance(exc,(TimeoutError,socket.timeout)): last_category="timeout"
+                else: last_category="network_error"
+            if attempt+1<ROBOTS_MAX_ATTEMPTS:
+                time.sleep(0.1*(attempt+1))
+        else:
+            return False,last_detail or _robots_reason(last_category),last_category
+    parser=urllib.robotparser.RobotFileParser();parser.set_url(robots_url);parser.parse(content.splitlines())
+    if not parser.can_fetch("BabyStepsAI-ReadOnlyInspector",url):
+        return False,_robots_reason("policy_disallowed"),"policy_disallowed"
+    return True,"","policy_verified"
+
 class DryRunRequest(BaseModel):
     job_key: str|None=None
     job: dict|None=None
@@ -295,6 +498,14 @@ class DryRunRequest(BaseModel):
 
 class ApplicationQueueRequest(BaseModel):
     job_keys: list[str]
+
+
+class FormInspectionRequest(BaseModel):
+    job_key: str
+
+
+class StandaloneFormCompatibilityRequest(BaseModel):
+    application_url: str
 
 class EligibilityReviewRequest(BaseModel):
     reviewed: bool = False
@@ -329,7 +540,8 @@ def _get_job(req):
 
 def _url_syntax_allowed(url):
     if _mock_allowed(url): return True
-    parsed=urlparse(str(url or ""))
+    try: parsed=urlparse(str(url or ""))
+    except ValueError: return False
     if parsed.scheme!="https" or not parsed.hostname or parsed.username or parsed.password: return False
     host=parsed.hostname.rstrip(".").casefold()
     if host in {"localhost","localhost.localdomain","metadata.google.internal"} or host.endswith(".localhost"): return False
@@ -353,6 +565,7 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
                 m.classification,m.match_score,m.status AS match_status,m.result_json AS match_result_json,m.freshness_status,m.matching_model_version,
                 a.id AS application_id,a.state AS application_state,a.updated_at AS application_updated_at,
                 a.diagnostic_json AS application_diagnostic,
+                (SELECT fi.report_json FROM application_form_inspections fi WHERE fi.user_id=o.user_id AND fi.job_key=o.job_key ORDER BY fi.inspected_at DESC LIMIT 1) AS form_inspection_json,
                 r.id AS active_resume_id, CASE WHEN r.id IS NULL THEN 0 ELSE 1 END AS has_active_resume,
                 r.stored_name AS active_resume_stored_name
             FROM discovered_openings o
@@ -383,6 +596,15 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
         except (TypeError,json.JSONDecodeError):
             app_diagnostic={}
         item["application_message"]=str(app_diagnostic.get("message") or "")[:500]
+        try:
+            inspection=json.loads(item.pop("form_inspection_json",None) or "null")
+        except (TypeError,json.JSONDecodeError):
+            inspection=None
+        try: current_application_url=urlparse(str(item.get("url") or ""))._replace(query="",fragment="").geturl()
+        except ValueError: current_application_url=""
+        if isinstance(inspection,dict) and inspection.get("requested_application_url")!=current_application_url:
+            inspection=None
+        item["form_inspection"]=inspection if isinstance(inspection,dict) else None
         item["question_groups"]=_group_questions(app_diagnostic.get("unanswered_fields",[]))
         item["missing_questions"]=[entry["question"] for group in item["question_groups"] for entry in group["questions"]]
         item["url_syntax_allowed"]=_url_syntax_allowed(item.get("url"))
@@ -412,6 +634,69 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
         item.pop("has_active_resume",None); item.pop("active_resume_stored_name",None); item.pop("active_resume_id",None)
         results.append(item)
     return {"results":results,"count":len(results)}
+
+
+@router.post("/api/applications/form-inspections", status_code=200)
+def inspect_saved_application_form(request: FormInspectionRequest):
+    """Read-only compatibility check for a fresh, eligible saved opening."""
+    jobs=list_saved_application_jobs(eligibility="all")["results"]
+    job=next((item for item in jobs if item.get("job_key")==request.job_key),None)
+    if not job:
+        raise HTTPException(404,"Saved job not found.")
+    if (job.get("classification")!="potential_match" or job.get("eligibility_stale") or
+            job.get("match_status")!="completed" or job.get("freshness_status")!="current"):
+        raise HTTPException(409,"Only a current potential match can be inspected from this action. Reassess the job first.")
+    if not job.get("active"):
+        raise HTTPException(410,"This posting is no longer active in its saved source.")
+    if not job.get("url_syntax_allowed"):
+        raise HTTPException(400,"The saved application link is not a permitted public HTTPS destination.")
+    with connect() as db:
+        saved=db.execute("SELECT url,job_url,title,company FROM discovered_openings WHERE user_id=? AND job_key=?",
+                         (USER,request.job_key)).fetchone()
+    if not saved:
+        raise HTTPException(404,"Saved job not found.")
+    report=inspect_public_application_form(saved["url"])
+    try: requested_application_url=urlparse(str(saved["url"] or ""))._replace(query="",fragment="").geturl()
+    except ValueError: requested_application_url=""
+    try: posting_url=urlparse(str(saved["job_url"] or saved["url"]))._replace(query="",fragment="").geturl()
+    except ValueError: posting_url=""
+    report.update({"job_key":request.job_key,"employer":str(saved["company"] or "")[:160],
+                   "job_title":str(saved["title"] or "")[:200],"posting_url":posting_url,
+                   "requested_application_url":requested_application_url,"inspected_at":now()})
+    report_json=json.dumps(report,ensure_ascii=False,separators=(",",":"))
+    try:
+        provider=(report.get("provider") or {}).get("provider") or "unknown"
+        with connect() as db:
+            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
+                       (str(uuid.uuid4()),USER,request.job_key,str(provider)[:40],str(report.get("inspection_outcome") or "unsupported")[:40],report_json,report["inspected_at"]))
+    except sqlite3.Error as exc:
+        raise HTTPException(500,"The inspection completed, but its report could not be saved. Please retry.") from exc
+    return report
+
+
+@router.post("/api/applications/form-compatibility-tests", status_code=200)
+def inspect_standalone_application_form(request: StandaloneFormCompatibilityRequest):
+    """Inspect a pasted public employer URL without a saved match or candidate profile."""
+    raw_url=str(request.application_url or "").strip()
+    if not raw_url or len(raw_url)>2048:
+        raise HTTPException(400,"Enter a public HTTPS employer job URL (maximum 2,048 characters).")
+    source_url=_sanitized_inspection_url(raw_url)
+    report=inspect_public_application_form(raw_url)
+    report.setdefault("provider",detect_application_provider(raw_url))
+    inspection_id=str(uuid.uuid4())
+    report.update({"inspection_id":inspection_id,"inspection_mode":"standalone_read_only",
+                   "source_url":source_url,"inspected_at":now()})
+    for key in ("application_url","source_url","posting_url","requested_application_url"):
+        if report.get(key): report[key]=_sanitized_inspection_url(report[key])
+    report_json=json.dumps(report,ensure_ascii=False,separators=(",",":"))
+    provider=(report.get("provider") or {}).get("provider") or detect_application_provider(raw_url).get("provider") or "unknown"
+    try:
+        with connect() as db:
+            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
+                       (inspection_id,USER,"standalone:"+inspection_id,str(provider)[:40],str(report.get("inspection_outcome") or "inaccessible")[:40],report_json,report["inspected_at"]))
+    except sqlite3.Error as exc:
+        raise HTTPException(500,"The compatibility check finished, but its sanitized report could not be saved. Please retry.") from exc
+    return report
 
 def _candidate():
     with connect() as db:
@@ -955,6 +1240,139 @@ def _inspect_controls(page):
         return []
 
 
+def _visible_form_metadata(page):
+    """Read public form labels and control types only; never read form values."""
+    try:
+        return page.locator("body").evaluate("""body=>{
+          const selector='input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable="true"]';
+          return [...body.querySelectorAll(selector)].filter(el=>el.getClientRects().length && !el.disabled).slice(0,100).map(el=>{
+            const type=(el.getAttribute('type')||'').toLowerCase();
+            const role=(el.getAttribute('role')||'').toLowerCase();
+            let kind=type||({combobox:'combobox',checkbox:'checkbox',radio:'radio',textbox:'text'}[role]||(el.tagName==='INPUT'?'text':el.tagName.toLowerCase()));
+            if(el.tagName==='TEXTAREA') kind='textarea';
+            if(el.tagName==='SELECT') kind='select';
+            if(el.isContentEditable) kind='contenteditable';
+            const labelledBy=(el.getAttribute('aria-labelledby')||'').split(/\\s+/).map(id=>document.getElementById(id)?.innerText||'').join(' ');
+            const label=[...(el.labels||[])].map(x=>x.innerText||'').join(' ') || el.getAttribute('aria-label') || labelledBy || el.getAttribute('placeholder') || el.closest('label')?.innerText || el.closest('fieldset')?.querySelector('legend')?.innerText || '';
+            return {kind,label:String(label).replace(/\\s+/g,' ').trim().slice(0,160),required:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',inside_form:!!el.closest('form,[role="form"]'),accept:kind==='file'?(el.getAttribute('accept')||'').slice(0,120):''};
+          });
+        }""") or []
+    except Exception:
+        return []
+
+
+def _inspect_public_controls(page):
+    """Inspect button/link semantics, including custom ARIA buttons, without activation."""
+    try:
+        controls=page.locator("button,a[href],input[type=button],input[type=submit],[role=button]")
+        result=[]
+        for index in range(min(controls.count(),100)):
+            control=controls.nth(index)
+            try:
+                if not control.is_visible(): continue
+                item=control.evaluate("""el=>({tag:el.getAttribute('role')==='button'?'button':el.tagName.toLowerCase(),type:(el.type||el.getAttribute('data-type')||'button').toLowerCase(),label:(el.innerText||el.getAttribute('aria-label')||el.getAttribute('title')||((el.tagName==='INPUT')?el.getAttribute('value'):'')||'').trim().slice(0,180),inside_form:!!el.closest('form')})""")
+                item["action"]=classify_control(item.get("label"),item.get("tag"),item.get("type"),item.get("inside_form"))
+                result.append(item)
+            except Exception: continue
+        return result
+    except Exception:
+        return []
+
+
+def inspect_public_application_form(url):
+    """Inspect a public application page in an empty, GET-only browser context.
+
+    This code path does not call candidate/profile APIs, read field values,
+    upload files, click controls, or create an application attempt.
+    """
+    clean_url = ""
+    provider={"provider":"employer_site","support_level":"generic_accessible_form","adapter":"shared_semantic_form"}
+    try:
+        if not isinstance(url,str) or len(url)>2048: raise ValueError("invalid URL")
+        parsed=urlparse(url)
+        if not parsed.hostname or parsed.username or parsed.password: raise ValueError("invalid URL")
+        clean_url = parsed._replace(query="", fragment="").geturl()
+        provider=detect_application_provider(url)
+    except (TypeError, ValueError):
+        return {"application_url": "", "inspection_outcome": "inaccessible",
+                "reason": "This destination is not a permitted public HTTPS page.","failure_category":"unsafe_destination"}
+    if not _inspection_lock.acquire(blocking=False):
+        return {"application_url": clean_url, "inspection_outcome": "inaccessible",
+                "provider":provider,"form_detected":False,"page_classification":"not_inspected",
+                "reason": "Another public form inspection is already running. Try again shortly."}
+    browser = context = None
+    try:
+        permitted, policy_reason, policy_category=_robots_permission(url)
+        if not permitted:
+            return {"application_url": clean_url, "inspection_outcome": "inaccessible", "reason": policy_reason,
+                    "provider":provider,"form_detected":False,"page_classification":"not_inspected",
+                    "robots_policy":"not_verified","failure_category":policy_category}
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            page.route("**/*", _guard_browser_request)
+            try:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as exc:
+                reason = "Employer page could not be opened (" + type(exc).__name__ + "). Check that the public application link is current and accessible."
+                return {"application_url": clean_url, "inspection_outcome": "inaccessible", "provider":provider,
+                        "form_detected":False,"page_classification":"not_inspected","robots_policy":"verified_allow",
+                        "failure_category":"navigation_error","reason": reason}
+            # A redirect is subject to the same public HTTPS/IP checks as the
+            # original link. No Apply links or form controls are activated.
+            try:
+                validate_application_url(page.url)
+            except ValueError:
+                return {"application_url": clean_url, "inspection_outcome": "inaccessible",
+                        "provider":provider,"form_detected":False,"page_classification":"not_inspected",
+                        "robots_policy":"verified_allow","failure_category":"unsafe_destination",
+                        "reason": "The employer page redirected to a restricted destination."}
+            fields = _visible_form_metadata(page)
+            controls = _inspect_public_controls(page)
+            interruption = _interruption(page)
+            try:
+                body = page.locator("body").inner_text(timeout=2000)[:10000]
+            except Exception:
+                body = ""
+            expired = page_interruption(body) == "expired_listing"
+            application_form,page_classification=_classify_inspected_page(page.url,fields,controls,body)
+            report = summarize_form_metadata(detect_application_provider(page.url), fields, controls,
+                                             interruption=interruption, expired=expired)
+            report["form_detected"]=application_form
+            report["page_classification"]=page_classification
+            if not application_form and _posting_redirected_away(clean_url, page.url):
+                report["page_classification"]="posting_redirected"
+                report["inspection_outcome"]="inaccessible"
+                report["reason"]="The job-specific URL redirected away from its posting. The posting and application form could not be verified."
+            if not application_form and not expired and not report.get("human_actions_required"):
+                if report.get("page_classification") != "posting_redirected":
+                    report["inspection_outcome"]="unsupported"
+                    report["reason"]=("A public job posting was reached, but no application form was exposed on this page."
+                                      if page_classification=="job_posting" else
+                                      "The public page loaded, but an employer application form could not be verified.")
+            report["application_url"] = urlparse(page.url)._replace(query="", fragment="").geturl()
+            report["http_status"] = int(response.status) if response else None
+            report["robots_policy"] = "verified_allow"
+            if response and response.status >= 400:
+                report["inspection_outcome"] = "inaccessible"
+                report["reason"] = "The public employer page returned HTTP " + str(response.status) + "."
+            return report
+    except Exception as exc:
+        return {"application_url": clean_url, "inspection_outcome": "inaccessible",
+                "reason": "The public form could not be inspected (" + type(exc).__name__ + ").",
+                "failure_category":"inspection_error"}
+    finally:
+        try:
+            if context: context.close()
+        except Exception: pass
+        try:
+            if browser: browser.close()
+        except Exception: pass
+        _inspection_lock.release()
+
+
 def _apply_links(page):
     try:
         raw=page.locator("a[href]").evaluate_all("""els=>els.filter(e=>e.getClientRects().length).map(e=>({label:(e.innerText||e.getAttribute('aria-label')||'').trim(),href:e.href}))""")
@@ -1010,6 +1428,12 @@ def _has_password(page):
     except Exception: return False
 
 
+def _has_captcha_widget(page):
+    try:
+        return page.locator('iframe[src*="recaptcha" i],iframe[src*="hcaptcha" i],[data-sitekey],.g-recaptcha,.h-captcha').count()>0
+    except Exception: return False
+
+
 def _interruption(page):
     try: text=page.locator("body").inner_text(timeout=2000)
     except Exception: text=""
@@ -1017,7 +1441,61 @@ def _interruption(page):
         if re.search(r"/(?:login|log-in|signin|sign-in|auth|sso)(?:/|$)",urlparse(page.url).path,re.I):
             return "authentication_required"
     except (TypeError,ValueError): pass
+    if _has_captcha_widget(page): return "human_verification"
     return page_interruption(text,_has_password(page))
+
+
+def _classify_inspected_page(url,fields,controls,body_text):
+    """Distinguish an application form from a job posting or unrelated page."""
+    fields=[item for item in (fields or []) if isinstance(item,dict)]
+    controls=controls or []
+    text=str(body_text or "")[:12000]
+    path=(urlparse(str(url or "")).path or "").casefold()
+    application_context=bool(re.search(r"\b(application|apply for|apply to|candidate application)\b",text,re.I) or
+                             re.search(r"/(?:apply|application)(?:/|$)",path))
+    strong_field=re.compile(r"\b(resume|curriculum vitae|cover letter|linkedin|work authorization|sponsorship|graduation|education|degree|employment history|work experience)\b",re.I)
+    labels=[str(item.get("label") or "") for item in fields]
+    has_application_field=any(strong_field.search(label) for label in labels)
+    contact_fields=sum(bool(re.search(r"\b(name|email|phone)\b",label,re.I)) for label in labels)
+    form_bound=any(item.get("inside_form") for item in fields)
+    apply_link=any(item.get("action")=="apply_link" for item in controls)
+    final_control=any(item.get("action")=="final_submission" for item in controls)
+    detected=bool(fields) and (has_application_field or
+                              (application_context and ((form_bound and len(fields)>=2) or final_control or contact_fields>=2)))
+    if detected:
+        classification="application_form"
+    elif apply_link or re.search(r"\b(job description|responsibilities|qualifications|apply now)\b",text,re.I):
+        classification="job_posting"
+    elif fields:
+        classification="public_form_unverified"
+    else:
+        classification="public_page_unverified"
+    return detected,classification
+
+
+def _posting_redirected_away(requested_url, landed_url):
+    """Recognize common job-detail URLs that land on a different, non-detail page."""
+    try:
+        requested=urlparse(str(requested_url or ""))
+        landed=urlparse(str(landed_url or ""))
+        if not requested.hostname or not landed.hostname:
+            return False
+        if requested.hostname.casefold() != landed.hostname.casefold():
+            return False
+        requested_path=requested.path.rstrip("/")
+        landed_path=landed.path.rstrip("/")
+        patterns=(r"/(?:jobs?|positions?)/([^/]+)$", r"/([0-9a-f]{8}-[0-9a-f-]{27,})$")
+        identifier=None
+        for pattern in patterns:
+            match=re.search(pattern,requested_path,re.I)
+            if match:
+                identifier=match.group(1).casefold()
+                break
+        if not identifier:
+            return False
+        return identifier not in landed_path.casefold() and not re.search(r"/(?:apply|application)(?:/|$)",landed_path,re.I)
+    except (TypeError,ValueError):
+        return False
 
 def _screenshot(page,app_id):
     try:
@@ -1569,6 +2047,7 @@ APPLICATIONS_PAGE=r'''<!doctype html>
 </style></head><body><header class="top"><div class="nav"><div class="brand">BabySteps<span>AI</span></div><nav aria-label="Main navigation"><a href="/">Home</a><a href="/find-jobs">Find jobs</a><a href="/candidate-profile">Candidate profile</a><a href="/applications" aria-current="page">Applications</a></nav></div></header>
 <main class="wrap"><div class="intro"><div><h1>Applications</h1><div class="muted">Review your application activity and safely prepare forms.</div></div><span class="pill">Dry runs only · Submission disabled</span></div>
 <div class="notice"><strong>Dry run — No application will be submitted.</strong> Dry runs may fill supported forms and attach your active resume. Legal questions, missing answers, and human verification stop for your review.</div>
+<section class="compatibility-tool" aria-labelledby="compatibility-title"><div class="section-head"><h2 id="compatibility-title">Test Employer Form Compatibility</h2><span class="sub">Standalone read-only check</span></div><p class="sub">Paste an official public job URL to inspect its application page. This does not require a saved job, AI match, or candidate profile. BabyStepsAI will not enter information, upload files, accept terms, or submit.</p><form id="standalone-inspection-form"><label for="standalone-inspection-url">Official employer job URL</label><div class="compatibility-input"><input id="standalone-inspection-url" name="application_url" type="url" inputmode="url" autocomplete="url" placeholder="https://jobs.ashbyhq.com/company/job-id" maxlength="2048" required><button id="standalone-inspection-submit" class="primary" type="submit">Inspect public form</button></div></form><p id="standalone-inspection-status" role="status" aria-live="polite"></p><div id="standalone-inspection-result"></div></section>
 <div id="summary" class="cards" aria-live="polite"></div><div class="toolbar" aria-label="Application controls"><button id="load-jobs" onclick="loadJobs()">Load saved jobs</button><button id="pause" onclick="action('/api/applications/pause')">Pause processing</button><button id="resume" onclick="action('/api/applications/resume')">Resume processing</button><button type="button" id="theme-toggle" aria-label="Toggle dark mode">Dark mode</button><span class="muted" id="run-state">Checking status…</span></div>
 <div class="section-head"><h2>Local test forms</h2><span class="sub">Clearly labeled test workflows</span></div><div class="toolbar"><button onclick="mock('simple')">Test simple form</button><button onclick="mock('multi-step')">Test multi-step form</button><button onclick="mock('uncertain')">Test uncertain questions</button><button onclick="mock('captcha')">Test human-check stop</button></div>
 <div class="section-head"><h2>Saved jobs</h2><span class="sub">Prepare one opening or explicitly queue selected openings</span></div><div class="toolbar" aria-label="Saved job filters"><label>Search <input id="job-search" type="search" placeholder="Title, company, or location"></label><label>Eligibility <select id="job-eligibility"><option value="all">All results</option><option value="potential_match">Potential match</option><option value="needs_review">Needs review</option><option value="not_eligible">Not eligible</option><option value="unmatched">Not analyzed</option></select></label><button id="filter-jobs" onclick="loadJobs()">Search saved jobs</button><button id="queue-selected" onclick="queueSelected()">Queue selected dry runs</button></div><div id="jobs" class="grid"><div class="empty">Load saved jobs to choose a dry run.</div></div>
@@ -1629,6 +2108,56 @@ renderApps=function(apps){
   });
 };
 </script></body></html>""")
+
+# Read-only compatibility inspection is kept separate from dry-run preparation.
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</body></html>", """<script>
+const phase123RenderSavedJobs=renderSavedJobs;
+function appendInspectionReport(card,report){
+  const labels={compatible:'Compatible',partially_compatible:'Partially compatible',needs_human_action:'Needs human action',unsupported:'Unsupported',inaccessible:'Inaccessible'};
+  const panel=document.createElement('details'),summary=node('summary','', 'Form compatibility · '+(labels[report.inspection_outcome]||'Not yet inspected'));panel.className='form-inspection-result';
+  const body=node('div','sub');
+  body.append(node('p','sub','Read-only inspection · no candidate information entered · no application prepared or submitted.'));
+  const failureLabels={dns_failure:'DNS lookup failed',timeout:'Request timed out',tls_error:'Secure connection failed',tls_configuration:'TLS trust configuration unavailable',redirect_blocked:'Unsafe redirect blocked',http_status:'Robots server returned an HTTP error',policy_missing:'robots.txt was not found',malformed_policy:'Robots policy could not be parsed',policy_disallowed:'Path disallowed by robots.txt',unsafe_destination:'Unsafe destination blocked',network_error:'Network request failed',navigation_error:'Public page could not be opened'};
+  if(report.failure_category)body.append(node('p','inspection-diagnostic','Diagnostic: '+(failureLabels[report.failure_category]||'Inspection blocked')));
+  if(report.robots_policy==='verified_allow')body.append(node('p','inspection-diagnostic','Robots policy verified for this path.'));
+  const pageKinds={application_form:'Application form',job_posting:'Job posting only · no application form exposed',posting_redirected:'Job URL redirected · posting not verified',public_form_unverified:'Public form found · application purpose unverified',public_page_unverified:'Public page · application form unverified'};
+  body.append(node('p','sub','Page classification: '+(pageKinds[report.page_classification]||'Not verified')));
+  body.append(node('p','sub','Provider: '+(report.provider?.provider||'Not identified')+' · '+(report.provider?.support_level||'compatibility unknown')+' · Form detected: '+(report.form_detected?'Yes':'No')));
+  body.append(node('p','sub','Required fields: '+((report.required_fields||[]).length)+' · File uploads: '+((report.file_upload_controls||[]).length)+' · Multi-step: '+(report.multi_step_detected?'Detected':'Not detected')+' · Submission control: '+(report.submission_control_detected?'Detected':'Not detected')));
+  if(report.fields?.length){body.append(node('strong','','Detected controls'));const fields=document.createElement('ul');report.fields.forEach(field=>fields.append(node('li','',(field.label||'Unlabeled')+' · '+(field.kind||'unknown')+(field.required?' · required':' · optional'))));body.append(fields)}
+  if(report.reason)body.append(node('p','sub',report.reason));
+  for(const [title,items] of [['Required fields',report.required_fields],['File upload controls',report.file_upload_controls],['Supported fields',report.supported_fields],['Unsupported fields',report.unsupported_fields],['Human actions required',report.human_actions_required]])if(items?.length){body.append(node('strong','',title));const list=document.createElement('ul');items.forEach(x=>list.append(node('li','',x)));body.append(list)}
+  if(report.application_url){const link=node('a','sub','Open inspected application page');link.href=report.application_url;link.target='_blank';link.rel='noopener noreferrer';body.append(link)}
+  panel.append(summary,body);card.append(panel);
+}
+const standaloneForm=document.querySelector('#standalone-inspection-form');
+standaloneForm?.addEventListener('submit',async event=>{event.preventDefault();const input=document.querySelector('#standalone-inspection-url'),button=document.querySelector('#standalone-inspection-submit'),status=document.querySelector('#standalone-inspection-status'),result=document.querySelector('#standalone-inspection-result');if(!input.reportValidity())return;button.disabled=true;button.setAttribute('aria-busy','true');status.textContent='Checking robots.txt and inspecting the public page in read-only mode…';result.replaceChildren();try{const report=await req('/api/applications/form-compatibility-tests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({application_url:input.value.trim()})});const card=node('article','job');appendInspectionReport(card,report);result.append(card);status.textContent='Compatibility report saved. No candidate data was used and no application was prepared or submitted.'}catch(error){status.textContent=error.message||'Compatibility inspection failed. Check the public URL and try again.'}finally{button.disabled=false;button.removeAttribute('aria-busy')}});
+renderSavedJobs=async function(silent=false){
+  await phase123RenderSavedJobs(silent);
+  const data=await req('/api/applications/saved-jobs?'+new URLSearchParams({q:document.querySelector('#job-search').value,eligibility:document.querySelector('#job-eligibility').value}).toString());
+  const cards=document.querySelectorAll('#jobs .job');
+  (data.results||[]).forEach((job,index)=>{
+    const card=cards[index];if(!card)return;
+    if(job.form_inspection)appendInspectionReport(card,job.form_inspection);
+    if(job.classification!=='potential_match'||job.eligibility_stale||job.match_status!=='completed'||job.freshness_status!=='current'||!job.active||!job.url_syntax_allowed)return;
+    if(!job.form_inspection)card.append(node('div','sub','Compatibility: Not yet inspected'));
+    const button=node('button','primary form-inspect-action', 'Inspect Employer Form');button.setAttribute('aria-label','Inspect Employer Form for '+(job.title||'saved job'));
+    window.bsaInspectionPending=window.bsaInspectionPending||new Set();
+    const pending=window.bsaInspectionPending;
+    button.title='Read-only inspection. This will not enter candidate information or prepare or submit an application.';
+    button.disabled=busy||pending.size>0;
+    if(pending.has(job.job_key)){button.textContent='Inspecting public form…';button.setAttribute('aria-busy','true')}
+    button.onclick=async()=>{if(pending.size)return;pending.add(job.job_key);button.disabled=true;button.textContent='Inspecting public form…';button.setAttribute('aria-busy','true');try{const report=await req('/api/applications/form-inspections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_key:job.job_key})});card.querySelector('details.form-inspection-result')?.remove();appendInspectionReport(card,report);say('Form inspection finished: '+(report.inspection_outcome||'result available')+'. No application was prepared or submitted.')}catch(e){say('Form inspection could not start: '+e.message)}finally{pending.delete(job.job_key);await renderSavedJobs(true)}};
+    card.append(button);
+  });
+};
+</script></body></html>""")
+
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</head>", """<style>
+.form-inspection-result{overflow-wrap:anywhere}.form-inspection-result summary{color:#405570}.form-inspect-action:focus-visible,.form-inspection-result summary:focus-visible{outline:3px solid #2563eb;outline-offset:2px}
+.compatibility-tool{margin:22px 0;padding:18px;background:var(--bsa-surface);color:var(--bsa-ink);border:1px solid var(--bsa-line);border-radius:14px;box-shadow:0 2px 8px #102a4308}.compatibility-tool label{display:block;color:var(--bsa-ink);font-weight:650;margin:8px 0}.compatibility-input{display:flex;gap:9px;flex-wrap:wrap}.compatibility-input input{flex:1 1 360px;min-width:0;padding:10px 12px;border:1px solid var(--bsa-line);border-radius:8px;background:var(--bsa-surface);color:var(--bsa-ink);font:inherit}.compatibility-tool button{background:var(--bsa-surface);color:var(--bsa-ink);border-color:var(--bsa-line)}.compatibility-tool button.primary{background:var(--brand);color:#fff;border-color:var(--brand)}.compatibility-tool button:focus-visible,.compatibility-input input:focus-visible{outline:3px solid #2563eb;outline-offset:2px}.inspection-diagnostic{font-weight:650}
+html[data-bsa-theme="dark"] .form-inspection-result summary{color:#e7edf6}
+</style></head>""")
 
 MOCK_PAGES={
 "simple":'''<!doctype html><title>Mock simple</title><h1>Software Developer Application</h1><form><label>Full Name <input name="name" required></label><label>Email <input name="email" type="email" required></label><label>Phone <input name="phone" required></label><label>LinkedIn URL <input name="linkedin"></label><label>GitHub URL <input name="github"></label><label>Resume <input name="resume" type="file" required></label><button type="submit">Submit application</button></form>''',

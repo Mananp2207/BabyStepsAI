@@ -10,6 +10,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from fastapi import HTTPException
 
 import main
 import application_agent as app_agent
@@ -222,6 +223,7 @@ class ApplicationAgentTests(unittest.TestCase):
         if path=="/api/applications/resume": return app_agent.resume_processing()
         if path=="/api/applications/dry-run": return app_agent.start_dry_run(app_agent.DryRunRequest(**json))
         if path=="/api/applications/queue": return app_agent.enqueue_saved_jobs(app_agent.ApplicationQueueRequest(**json))
+        if path=="/api/applications/form-compatibility-tests": return app_agent.inspect_standalone_application_form(app_agent.StandaloneFormCompatibilityRequest(**json))
 
     def get(self, path):
         if path=="/api/applications": return app_agent.list_applications()
@@ -238,6 +240,288 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertTrue(app["diagnostic"]["form_detected"])
         self.assertEqual(app["diagnostic"]["provider"]["adapter"],"shared_semantic_form")
         self.assertEqual(app["diagnostic"]["filled_fields"][-1]["source"],"active_resume")
+
+    def test_read_only_inspection_persists_report_without_creating_application_attempt(self):
+        from unittest.mock import patch
+        report={"provider":{"provider":"ashby","support_level":"accessibility_first"},
+                "form_detected":True,"supported_fields":["Email"],"unsupported_fields":[],
+                "required_fields":["Email"],"file_upload_controls":[],"human_actions_required":[],
+                "multi_step_detected":False,"submission_control_detected":True,
+                "inspection_outcome":"compatible","reason":"Public controls inspected."}
+        before=app_agent.list_applications()
+        with patch.object(app_agent,"inspect_public_application_form",return_value=dict(report)) as inspect:
+            result=app_agent.inspect_saved_application_form(app_agent.FormInspectionRequest(job_key="saved-simple"))
+        inspect.assert_called_once()
+        self.assertEqual(result["inspection_outcome"],"compatible")
+        self.assertEqual(result["employer"],"Example Co")
+        self.assertNotIn("test-secret",json.dumps(result))
+        self.assertEqual(app_agent.list_applications(),before)
+        with app_agent.connect() as db:
+            row=db.execute("SELECT report_json FROM application_form_inspections WHERE user_id=? AND job_key=?",(USER,"saved-simple")).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row["report_json"])["provider"]["provider"],"ashby")
+
+    def test_standalone_compatibility_check_needs_no_saved_match_or_candidate_data(self):
+        report={"application_url":"https://user:password@jobs.lever.co/example/role?session=secret","provider":{"provider":"lever"},
+                "form_detected":False,"page_classification":"job_posting","inspection_outcome":"unsupported",
+                "fields":[],"supported_fields":[],"unsupported_fields":[],"required_fields":[],
+                "file_upload_controls":[],"human_actions_required":[],"multi_step_detected":False,
+                "submission_control_detected":False,"reason":"A job posting was reached; no application form was exposed."}
+        before=app_agent.list_applications()
+        with patch.object(app_agent,"inspect_public_application_form",return_value=dict(report)) as inspect, \
+             patch.object(profile,"verified_profile_facts",side_effect=AssertionError("candidate facts must not be read")):
+            result=self.post("/api/applications/form-compatibility-tests",json={"application_url":"https://user:password@jobs.lever.co/example/role?session=secret"})
+        inspect.assert_called_once_with("https://user:password@jobs.lever.co/example/role?session=secret")
+        self.assertEqual(result["inspection_mode"],"standalone_read_only")
+        self.assertEqual(result["page_classification"],"job_posting")
+        self.assertNotIn("session=secret",json.dumps(result)); self.assertNotIn("password",json.dumps(result))
+        self.assertEqual(result["source_url"],"https://jobs.lever.co/example/role")
+        self.assertEqual(app_agent.list_applications(),before)
+        with app_agent.connect() as db:
+            row=db.execute("SELECT job_key,report_json FROM application_form_inspections WHERE id=?",(result["inspection_id"],)).fetchone()
+        self.assertTrue(row["job_key"].startswith("standalone:"))
+        self.assertNotIn("session=secret",row["report_json"])
+
+    def test_standalone_endpoint_persists_blocked_robots_diagnostics(self):
+        blocked={"application_url":"https://jobs.ashbyhq.com/example/job","inspection_outcome":"inaccessible",
+                "provider":{"provider":"ashby"},"form_detected":False,"page_classification":"not_inspected",
+                "robots_policy":"not_verified","failure_category":"policy_disallowed",
+                "reason":"The employer's robots.txt explicitly disallows this read-only inspection path."}
+        with patch.object(app_agent,"inspect_public_application_form",return_value=blocked):
+            result=self.post("/api/applications/form-compatibility-tests",json={"application_url":"https://jobs.ashbyhq.com/example/job"})
+        self.assertEqual(result["inspection_outcome"],"inaccessible")
+        self.assertEqual(result["failure_category"],"policy_disallowed")
+        with app_agent.connect() as db:
+            saved=json.loads(db.execute("SELECT report_json FROM application_form_inspections WHERE id=?",(result["inspection_id"],)).fetchone()[0])
+        self.assertEqual(saved["robots_policy"],"not_verified")
+
+    def test_application_page_classification_distinguishes_posting_from_form(self):
+        posting_controls=[{"action":"apply_link","label":"Apply Now"}]
+        posting,kind=app_agent._classify_inspected_page("https://jobs.greenhouse.io/company/1",[],posting_controls,"Job description and qualifications")
+        self.assertFalse(posting); self.assertEqual(kind,"job_posting")
+        newsletter,kind=app_agent._classify_inspected_page("https://company.example/jobs/1",[
+            {"label":"Email","kind":"email","inside_form":True}],posting_controls,"Job description and qualifications")
+        self.assertFalse(newsletter); self.assertEqual(kind,"job_posting")
+        application,kind=app_agent._classify_inspected_page("https://jobs.ashbyhq.com/company/1/application",[
+            {"label":"Email","kind":"email","inside_form":True},{"label":"Resume","kind":"file","inside_form":True}],[],"Candidate application")
+        self.assertTrue(application); self.assertEqual(kind,"application_form")
+
+    def test_job_specific_url_redirecting_to_employer_root_is_not_reported_as_a_posting(self):
+        self.assertTrue(app_agent._posting_redirected_away(
+            "https://job-boards.greenhouse.io/planetlabs/jobs/8096079",
+            "https://job-boards.greenhouse.io/planetlabs"))
+        self.assertFalse(app_agent._posting_redirected_away(
+            "https://job-boards.greenhouse.io/planetlabs/jobs/8096079",
+            "https://job-boards.greenhouse.io/planetlabs/jobs/8096079"))
+        self.assertFalse(app_agent._posting_redirected_away(
+            "https://jobs.ashbyhq.com/notion/e32799d2-8ef8-4803-8189-c72514afa816/",
+            "https://jobs.ashbyhq.com/notion/e32799d2-8ef8-4803-8189-c72514afa816/application"))
+
+    def test_form_inspection_rejects_ineligible_or_stale_jobs(self):
+        with self.assertRaises(HTTPException) as caught:
+            app_agent.inspect_saved_application_form(app_agent.FormInspectionRequest(job_key="saved-ineligible"))
+        self.assertEqual(caught.exception.status_code,409)
+        with app_agent.connect() as db:
+            db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key='saved-simple'",(USER,))
+        with self.assertRaises(HTTPException) as stale:
+            app_agent.inspect_saved_application_form(app_agent.FormInspectionRequest(job_key="saved-simple"))
+        self.assertEqual(stale.exception.status_code,409)
+
+    def test_inspection_browser_path_only_navigates_and_reads_metadata(self):
+        from unittest.mock import patch
+        calls=[]
+        class Response: status=200
+        class Page:
+            url="https://jobs.ashbyhq.com/example/job"
+            def route(self,*args): calls.append("route")
+            def goto(self,url,**kwargs): calls.append(("goto",url,kwargs)); return Response()
+            def locator(self,*_args): return self
+            def inner_text(self,**_kwargs): return "Public job application"
+        class Context:
+            def new_page(self): return Page()
+            def close(self): pass
+        class Browser:
+            def new_context(self): return Context()
+            def close(self): pass
+        class Chromium:
+            def launch(self,**_kwargs): return Browser()
+        class Manager:
+            chromium=Chromium()
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+        module=types.ModuleType("playwright.sync_api");module.sync_playwright=Manager
+        with patch.dict(sys.modules,{"playwright.sync_api":module}), patch.object(app_agent,"validate_application_url"), patch.object(app_agent,"_robots_permission",return_value=(True,"","policy_verified")), patch.object(app_agent,"_visible_form_metadata",return_value=[{"label":"Email","kind":"email","required":True},{"label":"Resume","kind":"file","required":True}]), patch.object(app_agent,"_inspect_public_controls",return_value=[{"label":"Submit application","tag":"button","type":"submit","inside_form":True,"action":"final_submission"}]), patch.object(app_agent,"_interruption",return_value=None):
+            report=app_agent.inspect_public_application_form("https://jobs.ashbyhq.com/example/job")
+        self.assertEqual(report["inspection_outcome"],"compatible")
+        self.assertEqual(calls[0],"route")
+        self.assertEqual(calls[1][0],"goto")
+        self.assertEqual([call[0] for call in calls if isinstance(call,tuple)], ["goto"])
+        self.assertTrue(report["submission_control_detected"])
+        self.assertEqual(report["page_classification"],"application_form")
+
+    def test_inspection_stops_for_unsafe_urls_and_disallowed_robots_policy(self):
+        with patch.object(app_agent,"validate_application_url",side_effect=ValueError("blocked")):
+            unsafe=app_agent.inspect_public_application_form("http://127.0.0.1/private")
+        self.assertEqual(unsafe["inspection_outcome"],"inaccessible")
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent,"_robots_permission",return_value=(False,"robots policy disallows inspection","policy_disallowed")):
+            blocked=app_agent.inspect_public_application_form("https://example.org/jobs/1")
+        self.assertEqual(blocked["inspection_outcome"],"inaccessible")
+        self.assertIn("robots",blocked["reason"])
+        with patch.object(app_agent,"_robots_permission",return_value=(False,"The employer's robots.txt host could not be resolved by this computer. Check DNS or network access and retry.","dns_failure")):
+            dns=app_agent.inspect_public_application_form("https://unresolved.example/jobs/1")
+        self.assertEqual(dns["failure_category"],"dns_failure"); self.assertIn("DNS",dns["reason"])
+
+    def test_robots_policy_is_parsed_for_each_requested_path(self):
+        class Response:
+            status=200
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+            def read(self,_limit): return b"User-agent: *\nDisallow: /apply\nAllow: /jobs\n"
+        class Opener:
+            def open(self,*_args,**_kwargs): return Response()
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=Opener()):
+            app_agent._robots_cache.clear()
+            denied=app_agent._robots_permission("https://employer.example/apply")
+            allowed=app_agent._robots_permission("https://employer.example/jobs/1")
+            self.assertFalse(denied[0]); self.assertEqual(denied[2],"policy_disallowed")
+            self.assertTrue(allowed[0]); self.assertEqual(allowed[2],"policy_verified")
+
+    def test_robots_policy_retries_transient_timeout_and_caches_verified_policy(self):
+        class Response:
+            status=200
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+            def read(self,_limit): return b"User-agent: *\nAllow: /\nDisallow: /private\n"
+        class Opener:
+            calls=0
+            requests=[]
+            def open(self,request,*args,**kwargs):
+                self.calls+=1
+                self.requests.append((request.full_url,request.get_header("User-agent"),kwargs.get("timeout")))
+                if self.calls==1: raise TimeoutError("temporary")
+                return Response()
+        opener=Opener()
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=opener), patch.object(app_agent.time,"sleep"):
+            app_agent._robots_cache.clear()
+            self.assertTrue(app_agent._robots_permission("https://cache.example/jobs/1")[0])
+            self.assertFalse(app_agent._robots_permission("https://cache.example/private/1")[0])
+            self.assertEqual(opener.calls,2)
+            self.assertEqual(opener.requests[0],("https://cache.example/robots.txt","BabyStepsAI-ReadOnlyInspector/1.0",5))
+
+    def test_robots_policy_reports_exhausted_dns_and_tls_without_permission(self):
+        from unittest.mock import Mock
+        app_agent._robots_cache.clear()
+        with patch.object(app_agent,"validate_application_url",side_effect=app_agent.ApplicationURLValidationError("dns_failure","dns")), patch.object(app_agent.urllib.request,"build_opener") as build, patch.object(app_agent.time,"sleep"):
+            denied=app_agent._robots_permission("https://dns.example/job")
+        self.assertFalse(denied[0]); self.assertEqual(denied[2],"dns_failure"); self.assertEqual(build.call_count,1)
+        app_agent._robots_cache.clear()
+        unsafe_validate=Mock(side_effect=app_agent.ApplicationURLValidationError("private_destination","private"))
+        with patch.object(app_agent,"validate_application_url",unsafe_validate), patch.object(app_agent.urllib.request,"build_opener") as unsafe_build:
+            unsafe=app_agent._robots_permission("https://private.example/job")
+        self.assertFalse(unsafe[0]); self.assertEqual(unsafe[2],"unsafe_destination"); self.assertEqual(unsafe_validate.call_count,1); unsafe_build.assert_called_once()
+        app_agent._robots_cache.clear()
+        class Opener:
+            calls=0
+            def open(self,*_args,**_kwargs): self.calls+=1; raise app_agent.ssl.SSLError("certificate")
+        opener=Opener()
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=opener):
+            tls=app_agent._robots_permission("https://tls.example/job")
+        self.assertFalse(tls[0]); self.assertEqual(tls[2],"tls_error"); self.assertEqual(opener.calls,1)
+
+    def test_robots_tls_context_uses_verified_system_or_ca_bundle_context(self):
+        context=app_agent._robots_ssl_context()
+        self.assertEqual(context.verify_mode,app_agent.ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        class Response:
+            status=200
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+            def read(self,_limit): return b"User-agent: *\nAllow: /\n"
+        class Opener:
+            def open(self,*_args,**_kwargs): return Response()
+        handlers=[]
+        def build(*items): handlers.extend(items); return Opener()
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",side_effect=build):
+            app_agent._robots_cache.clear()
+            allowed=app_agent._robots_permission("https://trusted.example/job")
+        self.assertTrue(allowed[0]); self.assertTrue(any(isinstance(item,app_agent.urllib.request.HTTPSHandler) for item in handlers))
+        https=next(item for item in handlers if isinstance(item,app_agent.urllib.request.HTTPSHandler))
+        self.assertEqual(https._context.verify_mode,app_agent.ssl.CERT_REQUIRED)
+        self.assertTrue(https._context.check_hostname)
+
+    def test_robots_tls_invalid_certificate_and_missing_ca_fail_closed_with_sanitized_reason(self):
+        class Opener:
+            calls=0
+            def open(self,*_args,**_kwargs):
+                self.calls+=1
+                raise app_agent.urllib.error.URLError(app_agent.ssl.SSLCertVerificationError(1,"invalid certificate details"))
+        app_agent._robots_cache.clear(); opener=Opener()
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=opener):
+            invalid=app_agent._robots_permission("https://invalid-cert.example/job")
+        self.assertFalse(invalid[0]); self.assertEqual(invalid[2],"tls_error")
+        self.assertIn("SSLCertVerificationError",invalid[1]); self.assertNotIn("invalid certificate details",invalid[1]); self.assertEqual(opener.calls,1)
+        app_agent._robots_cache.clear()
+        with patch.dict(os.environ,{"SSL_CERT_FILE":"/definitely/missing/babysteps-test-ca.pem","SSL_CERT_DIR":"","REQUESTS_CA_BUNDLE":"","CURL_CA_BUNDLE":""}), \
+             patch.object(app_agent.urllib.request,"build_opener") as build:
+            missing=app_agent._robots_permission("https://missing-ca.example/job")
+        self.assertFalse(missing[0]); self.assertEqual(missing[2],"tls_configuration"); build.assert_not_called()
+
+    def test_explicit_ca_environment_is_used_by_verified_context(self):
+        context=types.SimpleNamespace(verify_mode=None,check_hostname=False)
+        with patch.dict(os.environ,{"SSL_CERT_FILE":"/configured/ca.pem","SSL_CERT_DIR":"","REQUESTS_CA_BUNDLE":"","CURL_CA_BUNDLE":""}), \
+             patch.object(app_agent.ssl,"create_default_context",return_value=context) as create:
+            result=app_agent._robots_ssl_context()
+        create.assert_called_once_with(cafile="/configured/ca.pem",capath=None)
+        self.assertIs(result,context); self.assertEqual(context.verify_mode,app_agent.ssl.CERT_REQUIRED); self.assertTrue(context.check_hostname)
+
+    def test_robots_policy_bounds_retries_for_timeout_and_network_failures(self):
+        class Opener:
+            def __init__(self,exc): self.calls=0; self.exc=exc
+            def open(self,*_args,**_kwargs): self.calls+=1; raise self.exc
+        for exc,category in ((TimeoutError("slow"),"timeout"),(app_agent.urllib.error.URLError(OSError("offline")),"network_error")):
+            app_agent._robots_cache.clear(); opener=Opener(exc)
+            with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=opener), patch.object(app_agent.time,"sleep"):
+                result=app_agent._robots_permission("https://transient.example/job")
+            self.assertFalse(result[0]); self.assertEqual(result[2],category); self.assertEqual(opener.calls,app_agent.ROBOTS_MAX_ATTEMPTS)
+
+    def test_robots_policy_rejects_malformed_policy_and_unsafe_redirect(self):
+        class Response:
+            status=200
+            def __enter__(self): return self
+            def __exit__(self,*_args): pass
+            def read(self,_limit): return b"<html>blocked</html>"
+        class Opener:
+            def open(self,*_args,**_kwargs): return Response()
+        app_agent._robots_cache.clear()
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=Opener()):
+            malformed=app_agent._robots_permission("https://malformed.example/job")
+        self.assertFalse(malformed[0]); self.assertEqual(malformed[2],"malformed_policy")
+        handler=app_agent.SafeRobotsRedirectHandler()
+        with patch.object(app_agent,"validate_application_url") as validate:
+            redirected=handler.redirect_request(app_agent.urllib.request.Request("https://public.example/robots.txt"),None,302,"Found",{},"https://cdn.public.example/policy")
+        self.assertEqual(redirected.full_url,"https://cdn.public.example/policy"); validate.assert_called_once_with("https://cdn.public.example/policy")
+        with patch.object(app_agent,"validate_application_url",side_effect=app_agent.ApplicationURLValidationError("private_destination","private")):
+            with self.assertRaises(app_agent.RobotsRedirectBlocked):
+                handler.redirect_request(types.SimpleNamespace(full_url="https://public.example/robots.txt"),None,302,"Found",{},"http://127.0.0.1/robots.txt")
+
+    def test_robots_http_404_and_permanent_http_errors_fail_closed(self):
+        class Opener:
+            calls=0
+            def __init__(self,code): self.code=code
+            def open(self,*_args,**_kwargs):
+                self.calls+=1
+                if self.code: raise app_agent.urllib.error.HTTPError("https://example.test/robots.txt",self.code,"",{},None)
+                raise AssertionError("not expected")
+        app_agent._robots_cache.clear(); opener=Opener(404)
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=opener):
+            missing=app_agent._robots_permission("https://example.test/open")
+            self.assertFalse(missing[0]); self.assertEqual(missing[2],"policy_missing")
+            app_agent._robots_permission("https://example.test/other")
+        self.assertEqual(opener.calls,2)
+        app_agent._robots_cache.clear(); opener=Opener(403)
+        with patch.object(app_agent,"validate_application_url"), patch.object(app_agent.urllib.request,"build_opener",return_value=opener):
+            forbidden=app_agent._robots_permission("https://forbidden.example/open")
+        self.assertFalse(forbidden[0]); self.assertEqual(forbidden[2],"http_status"); self.assertEqual(opener.calls,1)
 
     @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")=="1","Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to launch installed Chromium.")
     def test_real_chromium_local_mock_reaches_ready_for_review_without_submission(self):
@@ -268,6 +552,8 @@ class ApplicationAgentTests(unittest.TestCase):
             with patch.object(app_agent,"_mock_allowed",side_effect=lambda url:original_mock_allowed(url) or
                               (url.startswith(f"http://127.0.0.1:{port}/mock-apps/"))):
                 result=app_agent.start_dry_run(app_agent.DryRunRequest(job={"job_key":"real-chromium-local","company":"Synthetic Employer","title":"Synthetic Engineer","application_url":f"http://127.0.0.1:{port}/mock-apps/application"}))
+                with patch.object(app_agent,"_robots_permission",return_value=(True,"","policy_verified")):
+                    inspection=app_agent.inspect_public_application_form(f"http://127.0.0.1:{port}/mock-apps/application")
             app=next(item for item in app_agent.list_applications() if item["id"]==result["application_id"])
             self.assertEqual(app["state"],"ready_for_review")
             self.assertTrue(app["diagnostic"]["form_detected"])
@@ -275,6 +561,11 @@ class ApplicationAgentTests(unittest.TestCase):
             self.assertIn("active_resume",{item.get("source") for item in app["diagnostic"]["filled_fields"]})
             self.assertEqual(len(app["diagnostic"]["required_fields"]),4,app["diagnostic"])
             self.assertFalse(app["diagnostic"]["submission_performed"])
+            self.assertEqual(inspection["inspection_outcome"],"compatible",json.dumps(inspection))
+            self.assertTrue(inspection["submission_control_detected"])
+            self.assertEqual(inspection["required_fields"],["Full Name","Email","Phone","Resume"])
+            self.assertEqual(inspection["file_upload_controls"],["Resume"])
+            self.assertNotIn("candidate@example.test",json.dumps(inspection))
             self.assertEqual(submitted,[])
         finally:
             server.shutdown();server.server_close();thread.join(timeout=2);app_agent.ARTIFACTS=old_artifacts
@@ -832,6 +1123,14 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertIn("View private dry-run screenshot",page)
         self.assertIn("/screenshot",page)
 
+    def test_dashboard_exposes_separate_read_only_employer_inspection(self):
+        page=app_agent.APPLICATIONS_PAGE
+        self.assertIn("Inspect Employer Form",page)
+        self.assertIn("Compatibility: Not yet inspected",page)
+        self.assertIn("/api/applications/form-inspections",page)
+        self.assertIn("no candidate information entered",page)
+        self.assertIn("Form compatibility",page)
+
     def test_structured_profile_answers_cover_location_education_employment_and_projects(self):
         profile.update_verification(profile.VerificationUpdate(values={
             "location":"Austin, TX",
@@ -936,6 +1235,7 @@ class ApplicationAgentTests(unittest.TestCase):
         documented=set(main.app.openapi()["paths"])
         for path in ("/candidate-profile","/applications","/api/candidate-profile/verification",
                      "/api/applications/dry-run","/api/applications/prepare","/api/applications/saved-jobs",
+                     "/api/applications/form-inspections",
                      "/api/applications/pause","/mock-apps/{scenario}"):
             self.assertTrue(path in paths or path in documented,path)
 

@@ -48,6 +48,8 @@ python -m pip install -r BabyStepsAI_Backend/requirements.txt
 python -m playwright install chromium
 ```
 
+The read-only employer robots.txt inspector verifies TLS certificates using the operating system trust store through `truststore` (macOS Keychain on macOS). The dependency is installed by the command above. Explicit `SSL_CERT_FILE` or `SSL_CERT_DIR` settings are honored; `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` are also honored as explicit CA-bundle settings for this urllib-based request. Certificate and hostname verification remain enabled. If you change these settings, restart the server. For a managed TLS proxy, use only a CA bundle supplied and verified by your IT administrator; never trust a website leaf certificate or disable verification.
+
 The application can initialize a new empty SQLite database on first import; the local database and candidate files are not part of this repository. Existing local user data is not needed for a fresh clone.
 
 For AI resume extraction and answer drafting, install and run [Ollama](https://ollama.com/) and fetch the configured model:
