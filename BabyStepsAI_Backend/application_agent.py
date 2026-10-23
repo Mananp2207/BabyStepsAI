@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from job_search_agent import USER, DB as JOB_DB, fetch_board
 from candidate_verification import (verified_profile_facts, save_application_answer, AnswerUpdate,
                                     verified_values_from_json, _answer_plaintext)
-from application_browser import apply_targets, classify_control, page_interruption, submission_controls
+from application_browser import apply_targets, classify_control, detect_application_provider, page_interruption, submission_controls
 from application_answer_assistant import get_authorization, generate_draft, draft_safe_profile, ORDINARY_PROMPT, SENSITIVE_PROMPT, MAX_ANSWER_CHARS
 from ui_theme import apply_ui_theme
 
@@ -348,7 +348,7 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
     if eligibility not in {"all","potential_match","needs_review","not_eligible","unmatched"}:
         raise HTTPException(422,"Unknown eligibility filter.")
     with connect() as db:
-        rows=db.execute("""SELECT o.company,o.title,o.location,o.url,o.job_key,o.discovered_at,
+        rows=db.execute("""SELECT o.company,o.title,o.location,o.url,o.job_url,o.job_key,o.discovered_at,
                 o.employment_type,o.location_status,o.location_reason,o.active,o.source_platform,o.posting_date,
                 m.classification,m.match_score,m.status AS match_status,m.result_json AS match_result_json,m.freshness_status,m.matching_model_version,
                 a.id AS application_id,a.state AS application_state,a.updated_at AS application_updated_at,
@@ -375,6 +375,9 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
         except (TypeError,json.JSONDecodeError): match_data={}
         item["eligibility_explanation"]=str(match_data.get("explanation") or "")[:600]
         item["application_status_label"]={"not_started":"Not prepared","queued":"Queued","opening":"Opening employer site","inspecting":"Inspecting form","filling":"Preparing form","uploading_resume":"Uploading resume","needs_user_input":"Needs your input","ready_for_review":"Ready for review","failed":"Failed","unsupported":"Unsupported website","paused":"Paused","submitted":"Submitted","skipped_duplicate":"Duplicate skipped"}.get(item["application_state"],"In progress")
+        try:item["job_posting_url"]=urlparse(str(item.get("job_url") or item.get("url") or ""))._replace(query="",fragment="").geturl()
+        except ValueError:item["job_posting_url"]=""
+        item.pop("job_url",None)
         try:
             app_diagnostic=json.loads(item.pop("application_diagnostic",None) or "{}")
         except (TypeError,json.JSONDecodeError):
@@ -679,6 +682,12 @@ def _answer(info,candidate,answers):
     if re.search(r"sponsorship|sponsor|visa",label):
         value=_country_answer(candidate,label,"requires_sponsorship")
         if value: return value,"requires_sponsorship"
+    if re.search(r"preferred name|name you go by",label):
+        value=candidate.get("preferred_name")
+        if value:return str(value),"preferred_name"
+        saved=answers.get("preferred_name")
+        if isinstance(saved,dict) and saved.get("answer") and saved.get("auto_reuse"):return saved["answer"],"preferred_name"
+        return None,None
     direct=((r"postal|zip code|postcode","postal_code"),(r"phone country code|country calling code","phone_country_code"),
       (r"address line 2|apartment|suite number","address_line2"),(r"street address|address line 1|mailing address|residential address|home address","address_line1"),
       (r"country|country of residence|country where you are located","country"),(r"state|province|region","state_province"),
@@ -762,12 +771,12 @@ def _ordinary_open_question(info):
     return (info.get("tag")=="textarea" or info.get("type") in {"text","textarea"}) and bool(ORDINARY_PROMPT.search(label)) and not SENSITIVE_PROMPT.search(label)
 
 def _fill_page(page,candidate,answers,resume_path,on_upload=None):
-    fields=page.locator("input:not([type=hidden]),textarea,select"); report=[]; missing=[]; drafts=[]; processed_radios=set()
+    fields=page.locator("input:not([type=hidden]),textarea,select,[role=textbox],[role=checkbox],[role=radio],[contenteditable=true]"); report=[]; missing=[]; drafts=[]; processed_radios=set()
     for i in range(min(fields.count(),150)):
         field=fields.nth(i); info={}
         try:
             if not field.is_visible() or not field.is_enabled(): continue
-            info=field.evaluate("""el=>{let labels=[...(el.labels||[])].map(x=>x.innerText);let near=el.closest('label')?.innerText||el.parentElement?.innerText||'';return {tag:el.tagName.toLowerCase(),type:(el.type||'').toLowerCase(),name:el.name||'',id:el.id||'',value:el.value||'',placeholder:el.placeholder||'',aria_label:el.getAttribute('aria-label')||'',accept:el.getAttribute('accept')||'',label:(labels.join(' ')||near).slice(0,240),required:el.required||el.getAttribute('aria-required')==='true',max_length:el.maxLength>0?el.maxLength:null,disabled:el.disabled,hidden:el.type==='hidden'||el.getAttribute('aria-hidden')==='true'}}""")
+            info=field.evaluate("""el=>{let labels=[...(el.labels||[])].map(x=>x.innerText);let near=el.closest('label')?.innerText||el.parentElement?.innerText||'';let role=el.getAttribute('role')||'';return {tag:el.tagName.toLowerCase(),type:(el.type||(role==='textbox'||el.isContentEditable?'text':role==='checkbox'?'checkbox':role==='radio'?'radio':'')).toLowerCase(),name:el.name||el.getAttribute('name')||'',id:el.id||'',value:el.value||el.getAttribute('value')||el.innerText||'',placeholder:el.placeholder||el.getAttribute('placeholder')||'',aria_label:el.getAttribute('aria-label')||'',accept:el.getAttribute('accept')||'',label:(labels.join(' ')||el.getAttribute('aria-label')||near).slice(0,240),required:el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',max_length:el.maxLength>0?el.maxLength:null,disabled:el.disabled,hidden:el.type==='hidden'||el.getAttribute('aria-hidden')==='true'}}""")
             if info["type"] in {"submit","button","hidden"} or info.get("hidden"): continue
             matching_answer_key=None
             value,source=_answer(info,candidate,answers)
@@ -799,7 +808,12 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                     missing.append("The active resume format is not accepted by the upload field.")
                     report.append({"field":"Resume upload","result":"unsupported_file_type"}); continue
                 if on_upload: on_upload()
-                field.set_input_files(str(resume_path)); report.append({"field":"Resume upload","result":"filled"}); continue
+                field.set_input_files(str(resume_path))
+                uploaded=field.evaluate("el=>({count:el.files?.length||0,name:el.files?.[0]?.name||''})")
+                if not uploaded.get("count"):
+                    missing.append("The employer did not accept the active resume upload.")
+                    report.append({"field":"Resume upload","result":"upload_unverified"}); continue
+                report.append({"field":"Resume upload","result":"filled","source":"active_resume","required":bool(info.get("required"))}); continue
             if info["type"]=="file" and isinstance(value,str) and value.startswith("__DOCUMENT__:"):
                 path=Path(value.split(":",1)[1]).resolve();private_docs=(Path(__file__).resolve().parent/"private_documents").resolve()
                 accept=str(info.get("accept") or "").casefold()
@@ -808,7 +822,12 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                 if accept and not any(token in accept for token in (path.suffix.casefold(),"*/*")):
                     missing.append("The saved application document format is not accepted by this field.");continue
                 if on_upload:on_upload()
-                field.set_input_files(str(path));report.append({"field":info.get("label") or "Application document","result":"filled","source":"private_document"});continue
+                field.set_input_files(str(path))
+                uploaded=field.evaluate("el=>({count:el.files?.length||0,name:el.files?.[0]?.name||''})")
+                if not uploaded.get("count"):
+                    missing.append("The employer did not accept the required private document upload.")
+                    report.append({"field":info.get("label") or "Application document","result":"upload_unverified"});continue
+                report.append({"field":info.get("label") or "Application document","result":"filled","source":"private_document","required":bool(info.get("required"))});continue
             if info["type"]=="radio":
                 group=info.get("name") or info.get("id") or info.get("label")
                 if group in processed_radios: continue
@@ -820,13 +839,13 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                 for option_index in range(min(fields.count(),150)):
                     option=fields.nth(option_index)
                     try:
-                        option_info=option.evaluate("""el=>({type:(el.type||'').toLowerCase(),name:el.name||'',value:el.value||'',label:((el.labels||[]).map(x=>x.innerText).join(' ')||el.closest('label')?.innerText||'').trim()})""")
+                        option_info=option.evaluate("""el=>({type:(el.type||el.getAttribute('role')||'').toLowerCase(),name:el.name||el.getAttribute('name')||'',value:el.value||el.getAttribute('value')||'',label:((el.labels||[]).map(x=>x.innerText).join(' ')||el.getAttribute('aria-label')||el.closest('label')?.innerText||'').trim()})""")
                         if option_info["type"]!="radio" or option_info["name"]!=info.get("name"): continue
                         label=option_info["label"].casefold().strip()
                         if desired==str(option_info["value"]).casefold() or desired==label or (len(desired)>2 and desired in label): chosen=option; break
                     except Exception: continue
                 if chosen:
-                    chosen.check(); report.append({"field":info.get("label") or "Selection","result":"filled","source":"verified_profile" if source in candidate else "confirmed_answer"})
+                    chosen.check(); report.append({"field":info.get("label") or "Selection","result":"filled","source":"verified_profile" if source in candidate else "confirmed_answer","required":bool(info.get("required"))})
                 elif info["required"]: missing.append("No confirmed choice matches: "+(info.get("label") or info.get("name") or "required selection"))
                 continue
             if value is None and _ordinary_open_question(info) and settings.get("allow_ai_drafting"):
@@ -873,7 +892,8 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
             if info["type"]=="url" and not re.match(r"^https://[^\s]+$",value,re.I):
                 missing.append("A URL field requires a valid HTTPS link.")
             report.append({"field":info.get("label") or info.get("name") or "Question","result":"filled",
-                           "source":source if source=="ai_draft" else ("verified_profile" if source in candidate else "confirmed_answer")})
+                           "source":source if source=="ai_draft" else ("verified_profile" if source in candidate else "confirmed_answer"),
+                           "required":bool(info.get("required"))})
         except Exception:
             if info.get("type")=="file":
                 missing.append("The active resume could not be uploaded. Check the employer's accepted file format and retry.")
@@ -909,7 +929,7 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                         if text==wanted: selected=option; break
                     except Exception: continue
                 if selected:
-                    selected.click(); report.append({'field':info.get('label') or 'Selection','result':'filled','source':'verified_profile' if source in candidate else 'confirmed_answer'})
+                    selected.click(); report.append({'field':info.get('label') or 'Selection','result':'filled','source':'verified_profile' if source in candidate else 'confirmed_answer','required':bool(info.get('required'))})
                 elif info['required']: missing.append('No exact confirmed choice matches: '+(info.get('label') or 'required selection'))
             except Exception: continue
     except Exception: pass
@@ -945,9 +965,42 @@ def _apply_links(page):
 
 def _has_form_fields(page):
     try:
-        return page.locator("input:not([type=hidden]),textarea,select").count()>0
+        return (page.locator("input:not([type=hidden]),textarea,select,[role=textbox],[role=checkbox],[role=radio],[contenteditable=true]").count()>0
+                or page.locator('[role="combobox"]').count()>0)
     except Exception:
         return False
+
+
+def _step_signature(page):
+    """Fingerprint visible controls before and after a safe next-step action."""
+    values=[]
+    fields=page.locator("input:not([type=hidden]),textarea,select,[role=textbox],[role=checkbox],[role=radio],[contenteditable=true]")
+    try:
+        for index in range(min(fields.count(),100)):
+            field=fields.nth(index)
+            if not field.is_visible():
+                continue
+            info=field.evaluate("""el=>({name:el.name||el.getAttribute('name')||'',id:el.id||'',type:(el.type||el.getAttribute('role')||el.tagName).toLowerCase(),label:((el.labels||[]).map(x=>x.innerText).join(' ')||el.getAttribute('aria-label')||el.placeholder||el.parentElement?.innerText||'').trim().slice(0,120),required:el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1'})""")
+            values.append(tuple(info.get(key, "" if key!="required" else False) for key in ("name","id","type","label","required")))
+    except Exception:
+        pass
+    return (str(getattr(page,"url","")),tuple(values))
+
+
+def _required_visible_fields(page):
+    result=[]
+    fields=page.locator("input:not([type=hidden]),textarea,select,[role=textbox],[role=checkbox],[role=radio],[contenteditable=true]")
+    try:
+        for index in range(min(fields.count(),100)):
+            field=fields.nth(index)
+            if not field.is_visible() or not field.is_enabled():
+                continue
+            info=field.evaluate("""el=>({required:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',label:((el.labels||[]).map(x=>x.innerText).join(' ')||el.getAttribute('aria-label')||el.placeholder||el.name||el.id||el.parentElement?.innerText||'Required field').trim().slice(0,160)})""")
+            if info.get("required"):
+                result.append(info.get("label") or "Required field")
+    except Exception:
+        return list(dict.fromkeys(result))
+    return list(dict.fromkeys(result))
 
 
 def _has_password(page):
@@ -977,7 +1030,9 @@ def _screenshot(page,app_id):
 def _process_application_inner(app_id,job,resume,candidate,answers):
     if "__is_local_mock" not in answers:
         answers=_application_context(job,answers)
-    diagnostic={"mode":"dry_run","filled_fields":[],"unanswered_fields":[],"draft_answers":[],"steps":0,"submission_performed":False,"screenshot":None,"message":""}
+    diagnostic={"mode":"dry_run","provider":detect_application_provider(job.get("application_url")),
+        "filled_fields":[],"required_fields":[],"unsupported_fields":[],"human_actions_required":[],
+        "unanswered_fields":[],"draft_answers":[],"steps":0,"submission_performed":False,"screenshot":None,"message":""}
     if _paused(): _update(app_id,"paused",diagnostic); return
     _update(app_id,"opening",diagnostic)
     try:
@@ -1031,6 +1086,11 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
             else:
                 diagnostic["message"]="The application page could not be reached after several navigation steps."; diagnostic["screenshot"]=_screenshot(page,app_id)
                 browser.close(); _update(app_id,"unsupported",diagnostic); return
+            diagnostic["form_detected"]=bool(_has_form_fields(page))
+            if not diagnostic["form_detected"]:
+                diagnostic["message"]="The application page opened, but no supported form controls were detected. No application was submitted."
+                diagnostic["screenshot"]=_screenshot(page,app_id)
+                browser.close(); _update(app_id,"unsupported",diagnostic); return
             diagnostic["phase"]="form_filling"
             _update(app_id,"filling",diagnostic); missing=[]
             for step in range(MAX_STEPS):
@@ -1043,6 +1103,15 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                 def mark_upload(): _update(app_id,"uploading_resume",diagnostic)
                 filled,unanswered,drafts=_fill_page(page,candidate,answers,resume_path,on_upload=mark_upload)
                 diagnostic["filled_fields"].extend(filled); missing.extend(unanswered); diagnostic["draft_answers"].extend(drafts); diagnostic["steps"]=step+1
+                diagnostic["required_fields"]=list(dict.fromkeys(
+                    diagnostic["required_fields"]+_required_visible_fields(page)+
+                    [str(item.get("field") or "Required field") for item in filled if item.get("required")]))
+                diagnostic["unsupported_fields"]=list(dict.fromkeys(
+                    str(item.get("field") or "Application field") for item in filled
+                    if item.get("result") in {"unsupported_file_type","upload_unverified","field_limit_exceeded"}))
+                diagnostic["human_actions_required"]=list(dict.fromkeys(
+                    str(item.get("field") or "Employer action") for item in filled
+                    if item.get("result")=="requires_user_confirmation"))
                 # Persist progress after each step so status survives a server restart.
                 _update(app_id,"filling",diagnostic)
                 controls=_inspect_controls(page)
@@ -1057,8 +1126,13 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                 # with unambiguous next-step wording can advance a multi-step form.
                 if safe and step+1<MAX_STEPS:
                     try:
+                        before=_step_signature(page)
                         page.locator("button,a[href],input[type=button],input[type=submit]").nth(safe["index"]).click(timeout=1000)
-                        page.wait_for_timeout(120); continue
+                        page.wait_for_timeout(250)
+                        if _step_signature(page)==before:
+                            missing.append("The application did not advance to its next step using a safe navigation control. Review it manually.")
+                            break
+                        continue
                     except Exception:
                         missing.append("The next application step could not be opened safely.")
                 break
@@ -1310,12 +1384,16 @@ def list_missing_application_questions(application_id:str):
 
 @router.get("/api/applications")
 def list_applications():
-    with connect() as db: rows=db.execute("SELECT id,job_key,company,title,state,mode,diagnostic_json,error,created_at,updated_at,started_at,state_changed_at,attempt_number FROM applications WHERE user_id=? ORDER BY updated_at DESC LIMIT 250",(USER,)).fetchall()
+    with connect() as db: rows=db.execute("""SELECT a.id,a.job_key,a.company,a.title,a.state,a.mode,a.diagnostic_json,a.error,a.created_at,a.updated_at,a.started_at,a.state_changed_at,a.attempt_number,
+        (SELECT COALESCE(NULLIF(o.job_url,''),o.url) FROM discovered_openings o WHERE o.user_id=a.user_id AND o.job_key=a.job_key LIMIT 1) AS source_url
+        FROM applications a WHERE a.user_id=? ORDER BY a.updated_at DESC LIMIT 250""",(USER,)).fetchall()
     result=[]
     for row in rows:
         item=dict(row)
         try: item["diagnostic"]=json.loads(item.pop("diagnostic_json"))
         except (TypeError,json.JSONDecodeError): item["diagnostic"]={}
+        try:item["source_url"]=urlparse(str(item.get("source_url") or ""))._replace(query="",fragment="").geturl()
+        except ValueError:item["source_url"]=""
         item["action_required_groups"]=_group_questions(item["diagnostic"].get("unanswered_fields",[]))
         item["action_required_count"]=sum(len(group["questions"]) for group in item["action_required_groups"])
         result.append(item)
@@ -1520,6 +1598,37 @@ const baseDraftReview=renderApps;renderApps=function(apps){baseDraftReview(apps)
 const phase8SavedJobs=renderSavedJobs;renderSavedJobs=async function(silent=false){await phase8SavedJobs(silent);const result=await req('/api/applications/saved-jobs?'+new URLSearchParams({q:document.querySelector('#job-search').value,eligibility:document.querySelector('#job-eligibility').value}).toString());const cards=document.querySelectorAll('#jobs .job');(result.results||[]).forEach((job,index)=>{const card=cards[index];if(!card)return;card.querySelector('.job-missing')?.remove();if(job.eligibility_explanation)card.append(node('p','sub',job.eligibility_explanation));if(job.preparation_reason)card.append(node('p','sub',job.preparation_reason));if(!job.preparation_allowed&&['potential_match','needs_review'].includes(job.classification)&&job.application_state==='not_started'){const agree=document.createElement('input');agree.type='checkbox';const consent=document.createElement('label');consent.append(agree,document.createTextNode(' I reviewed this match; it is not a guarantee of eligibility.'));const review=node('button','','Confirm review');review.disabled=busy||!job.url_syntax_allowed||!agree.checked;agree.onchange=()=>{review.disabled=busy||!job.url_syntax_allowed||!agree.checked};review.onclick=()=>runBusy('Recording your review…',async()=>{const d=await req('/api/applications/saved-jobs/'+encodeURIComponent(job.job_key)+'/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewed:agree.checked})});say(d.message);await renderSavedJobs(true)});card.append(consent,review)}})};
 const phase8RenderApps=renderApps;renderApps=function(apps){phase8RenderApps(apps);const cards=document.querySelectorAll('#apps .app');apps.forEach((app,index)=>{if(app.state!=='needs_user_input')return;const card=cards[index];if(!card)return;const old=[...card.querySelectorAll('p')].find(p=>p.textContent.startsWith('Needs your input:'));if(old)old.remove();const questions=app.diagnostic?.unanswered_fields||[];const count=Number.isInteger(app.action_required_count)?app.action_required_count:questions.length;const summary=node('p','sub',count+' question(s) need your attention.');card.append(summary);const panel=document.createElement('details'),title=node('summary','','Resolve Questions');panel.append(title);const body=node('div');panel.append(body);panel.addEventListener('toggle',async()=>{if(!panel.open||panel.dataset.loaded)return;panel.dataset.loaded='1';try{const data=await req('/api/applications/'+encodeURIComponent(app.id)+'/questions');for(const group of data.groups||[]){body.append(node('h4','',group.category));for(const item of group.questions||[]){const question=node('p','sub',item.question);body.append(question);if(item.existing_answer)body.append(node('p','sub','Confirmed profile answer: '+item.existing_answer));const draft=(app.diagnostic?.draft_answers||[]).find(x=>item.question.includes(x.question)||x.question.includes(item.question));const input=document.createElement('textarea');input.rows=3;input.maxLength=4000;input.setAttribute('aria-label','Your answer for '+item.question);if(item.existing_answer)input.value=item.existing_answer;const useDraft=node('button','','Use grounded suggestion');if(draft){useDraft.onclick=()=>{input.value=draft.answer||''};body.append(node('p','sub','Suggested answer · review before saving'));body.append(useDraft)}const reuseLabel=document.createElement('label'),reuse=document.createElement('input');reuse.type='checkbox';reuse.checked=!!item.can_reuse&&!item.sensitive;reuse.disabled=!!item.sensitive;reuseLabel.append(reuse,document.createTextNode(' Save for reuse on similar questions'));const save=node('button','primary','Confirm answer');save.onclick=async()=>{save.disabled=true;try{const result=await req('/api/applications/'+encodeURIComponent(app.id)+'/answers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:item.diagnostic_question||item.question,answer:input.value,reusable:reuse.checked,confirmed:true})});save.textContent='Saved';say(result.requires_manual_action?'Saved, but this employer still requires a human action.':'Answer confirmed and saved. Resume the dry run when ready.')}catch(e){save.disabled=false;say(e.message)}};body.append(input,reuseLabel,save);if(item.human_action_required)body.append(node('p','sub','This item cannot be completed automatically and may still require action on the employer website.'))}}}catch(e){body.append(node('p','sub',e.message))}});card.append(panel);const resume=node('button','primary','Resume Dry Run');resume.onclick=()=>retry(app.id);card.append(resume)})};
 </script></body></html>'''
+
+# Expose provider/form diagnostics in a compact review panel without repeating
+# candidate answers, local storage paths, or employer form values.
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("link.href=job.url;", "link.href=job.job_posting_url||job.url;")
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</body></html>", """<script>
+const phase122RenderApps=renderApps;
+renderApps=function(apps){
+  phase122RenderApps(apps);
+  const cards=document.querySelectorAll('#apps .app');
+  apps.forEach((app,index)=>{
+    const diagnostic=app.diagnostic||{},card=cards[index];
+    if(!card)return;
+    if(app.source_url){const link=node('a','sub','Open official posting');link.href=app.source_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link)}
+    const panel=document.createElement('details'),summary=node('summary','','Preparation details');
+    const body=node('div');
+    const provider=diagnostic.provider||{};
+    const status=diagnostic.form_detected?'Application form detected':(diagnostic.phase==='navigation'?'Opening application page':'Form not yet verified');
+    body.append(node('p','sub','Provider: '+(provider.provider||'Not identified')+' · '+(provider.support_level||'compatibility not assessed')));
+    body.append(node('p','sub',status+' · Steps inspected: '+(diagnostic.steps||0)));
+    body.append(node('p','sub','Fields completed: '+(diagnostic.filled_fields||[]).filter(x=>x.result==='filled').length+' · Required fields: '+(diagnostic.required_fields||[]).length+' · Required items remaining: '+(diagnostic.unanswered_fields||[]).length));
+    const uploaded=(diagnostic.filled_fields||[]).filter(x=>x.source==='private_document'||x.source==='active_resume').length;
+    body.append(node('p','sub','Documents accepted by form: '+uploaded+' · AI drafts: '+(diagnostic.draft_answers||[]).length+' · Human actions: '+(diagnostic.human_actions_required||[]).length));
+    const unresolved=diagnostic.unanswered_fields||[];
+    if(unresolved.length){const list=document.createElement('ul');list.className='sub';unresolved.forEach(value=>{const item=document.createElement('li');item.textContent=value;list.append(item)});body.append(list)}
+    if(diagnostic.human_actions_required?.length)body.append(node('p','sub','Employer or sensitive questions are waiting for your explicit action.'));
+    if(diagnostic.submission_performed)body.append(node('p','sub','Unexpected submission state detected. This run must be reviewed.'));
+    else body.append(node('p','sub','Final submission was not performed.'));
+    panel.append(summary,body);card.append(panel);
+  });
+};
+</script></body></html>""")
 
 MOCK_PAGES={
 "simple":'''<!doctype html><title>Mock simple</title><h1>Software Developer Application</h1><form><label>Full Name <input name="name" required></label><label>Email <input name="email" type="email" required></label><label>Phone <input name="phone" required></label><label>LinkedIn URL <input name="linkedin"></label><label>GitHub URL <input name="github"></label><label>Resume <input name="resume" type="file" required></label><button type="submit">Submit application</button></form>''',

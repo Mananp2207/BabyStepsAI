@@ -1,6 +1,7 @@
 """Source-independent safety and page-understanding helpers for dry runs."""
 import re
 from urllib.parse import urljoin
+from urllib.parse import urlparse
 
 
 FINAL_WORDING = re.compile(
@@ -13,6 +14,30 @@ AUTH_WORDING = re.compile(r"\b(sign in|log in|login|authentication required|crea
 EXPIRED_WORDING = re.compile(r"\b(job (has )?expired|position (is )?no longer available|job is closed|no longer accepting applications)\b", re.I)
 HUMAN_WORDING = re.compile(r"\b(captcha|verify you are human|human verification|security challenge|robot check)\b", re.I)
 AUTOMATION_RESTRICTION = re.compile(r"\b(automated applications? (?:are )?not permitted|do not use (?:bots|automation|automated tools)|no automated submissions|automation is prohibited|must complete (?:this|the) application (?:yourself|manually))\b", re.I)
+
+# Provider recognition is descriptive. All adapters share the same semantic
+# field reader and safety gates; recognizing a host never implies that every
+# tenant or form layout is supported.
+PROVIDER_HOSTS = {
+    "ashby": ("jobs.ashbyhq.com", "ashbyhq.com"),
+    "greenhouse": ("boards.greenhouse.io", "job-boards.greenhouse.io", "greenhouse.io"),
+    "lever": ("jobs.lever.co", "lever.co"),
+    "smartrecruiters": ("jobs.smartrecruiters.com", "smartrecruiters.com"),
+    "workday": ("myworkdayjobs.com", "workday.com"),
+}
+
+
+def detect_application_provider(url):
+    """Return a conservative provider descriptor for a public application URL."""
+    try:
+        host = (urlparse(str(url or "")).hostname or "").rstrip(".").casefold()
+    except ValueError:
+        host = ""
+    for provider, domains in PROVIDER_HOSTS.items():
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            support = "limited_public_layout" if provider in {"smartrecruiters", "workday"} else "accessibility_first"
+            return {"provider": provider, "support_level": support, "adapter": "shared_semantic_form"}
+    return {"provider": "employer_site", "support_level": "generic_accessible_form", "adapter": "shared_semantic_form"}
 
 
 def classify_control(label, tag="button", control_type="submit", inside_form=False):

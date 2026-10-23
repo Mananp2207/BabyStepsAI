@@ -3,6 +3,8 @@ import os
 import sqlite3
 import sys
 import concurrent.futures
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 import tempfile
 import types
 import unittest
@@ -21,7 +23,10 @@ class FakeField:
     def __init__(self, info): self.info, self.value, self.file, self.checked = info, "", None, False
     def is_visible(self): return True
     def is_enabled(self): return True
-    def evaluate(self, _script): return self.info
+    def evaluate(self, script):
+        if "el.files?.length" in script:
+            return {"count":1 if self.file else 0,"name":Path(self.file).name if self.file else ""}
+        return self.info
     def fill(self, value): self.value = value
     def set_input_files(self, value): self.file = value
     def check(self): self.checked=True
@@ -47,7 +52,7 @@ class FakeQuestionPage:
 class FakeControl(FakeField):
     def __init__(self,page,info): super().__init__(info); self.page=page
     def click(self,**_kwargs):
-        if self.info.get("action")=="safe_next": self.page.stage+=1
+        if self.info.get("action")=="safe_next" and self.page.scenario!="stalled-step": self.page.stage+=1
         elif self.info.get("action")=="apply_button": self.page.url=self.page.url.rsplit("/",1)[0]+"/simple"
         elif self.info.get("type")=="submit": self.page.submission_count+=1
 
@@ -64,6 +69,8 @@ class FakeButton:
 
 class FakePage:
     def __init__(self, client): self.client, self.stage, self.url = client, 0, ""; self.submission_count=0
+    @property
+    def scenario(self): return self.url.rstrip("/").rsplit("/",1)[-1]
     def set_default_timeout(self, _value): pass
     def route(self, *_args): pass
     def goto(self, url, **_kwargs):
@@ -93,6 +100,10 @@ class FakePage:
                     [{"tag":"input","type":"text","name":"name","label":"Full name","required":True},{"tag":"input","type":"email","name":"email","label":"Email","required":True}],
                     [{"tag":"input","type":"text","name":"university","label":"University","required":True},{"tag":"input","type":"text","name":"degree","label":"Degree","required":True},{"tag":"input","type":"text","name":"graduation_year","label":"Graduation year","required":True}],
                     [{"tag":"textarea","type":"textarea","name":"experience","label":"Work experience","required":True}],],
+                "stalled-step": [
+                    [{"tag":"input","type":"text","name":"name","label":"Full name","required":True},{"tag":"input","type":"email","name":"email","label":"Email","required":True}],
+                    [{"tag":"input","type":"text","name":"university","label":"University","required":True},{"tag":"input","type":"text","name":"degree","label":"Degree","required":True},{"tag":"input","type":"text","name":"graduation_year","label":"Graduation year","required":True}],
+                    [{"tag":"textarea","type":"textarea","name":"experience","label":"Work experience","required":True}],],
                 "uncertain": [[{"tag":"select","type":"select-one","name":"authorized","label":"Are you legally authorized to work?","required":True},{"tag":"textarea","type":"textarea","name":"why","label":"Why do you want this job?","required":True}]],
                 "written": [[{"tag":"textarea","type":"textarea","name":"project","label":"Describe a relevant technical project and the technologies used (maximum 120 words)","required":True,"max_length":600}]],
                 "validation": [[{"tag":"input","type":"email","name":"email","label":"Email","required":True},{"tag":"input","type":"text","name":"custom","label":"Required custom question","required":True},{"tag":"input","type":"file","name":"resume","label":"Resume (.docx only)","required":True,"accept":".docx"}]],
@@ -108,7 +119,7 @@ class FakePage:
     def control_infos(self):
         from urllib.parse import urlparse
         scenario=urlparse(self.url).path.rstrip("/").rsplit("/",1)[-1]
-        if scenario=="multi-step" and self.stage<2:
+        if scenario in {"multi-step","stalled-step"} and self.stage<2:
             label="Next" if self.stage==0 else "Continue to work experience"
             return [{"tag":"button","type":"button","label":label,"inside_form":False,"action":"safe_next"}]
         if scenario=="weird-submit": return [{"tag":"button","type":"submit","label":"Continue","inside_form":True,"action":"final_submission"}]
@@ -224,6 +235,49 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertFalse(app["diagnostic"]["submission_performed"])
         self.assertEqual(app["diagnostic"]["steps"],1)
         self.assertEqual(sum(x["result"]=="filled" for x in app["diagnostic"]["filled_fields"]),6)
+        self.assertTrue(app["diagnostic"]["form_detected"])
+        self.assertEqual(app["diagnostic"]["provider"]["adapter"],"shared_semantic_form")
+        self.assertEqual(app["diagnostic"]["filled_fields"][-1]["source"],"active_resume")
+
+    @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")=="1","Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to launch installed Chromium.")
+    def test_real_chromium_local_mock_reaches_ready_for_review_without_submission(self):
+        submitted=[]
+        html=b'''<!doctype html><html><body><h1>Local synthetic application</h1><form>
+          <label>Full Name <input name="name" required></label>
+          <label>Email <input name="email" type="email" required></label>
+          <label>Phone <input name="phone" required></label>
+          <label>Resume <input name="resume" type="file" accept=".pdf" required></label>
+          <button type="submit">Submit application</button></form></body></html>'''
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.startswith("/mock-apps/"):
+                    self.send_response(200);self.send_header("Content-Type","text/html");self.end_headers();self.wfile.write(html)
+                else:self.send_error(404)
+            def do_POST(self):
+                submitted.append(self.path);self.send_error(405)
+            def log_message(self,*_args): pass
+        server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
+        port=server.server_address[1]
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        old_artifacts=app_agent.ARTIFACTS
+        app_agent.ARTIFACTS=Path(self.temp.name)/"artifacts"
+        app_agent.ARTIFACTS.mkdir()
+        self.patch_playwright.stop()
+        try:
+            original_mock_allowed=app_agent._mock_allowed
+            with patch.object(app_agent,"_mock_allowed",side_effect=lambda url:original_mock_allowed(url) or
+                              (url.startswith(f"http://127.0.0.1:{port}/mock-apps/"))):
+                result=app_agent.start_dry_run(app_agent.DryRunRequest(job={"job_key":"real-chromium-local","company":"Synthetic Employer","title":"Synthetic Engineer","application_url":f"http://127.0.0.1:{port}/mock-apps/application"}))
+            app=next(item for item in app_agent.list_applications() if item["id"]==result["application_id"])
+            self.assertEqual(app["state"],"ready_for_review")
+            self.assertTrue(app["diagnostic"]["form_detected"])
+            self.assertEqual(app["diagnostic"]["provider"]["provider"],"employer_site")
+            self.assertIn("active_resume",{item.get("source") for item in app["diagnostic"]["filled_fields"]})
+            self.assertEqual(len(app["diagnostic"]["required_fields"]),4,app["diagnostic"])
+            self.assertFalse(app["diagnostic"]["submission_performed"])
+            self.assertEqual(submitted,[])
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=2);app_agent.ARTIFACTS=old_artifacts
 
     def test_imported_official_job_can_reach_existing_mock_dry_run(self):
         import job_search_agent as jobs
@@ -802,6 +856,13 @@ class ApplicationAgentTests(unittest.TestCase):
         value,key=app_agent._answer({"label":"Graduation month and year"},facts,{})
         self.assertEqual((value,key),("December 2026","graduation_date"))
 
+    def test_preferred_name_uses_only_separate_confirmed_profile_fact(self):
+        value,source=app_agent._answer({"label":"Preferred name","type":"text"},{"preferred_name":"Alex"}, {})
+        self.assertEqual((value,source),("Alex","preferred_name"))
+        value,source=app_agent._answer({"label":"Preferred name","type":"text"},{"full_name":"Alex Example"}, {})
+        self.assertIsNone(value)
+        self.assertIsNone(source)
+
     def test_job_discovery_source_answer_uses_the_recorded_source(self):
         _,candidate,answers=app_agent._candidate()
         job={"job_key":"saved-simple","company":"Example Co","title":"Software Developer","location":"Austin, TX"}
@@ -847,6 +908,17 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(saved["status"],"grounded_draft")
         self.assertFalse(saved["approved"])
         self.assertEqual(self.client.last_page.submission_count,0)
+
+    def test_safe_next_control_must_advance_before_form_can_be_marked_ready(self):
+        app_agent.MOCK_PAGES["stalled-step"]=app_agent.MOCK_PAGES["multi-step"]
+        try:
+            self.post("/api/applications/dry-run",json={"job":{"job_key":"mock-stalled-step","company":"Test Co","title":"Engineer","application_url":"http://127.0.0.1:8000/mock-apps/stalled-step"}})
+            app=self.get("/api/applications")[0]
+            self.assertEqual(app["state"],"needs_user_input")
+            self.assertTrue(any("did not advance" in x for x in app["diagnostic"]["unanswered_fields"]))
+            self.assertFalse(app["diagnostic"]["submission_performed"])
+        finally:
+            app_agent.MOCK_PAGES.pop("stalled-step",None)
 
     def test_unvalidated_ai_answer_is_not_inserted_and_requests_review(self):
         _,candidate,answers=app_agent._candidate()

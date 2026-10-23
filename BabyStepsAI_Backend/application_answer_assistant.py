@@ -25,6 +25,8 @@ from candidate_verification import verified_values_from_json
 router = APIRouter()
 MODEL = "qwen2.5:3b"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 TIMEOUT = (5, 90)
 ATTEMPTS = 2
 _DRAFT_CACHE = OrderedDict()
@@ -155,7 +157,7 @@ class DraftRequest(BaseModel):
     regenerate: bool = False
 
 
-ORDINARY_PROMPT = re.compile(r"\b(why|describe|tell me about|what interests|how have you|which programming|what programming|programming languages|what technologies|technical project|relevant project|challenge you solved|experience with|software engineering experience|what makes you (?:a )?good candidate|tell me about a time)\b", re.I)
+ORDINARY_PROMPT = re.compile(r"\b(why|describe|tell me about|what interests|how have you|which programming|what programming|programming languages|what technologies|technical project|relevant project|challenge you solved|experience with|software engineering experience|what makes you (?:a )?good candidate|tell me about a time|cover letter)\b", re.I)
 SENSITIVE_PROMPT = re.compile(r"\b(work authorization|authorized to work|authori[sz]ed? to work|legally eligible to work|visa|sponsor|immigration|disability|demographic|gender|race|ethnic|criminal|background check|attest|certify|legal declaration|captcha|human verification|did you use (?:ai|automation)|have you used (?:ai|automation)|are you using (?:ai|automation)|automation disclosure|referral)\b", re.I)
 
 
@@ -311,12 +313,64 @@ def parse_answer_limits(question, max_chars=None, max_words=None):
     return max_chars,max_words
 
 
+def _draft_schema():
+    return {"type":"OBJECT","properties":{
+        "answer":{"type":"STRING"},
+        "needs_user_input":{"type":"BOOLEAN"},
+        "evidence_used":{"type":"ARRAY","items":{"type":"STRING"}},
+    },"required":["answer","needs_user_input","evidence_used"]}
+
+
+def _model_draft(prompt, provider):
+    if provider=="gemini":
+        api_key=os.getenv("GEMINI_API_KEY","").strip()
+        if not api_key:
+            raise RuntimeError("Gemini is selected, but GEMINI_API_KEY is not configured on this server.")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}",GEMINI_MODEL):
+            raise RuntimeError("The configured Gemini model name is invalid.")
+        response=requests.post(GEMINI_URL.format(model=GEMINI_MODEL),
+            headers={"x-goog-api-key":api_key},
+            json={"contents":[{"role":"user","parts":[{"text":prompt}]}],
+                  "generationConfig":{"temperature":0,"responseMimeType":"application/json","responseSchema":_draft_schema()}},
+            timeout=TIMEOUT)
+        if response.status_code in {401,403}:
+            raise RuntimeError("Gemini rejected the configured API key or model access.")
+        response.raise_for_status()
+        envelope=response.json()
+        candidates=envelope.get("candidates") if isinstance(envelope,dict) else None
+        parts=(candidates[0].get("content") or {}).get("parts") or [] if candidates else []
+        text="\n".join(part.get("text","") for part in parts if isinstance(part,dict))
+        if not text:
+            raise ValueError("Gemini returned no structured answer content.")
+        result=json.loads(text)
+        if not isinstance(result,dict):
+            raise ValueError("Gemini answer content was not a JSON object.")
+        return result
+    if provider!="ollama":
+        raise RuntimeError("Unsupported application answer provider.")
+    with OLLAMA_LOCK:
+        response=requests.post(OLLAMA,json={"model":MODEL,"prompt":prompt,"stream":False,"format":"json",
+            "options":{"temperature":0.1,"num_ctx":4096,"num_predict":350}},timeout=TIMEOUT)
+        response.raise_for_status()
+        payload=response.json()
+    if not isinstance(payload,dict) or not isinstance(payload.get("response"),str):
+        raise ValueError("Ollama returned an invalid answer envelope.")
+    result=json.loads(payload["response"])
+    if not isinstance(result,dict):
+        raise ValueError("Ollama answer content was not a JSON object.")
+    return result
+
+
 def generate_draft(question, facts, preferences, job, description, max_chars=None, max_words=None, regenerate=False, avoid_answer=None):
     limit = min(max_chars or MAX_ANSWER_CHARS, MAX_ANSWER_CHARS, 1200)
     reusable=preferences.get("_reusable_answers",[])
     preferences={k:v for k,v in preferences.items() if k!="_reusable_answers"}
     word_limit=max_words if max_words and max_words>0 else None
-    context={"question":question,"facts":facts,"preferences":preferences,"reusable":reusable,"job":job,"description":description,"max_chars":limit,"max_words":word_limit,"avoid_answer":avoid_answer or ""}
+    authorization=get_authorization()["settings"]
+    provider=authorization.get("matching_provider","ollama")
+    if provider not in {"ollama","gemini"}:provider="ollama"
+    model=GEMINI_MODEL if provider=="gemini" else MODEL
+    context={"question":question,"facts":facts,"preferences":preferences,"reusable":reusable,"job":job,"description":description,"max_chars":limit,"max_words":word_limit,"avoid_answer":avoid_answer or "","provider":provider,"model":model}
     cache_key=hashlib.sha256(json.dumps(context,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
     with _DRAFT_CACHE_LOCK:
         cached=_DRAFT_CACHE.get(cache_key)
@@ -337,12 +391,7 @@ Previously confirmed non-sensitive application answers: {json.dumps(reusable,ens
     last = None
     for attempt in range(ATTEMPTS):
         try:
-            with OLLAMA_LOCK:
-                response = requests.post(OLLAMA, json={"model":MODEL,"prompt":prompt,"stream":False,"format":"json",
-                    "options":{"temperature":0.1,"num_ctx":4096,"num_predict":350}}, timeout=TIMEOUT)
-                response.raise_for_status()
-                payload = response.json()
-            result = json.loads(payload.get("response", "{}")) if isinstance(payload, dict) else {}
+            result=_model_draft(prompt,provider)
             answer = result.get("answer") if isinstance(result, dict) else None
             if result.get("needs_user_input") or not isinstance(answer,str) or not answer.strip():
                 outcome={"answer":"","needs_user_input":True,"evidence_used":[],"max_chars":limit,"max_words":word_limit,"validation":{"valid":False,"problems":["The model reported insufficient evidence."],"sources":[]}}
@@ -356,10 +405,13 @@ Previously confirmed non-sensitive application answers: {json.dumps(reusable,ens
                 _DRAFT_CACHE[cache_key]=dict(outcome); _DRAFT_CACHE.move_to_end(cache_key)
                 while len(_DRAFT_CACHE)>MAX_CACHED_DRAFTS: _DRAFT_CACHE.popitem(last=False)
             return outcome
-        except (requests.RequestException, ValueError, TypeError) as error:
+        except (requests.RequestException, ValueError, TypeError, RuntimeError) as error:
             last = type(error).__name__
+            if isinstance(error,RuntimeError) and ("not configured" in str(error) or "rejected" in str(error) or "invalid" in str(error)):
+                raise HTTPException(503,str(error)+" No answer was generated.") from error
             if attempt + 1 < ATTEMPTS: time.sleep(.35 * (attempt + 1))
-    raise HTTPException(503, f"The local answer assistant is unavailable ({last or 'model error'}). Your application was not submitted.")
+    label="local" if provider=="ollama" else provider.title()
+    raise HTTPException(503, f"The {label} answer assistant is unavailable ({last or 'model error'}). No answer was generated, and your application was not submitted.")
 
 
 @router.post("/api/application-answers/draft")

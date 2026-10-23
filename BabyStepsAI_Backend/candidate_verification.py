@@ -21,6 +21,7 @@ router = APIRouter()
 
 FIELDS = {
     "full_name": ("Contact", "Full name", "text", False),
+    "preferred_name": ("Contact", "Preferred name", "text", False),
     "email": ("Contact", "Email address", "email", False),
     "phone": ("Contact", "Phone number", "tel", False),
     "github": ("Links", "GitHub URL", "url", False),

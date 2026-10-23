@@ -16,6 +16,12 @@ class FakeResponse:
     def raise_for_status(self): pass
     def json(self): return {"response":json.dumps(self.value)}
 
+class FakeGeminiResponse:
+    status_code=200
+    def __init__(self,value): self.value=value
+    def raise_for_status(self): pass
+    def json(self): return {"candidates":[{"content":{"parts":[{"text":json.dumps(self.value)}]}}]}
+
 
 class ApplicationAnswerAssistantTests(unittest.TestCase):
     def setUp(self):
@@ -76,6 +82,11 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
             with self.assertRaises(HTTPException) as caught:
                 assistant.draft_application_answer(assistant.DraftRequest(question=question))
             self.assertEqual(caught.exception.status_code,422)
+
+    def test_cover_letter_text_field_is_ordinary_but_sensitive_questions_stay_blocked(self):
+        self.assertTrue(assistant.ORDINARY_PROMPT.search("Please provide a cover letter (maximum 400 words)."))
+        self.assertFalse(assistant.SENSITIVE_PROMPT.search("Please provide a cover letter."))
+        self.assertTrue(assistant.SENSITIVE_PROMPT.search("Are you authorized to work?"))
 
     def test_successful_draft_uses_confirmed_facts_and_excludes_private_or_sensitive_facts(self):
         def mocked_post(_url,**kwargs):
@@ -146,6 +157,35 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
             with self.assertRaises(Exception) as caught:
                 assistant.draft_application_answer(assistant.DraftRequest(question="Why do you want this company?"))
         self.assertIn("answer assistant is unavailable",str(caught.exception))
+
+    def test_selected_gemini_provider_uses_structured_output_and_confirmed_context(self):
+        assistant._DRAFT_CACHE.clear()
+        with patch.dict(os.environ,{"GEMINI_API_KEY":"test-only-key"}):
+            assistant.update_authorization(assistant.AuthorizationUpdate(allow_ai_drafting=True,matching_provider="gemini"))
+            def post(url,**kwargs):
+                self.assertIn("generateContent",url)
+                self.assertEqual(kwargs["headers"]["x-goog-api-key"],"test-only-key")
+                self.assertEqual(kwargs["json"]["generationConfig"]["responseMimeType"],"application/json")
+                self.assertIn("Telemetry API",kwargs["json"]["contents"][0]["parts"][0]["text"])
+                return FakeGeminiResponse({"answer":"I built a Python telemetry API and am interested in this backend role.",
+                    "needs_user_input":False,"evidence_used":["confirmed candidate project","saved job posting"]})
+            with patch.object(assistant.requests,"post",side_effect=post) as mocked:
+                result=assistant.generate_draft("Why are you interested in this backend role?",
+                    {"projects":[{"name":"Telemetry API","technologies":["Python"]}]},{},
+                    {"title":"Backend Engineer"},"The backend team builds APIs.")
+        self.assertFalse(result["needs_user_input"])
+        mocked.assert_called_once()
+
+    def test_selected_gemini_without_key_fails_clearly_without_fallback(self):
+        from fastapi import HTTPException
+        assistant.update_authorization(assistant.AuthorizationUpdate(allow_ai_drafting=True,matching_provider="gemini"))
+        with patch.dict(os.environ,{"GEMINI_API_KEY":""}):
+            with patch.object(assistant.requests,"post") as mocked:
+                with self.assertRaises(HTTPException) as caught:
+                    assistant.generate_draft("Why this position?",{"technical_skills":["Python"]},{},
+                        {"title":"Engineer"},"Python software role.")
+        self.assertIn("GEMINI_API_KEY",str(caught.exception.detail))
+        mocked.assert_not_called()
 
     def test_ollama_connection_failure_returns_clear_local_service_error(self):
         import requests

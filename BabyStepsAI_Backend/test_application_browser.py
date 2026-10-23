@@ -1,9 +1,17 @@
 import unittest
 
-from application_browser import apply_targets, classify_control, page_interruption, submission_controls
+from application_browser import apply_targets, classify_control, detect_application_provider, page_interruption, submission_controls
 
 
 class ApplicationBrowserSafetyTests(unittest.TestCase):
+    def test_provider_detection_is_conservative_and_exposes_limited_coverage(self):
+        self.assertEqual(detect_application_provider("https://jobs.ashbyhq.com/example/123")["provider"],"ashby")
+        self.assertEqual(detect_application_provider("https://boards.greenhouse.io/example/jobs/1")["provider"],"greenhouse")
+        self.assertEqual(detect_application_provider("https://jobs.lever.co/example/1")["provider"],"lever")
+        self.assertEqual(detect_application_provider("https://jobs.smartrecruiters.com/Example/1")["support_level"],"limited_public_layout")
+        self.assertEqual(detect_application_provider("https://example.myworkdayjobs.com/en-US/jobs/1")["support_level"],"limited_public_layout")
+        self.assertEqual(detect_application_provider("https://careers.example.test/jobs/1")["provider"],"employer_site")
+
     def test_next_is_only_safe_with_specific_button_semantics(self):
         self.assertEqual(classify_control("Next", "button", "button"), "safe_next")
         self.assertEqual(classify_control("Continue", "button", "button"), "ambiguous")
