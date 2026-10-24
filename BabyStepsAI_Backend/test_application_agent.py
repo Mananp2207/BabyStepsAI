@@ -406,6 +406,12 @@ class ApplicationAgentTests(unittest.TestCase):
         unresolved={**base,"submission_control_status":"detected_visible",
                     "unresolved_controls":[{"question":"Are you legally authorized?","required":True,"reasons":["Unknown type"]}]}
         self.assertIn("Required form controls could not be identified reliably",app_agent._preparation_inspection_blocker(unresolved))
+        unknown={**base,"submission_control_status":"detected_visible",
+                 "unknown_requirement_questions":[{"question":"Upload supporting document"}]}
+        self.assertIn("Required status is unknown",app_agent._preparation_inspection_blocker(unknown))
+        upload={**base,"submission_control_status":"detected_visible",
+                "unresolved_controls":[{"question":"Resume/CV*","kind":"file_upload_prompt","required":True}]}
+        self.assertIn("Resume/CV*",app_agent._preparation_inspection_blocker(upload))
 
     def test_required_marker_recognizes_suffix_asterisk_used_by_greenhouse(self):
         self.assertTrue(app_agent._required_marker("Resume/CV*"))
@@ -571,7 +577,7 @@ class ApplicationAgentTests(unittest.TestCase):
           <label>Full Name <input name="name" required></label>
           <label>Email <input name="email" type="email" required></label>
           <label>Phone <input name="phone" required></label>
-          <label>Resume <input name="resume" type="file" accept=".pdf" required></label>
+          <div class="application--field"><label for="resume">Resume*</label><button type="button" aria-controls="resume">Attach</button><input id="resume" name="resume" type="file" accept=".pdf" required style="display:none"></div>
           <button type="submit">Submit application</button></form></body></html>'''
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -604,8 +610,11 @@ class ApplicationAgentTests(unittest.TestCase):
             self.assertFalse(app["diagnostic"]["submission_performed"])
             self.assertEqual(inspection["inspection_outcome"],"compatible",json.dumps(inspection))
             self.assertTrue(inspection["submission_control_detected"])
-            self.assertEqual(inspection["required_fields"],["Full Name","Email","Phone","Resume"])
-            self.assertEqual(inspection["file_upload_controls"],["Resume"])
+            self.assertEqual(inspection["required_fields"],["Full Name","Email","Phone","Resume*"])
+            self.assertEqual(inspection["file_upload_controls"],["Resume*"])
+            self.assertTrue(inspection["upload_control_details"][0]["supported"])
+            self.assertEqual(inspection["upload_control_details"][0]["mechanism"],"hidden_native_input")
+            self.assertEqual(inspection["upload_control_details"][0]["association_method"],"accessible_label")
             self.assertEqual(inspection["page_metadata"]["job_title"],"Local synthetic application")
             self.assertEqual(inspection["page_metadata"]["employer"],"Synthetic Employer")
             self.assertEqual(inspection["page_metadata"]["employer_source"],"document_title")
@@ -1127,9 +1136,10 @@ class ApplicationAgentTests(unittest.TestCase):
     def test_submit_control_with_unusual_continue_label_is_never_clicked(self):
         app_agent.start_dry_run(app_agent.DryRunRequest(job={"job_key":"mock-weird-submit","company":"Mock Co","title":"Developer","application_url":"http://127.0.0.1:8000/mock-apps/weird-submit"}))
         item=app_agent.list_applications()[0]
-        self.assertEqual(item["state"],"ready_for_review")
+        self.assertEqual(item["state"],"needs_user_input")
         self.assertFalse(item["diagnostic"]["submission_performed"])
         self.assertIn("Continue",item["diagnostic"]["submission_controls"])
+        self.assertNotEqual(item["state"],"ready_for_review")
         self.assertEqual(self.client.last_page.submission_count,0)
 
     def test_checkbox_and_radio_answers_use_confirmed_profile_values(self):
@@ -1332,6 +1342,10 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertIn("/api/applications/form-inspections",page)
         self.assertIn("no candidate information entered",page)
         self.assertIn("Form compatibility",page)
+        self.assertIn("Upload controls",page)
+        self.assertIn("accepted:",page)
+        self.assertIn("Submission boundary controls",page)
+        self.assertIn("form action path:",page)
 
     def test_structured_profile_answers_cover_location_education_employment_and_projects(self):
         profile.update_verification(profile.VerificationUpdate(values={

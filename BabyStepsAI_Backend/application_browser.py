@@ -7,8 +7,8 @@ from urllib.parse import urlparse
 
 
 FINAL_WORDING = re.compile(
-    r"\b(submit|send|apply|finish|complete)\b.*\b(application|my application|your application)\b|"
-    r"\b(submit application|send application|apply now|finish application|complete application)\b",
+    r"\b(submit|send|finish|complete)\b.*\b(application|my application|your application)\b|"
+    r"\b(submit application|send application|finish application|complete application)\b",
     re.I,
 )
 REVIEW_WORDING = re.compile(r"\b(review|preview)\b", re.I)
@@ -16,6 +16,21 @@ AUTH_WORDING = re.compile(r"\b(sign in|log in|login|authentication required|crea
 EXPIRED_WORDING = re.compile(r"\b(job (has )?expired|position (is )?no longer available|job is closed|no longer accepting applications)\b", re.I)
 HUMAN_WORDING = re.compile(r"\b(captcha|verify you are human|human verification|security challenge|robot check)\b", re.I)
 AUTOMATION_RESTRICTION = re.compile(r"\b(automated applications? (?:are )?not permitted|do not use (?:bots|automation|automated tools)|no automated submissions|automation is prohibited|must complete (?:this|the) application (?:yourself|manually))\b", re.I)
+
+
+def _upload_purpose(value):
+    """Infer an upload purpose only from explicit labels or stable field identifiers."""
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+    if re.search(r"\b(resume|curriculum vitae|cv)\b", text): return "resume"
+    if re.search(r"\bcover letter\b", text): return "cover_letter"
+    if re.search(r"\btranscript\b", text): return "transcript"
+    if re.search(r"\bcertificate\b", text): return "certificate"
+    if re.search(r"\b(portfolio|work sample)\b", text): return "portfolio"
+    return "unspecified"
+
+
+def _normalized_question(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 # Provider recognition is descriptive. All adapters share the same semantic
 # field reader and safety gates; recognizing a host never implies that every
@@ -50,19 +65,23 @@ def classify_control(label, tag="button", control_type="submit", inside_form=Fal
     # submit buttons. Keeping these out of the report avoids false warnings.
     if text.casefold() in {"accept", "accept all", "necessary only", "customize settings", "deny", "reject", "decline", "create alert", "allow all", "manage preferences", "manage cookies"} or re.fullmatch(r"\d+", text):
         return "other"
+    if re.fullmatch(r"(?:attach|upload|choose file|browse)(?:\s+(?:file|resume|document))?",text,re.I):
+        return "other"
     if str(tag).casefold() == "a" and re.fullmatch(r"apply(?: now)?", text, re.I):
         return "apply_link"
-    if str(tag).casefold() == "button" and str(control_type).casefold() == "button" and re.fullmatch(r"apply(?: now)?", text, re.I):
-        return "ambiguous" if inside_form else "apply_button"
-    if FINAL_WORDING.search(text) or str(control_type).casefold() == "submit":
-        return "final_submission"
-    if REVIEW_WORDING.search(text):
-        return "review"
     if text.casefold() in {"next", "next step", "go to next step"} and str(control_type).casefold() == "button":
         return "safe_next"
     if re.fullmatch(r"(?:continue|save and continue) to (?:the )?(?:next )?(?:step|section|education|experience|work experience|work history|additional information|questions|review)", text, re.I) and str(control_type).casefold() == "button":
         return "safe_next"
-    if text.casefold() in {"continue", "save", "apply", "apply now"}:
+    if FINAL_WORDING.search(text):
+        return "final_submission"
+    if str(tag).casefold() == "button" and re.fullmatch(r"apply(?: now)?", text, re.I):
+        return "ambiguous" if inside_form else "apply_button"
+    if REVIEW_WORDING.search(text):
+        return "review"
+    if text.casefold() in {"continue", "save", "apply", "apply now", "submit", "send"}:
+        return "ambiguous"
+    if str(control_type).casefold() == "submit":
         return "ambiguous"
     return "other"
 
@@ -104,7 +123,15 @@ def submission_controls(controls):
         label = str(control.get("label") or "").strip()
         action = classify_control(label, control.get("tag"), control.get("type"), control.get("inside_form", False))
         if action in {"final_submission", "ambiguous"}:
-            found.append({"label": label[:160], "action": action})
+            item={"label": label[:160], "action": action,
+                  "tag":str(control.get("tag") or "")[:30],
+                  "type":str(control.get("type") or "")[:30],
+                  "visible":bool(control.get("visible",True)),
+                  "enabled":not bool(control.get("disabled",False)),
+                  "inside_form":bool(control.get("inside_form",False))}
+            for key in ("aria_label","form_id","form_action_path","form_method","id","name"):
+                if control.get(key): item[key]=str(control[key])[:160]
+            found.append(item)
     return found
 
 
@@ -134,7 +161,7 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         group["conditional"] = bool(group["conditional"] or item.get("conditional"))
         if kind not in group["control_types"]: group["control_types"].append(kind)
         control = {"kind": kind, "required":("unknown" if item.get("required") is None else bool(item.get("required"))), "label": str(item.get("label") or "")[:160]}
-        for key_name in ("tag", "input_type", "role", "name", "id", "class_hint", "container_class_hint", "aria_hints", "container_control_count", "possible_custom_selector", "unresolved_reason"):
+        for key_name in ("tag", "input_type", "role", "name", "id", "class_hint", "container_class_hint", "aria_hints", "container_control_count", "possible_custom_selector", "unresolved_reason", "accept", "upload_purpose", "label_text", "aria_label", "aria_labelledby_text", "associated_question"):
             if item.get(key_name) not in (None, "", False): control[key_name] = str(item[key_name])[:120] if not isinstance(item[key_name], bool) else True
         if kind == "file":
             control["upload_purpose"] = str(item.get("upload_purpose") or "unspecified")[:40]
@@ -165,10 +192,12 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         purpose=str(control.get("upload_purpose") or "unspecified")[:40]
         required=control.get("upload_required")
         upload_prompts.append({"question":question or "Unresolved file upload", "purpose":purpose,
-            "required":("unknown" if required is None else bool(required)),"verified_input":False})
-    # A visible Attach/Upload trigger is an applicant-facing question even if
-    # the employer hides or omits its backing file input from the public DOM.
-    # Retain it in question counts, but keep its control explicitly unresolved.
+            "required":("unknown" if required is None else bool(required)),"verified_input":False,
+            "mechanism":"unresolved","association_method":"unresolved","accepted_types":[],
+            "input_id":"","input_name":"","input_visible":False,"supported":False})
+    # A visible Attach/Upload trigger is an applicant-facing question even when
+    # the provider hides its native input. Do not count that implementation
+    # input as a second question.
     for prompt in upload_prompts:
         question=prompt["question"]
         key="question:"+re.sub(r"[^a-z0-9]+"," ",question.casefold()).strip() if question!="Unresolved file upload" else "unresolved|upload_prompt"
@@ -179,6 +208,86 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         if "file_upload_prompt" not in group["control_types"]:group["control_types"].append("file_upload_prompt")
         group["controls"].append({"kind":"file_upload_prompt","required":prompt["required"],"label":question,
             "upload_purpose":prompt["purpose"],"verified_input":False})
+
+    hidden_files=[item for item in ignored_controls if item.get("input_type")=="file"]
+    upload_inputs=[]
+    for item in fields:
+        if item.get("kind")!="file": continue
+        upload_inputs.append({"id":str(item.get("id") or ""),"name":str(item.get("name") or ""),
+            "purpose":item.get("upload_purpose") or _upload_purpose(" ".join(str(item.get(k) or "") for k in ("question","label","id","name"))),
+            "question":str(item.get("question") or item.get("label") or ""),"accept":str(item.get("accept") or ""),
+            "visible":True,"mechanism":"visible_native_input","source":item})
+    for item in hidden_files:
+        identity=" ".join(str(item.get(key) or "") for key in ("id","name","label_text","aria_label","aria_labelledby_text","associated_question"))
+        upload_inputs.append({"id":str(item.get("id") or ""),"name":str(item.get("name") or ""),
+            "purpose":item.get("upload_purpose") or _upload_purpose(identity),
+            "question":str(item.get("associated_question") or item.get("label_text") or item.get("aria_labelledby_text") or ""),
+            "accept":str(item.get("accept") or ""),"visible":False,"mechanism":"hidden_native_input","source":item})
+    used_input_indexes=set()
+    upload_control_details=[]
+    canonical_ids={"resume":{"resume","resumeupload","cv"},
+                   "cover_letter":{"coverletter","coverletterupload"},
+                   "transcript":{"transcript","transcriptupload"},
+                   "certificate":{"certificate","certificateupload"},
+                   "portfolio":{"portfolio","portfoliodocument"}}
+    for prompt in upload_prompts:
+        qkey=_normalized_question(prompt.get("question")); purpose=prompt.get("purpose") or "unspecified"
+        candidates=[]
+        for index,backing in enumerate(upload_inputs):
+            if index in used_input_indexes: continue
+            source=backing["source"]
+            labels=" ".join(str(source.get(key) or "") for key in ("label_text","aria_label","aria_labelledby_text","associated_question","question","label"))
+            normalized_labels=_normalized_question(labels)
+            label_match=bool(qkey and normalized_labels and (normalized_labels==qkey or normalized_labels in qkey or qkey in normalized_labels))
+            if label_match:
+                candidates.append((index,"accessible_label")); continue
+            reference_ids={str(source.get(key) or "") for key in ("id","name")}
+            trigger_ids={str(control.get(key) or "") for control in controls if control.get("upload_prompt") and
+                _normalized_question(control.get("upload_question"))==qkey for key in ("upload_target_id","aria_controls","for")}
+            if reference_ids & trigger_ids - {""}:
+                candidates.append((index,"trigger_reference")); continue
+            if qkey and _normalized_question(backing.get("question"))==qkey:
+                candidates.append((index,"shared_question")); continue
+            if purpose!="unspecified" and backing["purpose"]==purpose:
+                same_purpose=[i for i,b in enumerate(upload_inputs) if b["purpose"]==purpose]
+                same_prompt=[p for p in upload_prompts if p.get("purpose")==purpose]
+                identifier=re.sub(r"[^a-z0-9]","",(backing.get("id") or backing.get("name") or "").casefold())
+                if len(same_purpose)==1 and len(same_prompt)==1 and identifier in canonical_ids.get(purpose,set()):
+                    candidates.append((index,"provider_field_identifier"))
+        if len(candidates)==1:
+            index,method=candidates[0]; backing=upload_inputs[index]; used_input_indexes.add(index)
+            prompt.update({"verified_input":True,"mechanism":backing["mechanism"],"association_method":method,
+                "accepted_types":[value.strip() for value in backing["accept"].split(",") if value.strip()],
+                "input_id":backing["id"],"input_name":backing["name"],"input_visible":backing["visible"],"supported":True})
+            upload_control_details.append({"question":prompt["question"],"purpose":purpose,"required":prompt["required"],
+                "mechanism":backing["mechanism"],"association_method":method,"accepted_types":prompt["accepted_types"],
+                "input_id":backing["id"],"input_name":backing["name"],"input_visible":backing["visible"],
+                "supported":True,"unresolved_reason":""})
+            group_key="question:"+qkey if qkey else "unresolved|upload_prompt"
+            group=questions_by_key.get(group_key)
+            if group:
+                group["control_types"]=["file" if kind=="file_upload_prompt" else kind for kind in group["control_types"]]
+                group["controls"]=[({**control,"kind":"file","verified_input":True,"upload_mechanism":backing["mechanism"],
+                    "association_method":method,"accept":backing["accept"]} if control.get("kind")=="file_upload_prompt" else control) for control in group["controls"]]
+        else:
+            if candidates:
+                prompt.update({"association_method":"ambiguous","mechanism":"ambiguous",
+                    "unresolved_reason":"More than one file input could match this upload question."})
+            else:
+                prompt["unresolved_reason"]="No file input could be associated with this upload question using public structural or accessibility metadata."
+            upload_control_details.append({"question":prompt["question"],"purpose":purpose,"required":prompt["required"],
+                "mechanism":prompt["mechanism"],"association_method":prompt["association_method"],"accepted_types":[],
+                "input_id":"","input_name":"","input_visible":False,"supported":False,
+                "unresolved_reason":prompt["unresolved_reason"]})
+    for index,backing in enumerate(upload_inputs):
+        if index in used_input_indexes or backing["mechanism"]!="visible_native_input": continue
+        source=backing["source"]
+        upload_control_details.append({"question":backing["question"] or "Unlabeled file upload",
+            "purpose":backing["purpose"],"required":("unknown" if source.get("required") is None else bool(source.get("required"))),
+            "mechanism":backing["mechanism"],"association_method":"visible_question_control",
+            "accepted_types":[value.strip() for value in backing["accept"].split(",") if value.strip()],
+            "input_id":backing["id"],"input_name":backing["name"],"input_visible":True,"supported":True,
+            "unresolved_reason":""})
     questions=[item for item in questions_by_key.values() if item.get("question")]
     required_questions=[item for item in questions if item["required"] is True]
     optional_questions=[item for item in questions if item["required"] is False]
@@ -201,8 +310,9 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
             unresolved_controls.append({"question":str(item.get("question") or item.get("label") or "Unlabeled control")[:160],
                 "kind":str(item.get("kind") or "unknown")[:40],"required":("unknown" if item.get("required") is None else bool(item.get("required"))),"reasons":list(dict.fromkeys(reasons))})
     for prompt in upload_prompts:
-        unresolved_controls.append({"question":prompt["question"],"kind":"file_upload_prompt","required":prompt["required"],
-            "reasons":["A visible upload button was found, but its file input was not exposed in read-only inspection."]})
+        if not prompt.get("supported"):
+            unresolved_controls.append({"question":prompt["question"],"kind":"file_upload_prompt","required":prompt["required"],
+                "reasons":[prompt.get("unresolved_reason") or "A visible upload prompt could not be associated with a supported file input."]})
     human_actions = []
     if interruption == "human_verification": human_actions.append("CAPTCHA or human verification")
     elif interruption == "authentication_required": human_actions.append("Employer sign-in is required")
@@ -217,15 +327,20 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         outcome = "inaccessible"
     elif not form_detected:
         outcome = "unsupported"
-    elif unsupported or unresolved_controls or submission_status in {"not_detected_unresolved","ambiguous_unresolved"}:
+    elif unsupported or unresolved_controls or unknown_requirement_questions or submission_status in {"not_detected_unresolved","ambiguous_unresolved"}:
         outcome = "partially_compatible"
     else:
         outcome = "compatible"
     structural_signature={"provider":(provider or {}).get("provider"),
         "questions":[{"id":item.get("question_id"),"types":item.get("control_types"),
             "required":item.get("required"),"conditional":item.get("conditional")} for item in questions],
+        "uploads":[{"question":item.get("question"),"purpose":item.get("purpose"),"required":item.get("required"),
+            "mechanism":item.get("mechanism"),"association":item.get("association_method"),
+            "accepted_types":item.get("accepted_types"),"supported":item.get("supported")} for item in upload_control_details],
         "unresolved":[{"kind":item.get("kind"),"required":item.get("required")} for item in unresolved_controls],
-        "submission":submission_status,"multi_step":multi_step}
+        "submission":{"status":submission_status,"controls":[{"label":item.get("label"),"action":item.get("action"),
+            "type":item.get("type"),"enabled":item.get("enabled"),"inside_form":item.get("inside_form"),
+            "form_action_path":item.get("form_action_path")} for item in actions]},"multi_step":multi_step}
     form_fingerprint=hashlib.sha256(json.dumps(structural_signature,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode("ascii")).hexdigest()
     return {
         "provider": dict(provider or {}),
@@ -265,7 +380,8 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         "conditional_questions": [item["question"] for item in questions if item.get("conditional")],
         "conditional_detection_note": "Read-only inspection can identify explicit conditional markers only; it does not activate controls to reveal other conditional questions.",
         "required_fields": required[:100],
-        "file_upload_controls": upload_fields[:30],
+        "file_upload_controls": list(dict.fromkeys(upload_fields + [item["question"] for item in upload_control_details if item.get("supported")]))[:30],
+        "upload_control_details": upload_control_details[:30],
         "human_actions_required": human_actions,
         "multi_step_detected": multi_step,
         "submission_control_detected": bool(final_actions),
@@ -275,13 +391,15 @@ def summarize_form_metadata(provider, fields, controls, interruption=None, expir
         "form_fingerprint": form_fingerprint,
         "compatibility_status": ("needs_human_action" if interruption in {"human_verification","authentication_required","automation_restricted","cookie_preference_required"} else
             "inaccessible" if expired else "unsupported" if not form_detected else
-            "unresolved" if unresolved_controls or submission_status in {"not_detected_unresolved","ambiguous_unresolved"} else
+            "unresolved" if unresolved_controls or unknown_requirement_questions or submission_status in {"not_detected_unresolved","ambiguous_unresolved"} else
             "partially_compatible" if unsupported else "compatible"),
         "inspection_outcome": outcome,
         "reason": ("The page requires a human action before its form can be inspected." if human_actions else
                    "No public application form was detected." if not form_detected else
                    "Some required fields or control semantics could not be resolved." if unresolved_controls else
+                   "Required status is unknown for one or more applicant questions." if unknown_requirement_questions else
                    "The final submission control could not be identified reliably." if submission_status in {"not_detected_unresolved","ambiguous_unresolved"} else
+                   "One or more upload questions could not be associated with a supported file input." if any(not item.get("supported") for item in upload_control_details) else
                    "Some controls use unsupported or custom semantics." if unsupported else
                    "Public form metadata was inspected without entering or submitting information."),
     }
