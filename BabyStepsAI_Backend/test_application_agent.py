@@ -286,6 +286,7 @@ class ApplicationAgentTests(unittest.TestCase):
     def test_standalone_compatibility_check_needs_no_saved_match_or_candidate_data(self):
         report={"application_url":"https://user:password@jobs.lever.co/example/role?session=secret","provider":{"provider":"lever"},
                 "form_detected":False,"page_classification":"job_posting","inspection_outcome":"unsupported",
+                "robots_policy":"verified_allow",
                 "fields":[],"supported_fields":[],"unsupported_fields":[],"required_fields":[],
                 "file_upload_controls":[],"human_actions_required":[],"multi_step_detected":False,
                 "submission_control_detected":False,"reason":"A job posting was reached; no application form was exposed."}
@@ -298,6 +299,10 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(result["page_classification"],"job_posting")
         self.assertNotIn("session=secret",json.dumps(result)); self.assertNotIn("password",json.dumps(result))
         self.assertEqual(result["source_url"],"https://jobs.lever.co/example/role")
+        self.assertTrue(result.get("inspection_timestamp"))
+        self.assertTrue(result.get("canonical_application_url"))
+        self.assertTrue(result.get("form_fingerprint"))
+        self.assertEqual(result.get("compatibility_status"),"posting_only")
         self.assertEqual(app_agent.list_applications(),before)
         with app_agent.connect() as db:
             row=db.execute("SELECT job_key,report_json FROM application_form_inspections WHERE id=?",(result["inspection_id"],)).fetchone()
@@ -562,7 +567,7 @@ class ApplicationAgentTests(unittest.TestCase):
     @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")=="1","Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to launch installed Chromium.")
     def test_real_chromium_local_mock_reaches_ready_for_review_without_submission(self):
         submitted=[]
-        html=b'''<!doctype html><html><body><h1>Local synthetic application</h1><form>
+        html=b'''<!doctype html><html><head><title>Job Application for Synthetic Engineer at Synthetic Employer</title></head><body><h1>Local synthetic application</h1><form>
           <label>Full Name <input name="name" required></label>
           <label>Email <input name="email" type="email" required></label>
           <label>Phone <input name="phone" required></label>
@@ -601,6 +606,9 @@ class ApplicationAgentTests(unittest.TestCase):
             self.assertTrue(inspection["submission_control_detected"])
             self.assertEqual(inspection["required_fields"],["Full Name","Email","Phone","Resume"])
             self.assertEqual(inspection["file_upload_controls"],["Resume"])
+            self.assertEqual(inspection["page_metadata"]["job_title"],"Local synthetic application")
+            self.assertEqual(inspection["page_metadata"]["employer"],"Synthetic Employer")
+            self.assertEqual(inspection["page_metadata"]["employer_source"],"document_title")
             self.assertNotIn("candidate@example.test",json.dumps(inspection))
             self.assertEqual(submitted,[])
         finally:
@@ -869,6 +877,17 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertTrue(app_agent._current_preparation_authorization(key,"r1",url))
         profile.update_verification(profile.VerificationUpdate(values={"full_name":"Candidate Updated","email":"candidate@example.test"},confirmed_fields=["full_name","email"]))
         self.assertIsNone(app_agent._current_preparation_authorization(key,"r1",url))
+
+    def test_inspection_report_is_not_reused_after_application_url_changes(self):
+        key,url=self._make_external_eligible_job()
+        with patch.object(app_agent,"validate_application_url"):
+            _,_,_,_,_,_,report,_=app_agent._saved_preparation_context(key)
+            self.assertIsNotNone(report)
+            with app_agent.connect() as db:
+                db.execute("UPDATE discovered_openings SET url=? WHERE user_id=? AND job_key=?",
+                    ("https://jobs.ashbyhq.com/example/changed/application",USER,key))
+            _,_,_,_,_,_,stale_report,_=app_agent._saved_preparation_context(key)
+        self.assertIsNone(stale_report)
 
     def test_authorization_blocks_gemini_without_separate_cloud_consent(self):
         key,url=self._make_external_eligible_job()
@@ -1248,6 +1267,28 @@ class ApplicationAgentTests(unittest.TestCase):
             request=Request()
             def continue_(self):raise app_agent.asyncio.CancelledError()
         app_agent._guard_browser_request(Route(),{})
+
+    def test_inspection_aborts_background_post_without_treating_it_as_page_navigation(self):
+        class Request:
+            method="POST";url="https://jobs.ashbyhq.com/telemetry"
+            def is_navigation_request(self):return False
+        class Route:
+            request=Request();aborted=False
+            def abort(self):self.aborted=True
+        state={};route=Route();app_agent._guard_browser_request(route,state)
+        self.assertTrue(route.aborted)
+        self.assertEqual(state,{"blocked_non_read_only_request_count":1})
+
+    def test_inspection_stops_when_non_read_only_request_is_top_level_navigation(self):
+        class Request:
+            method="POST";url="https://jobs.lever.co/example/apply"
+            def is_navigation_request(self):return True
+        class Route:
+            request=Request();aborted=False
+            def abort(self):self.aborted=True
+        state={};route=Route();app_agent._guard_browser_request(route,state)
+        self.assertTrue(route.aborted)
+        self.assertEqual(state["category"],"read_only_method_blocked")
 
     def test_explicit_visual_required_markers_are_recognized_without_matching_question_wording(self):
         self.assertTrue(app_agent._required_marker("Resume/CV ✱ ATTACH RESUME/CV"))

@@ -26,6 +26,9 @@ class ApplicationBrowserSafetyTests(unittest.TestCase):
 
     def test_cookie_and_pagination_submit_buttons_are_not_application_submissions(self):
         controls=[{"label":"Accept","tag":"button","type":"submit"},
+                  {"label":"Accept All","tag":"button","type":"button"},
+                  {"label":"Necessary Only","tag":"button","type":"button"},
+                  {"label":"Customize Settings","tag":"button","type":"button"},
                   {"label":"Create alert","tag":"button","type":"submit"},
                   {"label":"2","tag":"button","type":"submit"}]
         self.assertEqual(submission_controls(controls),[])
@@ -38,6 +41,7 @@ class ApplicationBrowserSafetyTests(unittest.TestCase):
     def test_human_auth_and_expired_pages_are_detected(self):
         self.assertEqual(page_interruption("Please complete CAPTCHA"),"human_verification")
         self.assertEqual(page_interruption("Sign in to continue"),"authentication_required")
+        self.assertEqual(page_interruption("We use cookies. Accept All or Necessary Only."),"cookie_preference_required")
         self.assertEqual(page_interruption("Position is no longer available"),"expired_listing")
         self.assertIsNone(page_interruption("Software Engineer opening"))
 
@@ -122,6 +126,10 @@ class ApplicationBrowserSafetyTests(unittest.TestCase):
         self.assertEqual(report["required_fields"], [q["question"] for q in report["required_questions"]])
         self.assertEqual(report["file_upload_controls"],["Resume/CV*"])
         self.assertEqual(report["fields"][23]["upload_purpose"],"resume")
+        phone=next(item for item in report["questions"] if item["question"].startswith("Phone"))
+        self.assertEqual(set(phone["control_types"]),{"text","tel"})
+        self.assertTrue(phone["question_id"])
+        self.assertGreater(report["total_dom_control_count"],report["visible_form_control_count"])
         self.assertTrue(report["submission_control_detected"])
         self.assertEqual(report["submission_control_status"],"detected_visible")
         self.assertIn("CAPTCHA or human verification",report["human_actions_required"])
@@ -134,6 +142,40 @@ class ApplicationBrowserSafetyTests(unittest.TestCase):
             [{"question":"Resume","label":"Resume","kind":"file","required":True}],[])
         self.assertFalse(report["submission_control_detected"])
         self.assertEqual(report["submission_control_status"],"not_detected_unresolved")
+        self.assertEqual(report["inspection_outcome"],"partially_compatible")
+        self.assertEqual(report["compatibility_status"],"unresolved")
+        self.assertTrue(report["form_fingerprint"])
+
+    def test_upload_button_without_exposed_file_input_is_unresolved_not_verified_upload(self):
+        report=summarize_form_metadata(detect_application_provider("https://job-boards.greenhouse.io/example/jobs/1"),
+            [{"question":"Email*","label":"Email*","kind":"email","required":True}],
+            [{"label":"Attach","tag":"button","type":"button","inside_form":True,"upload_prompt":True,
+              "upload_question":"Resume/CV*","upload_purpose":"resume","upload_required":True},
+             {"label":"Submit application","tag":"button","type":"submit","inside_form":True,"action":"final_submission","visible":True}])
+        self.assertEqual(report["file_upload_controls"],[])
+        self.assertEqual(report["upload_prompts"],[{"question":"Resume/CV*","purpose":"resume","required":True,"verified_input":False}])
+        self.assertIn("Resume/CV*",report["required_fields"])
+        self.assertEqual(report["unique_required_question_count"],2)
+        self.assertEqual(report["compatibility_status"],"unresolved")
+        self.assertTrue(any(item["kind"]=="file_upload_prompt" for item in report["unresolved_controls"]))
+
+    def test_unknown_requiredness_is_not_reported_as_optional(self):
+        report=summarize_form_metadata(detect_application_provider("https://jobs.ashbyhq.com/example/job"),
+            [{"question":"Unclear question","label":"Unclear question","kind":"text","required":None}],
+            [{"label":"Submit application","tag":"button","type":"submit","inside_form":True,"action":"final_submission","visible":True}])
+        self.assertEqual(report["unique_required_question_count"],0)
+        self.assertEqual(report["unique_optional_question_count"],0)
+        self.assertEqual(report["unique_unknown_requirement_question_count"],1)
+        self.assertEqual(report["fields"][0]["required"],"unknown")
+
+    def test_ambiguous_apply_button_is_not_misreported_as_final_submit(self):
+        report=summarize_form_metadata(detect_application_provider("https://jobs.lever.co/example/job"),
+            [{"question":"Email*","label":"Email*","kind":"email","required":True}],
+            [{"label":"Apply now","tag":"button","type":"button","inside_form":True,"action":"ambiguous","visible":True}])
+        self.assertFalse(report["submission_control_detected"])
+        self.assertEqual(report["submission_control_status"],"ambiguous_unresolved")
+        self.assertEqual(report["compatibility_status"],"unresolved")
+        self.assertFalse(report["multi_step_detected"])
 
     def test_hidden_implementation_controls_are_separated_from_question_counts(self):
         report=summarize_form_metadata(detect_application_provider("https://job-boards.greenhouse.io/example/jobs/1"),[

@@ -403,7 +403,11 @@ def _safe_request(url):
 def _guard_browser_request(route,policy_state=None):
     request=route.request
     if request.method.upper() not in {"GET","HEAD","OPTIONS"}:
-        if policy_state is not None:policy_state.update({"category":"read_only_method_blocked","reason":"A page request attempted a non-read-only HTTP method. No application interaction was performed."})
+        if policy_state is not None:
+            if getattr(request,"is_navigation_request",lambda:False)():
+                policy_state.update({"category":"read_only_method_blocked","reason":"A page navigation attempted a non-read-only HTTP method. No application interaction was performed."})
+            else:
+                policy_state["blocked_non_read_only_request_count"]=int(policy_state.get("blocked_non_read_only_request_count",0))+1
         try:route.abort()
         except (Exception,asyncio.CancelledError):pass
         return
@@ -801,12 +805,32 @@ def _save_form_inspection(job,report,*,preparation_preflight=False):
     try:
         requested=_public_url_for_confirmation(job.get("application_url"))
         posting=_public_url_for_confirmation(job.get("job_url") or job.get("application_url"))
-        report.update({"job_key":str(job.get("job_key") or "")[:250],"employer":str(job.get("company") or "")[:160],
-            "job_title":str(job.get("title") or "")[:200],"posting_url":posting,
-            "requested_application_url":requested,"inspected_at":now(),"preparation_preflight":bool(preparation_preflight)})
+        stamp=now()
+        page_meta=report.get("page_metadata") if isinstance(report.get("page_metadata"),dict) else {}
+        employer=str(job.get("company") or page_meta.get("employer") or "")[:160]
+        title=str(job.get("title") or page_meta.get("job_title") or "")[:200]
+        canonical_application=_public_url_for_confirmation(report.get("application_url") or requested)
+        report.update({"job_key":str(job.get("job_key") or "")[:250],"employer":employer,
+            "job_title":title,"posting_url":posting,
+            "requested_application_url":requested,"canonical_application_url":canonical_application,
+            "inspected_at":stamp,"inspection_timestamp":stamp,"preparation_preflight":bool(preparation_preflight)})
+        if not report.get("form_fingerprint"):
+            report["form_fingerprint"]=_sha256_json({"provider":(report.get("provider") or {}).get("provider"),
+                "questions":report.get("questions") or [],"fields":report.get("fields") or [],
+                "submission_control_status":report.get("submission_control_status")})
+        if not report.get("compatibility_status"):
+            if report.get("failure_category") or report.get("robots_policy")!="verified_allow":status="inspection_blocked"
+            elif report.get("page_classification") in {"job_posting","posting_redirected"}:status="posting_only"
+            elif report.get("inspection_outcome")=="needs_human_action":status="needs_human_action"
+            elif report.get("inspection_outcome")=="inaccessible":status="inaccessible"
+            elif not report.get("form_detected"):status="unsupported"
+            elif report.get("unresolved_controls") or report.get("submission_control_status") not in {"detected_visible","detected_hidden"}:status="unresolved"
+            elif report.get("inspection_outcome")=="partially_compatible":status="partially_compatible"
+            else:status="compatible"
+            report["compatibility_status"]=status
         with connect() as db:
             db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()),USER,str(job.get("job_key") or "")[:250],str((report.get("provider") or {}).get("provider") or "unknown")[:40],
+                (str(report.get("inspection_id") or uuid.uuid4()),USER,str(job.get("job_key") or "")[:250],str((report.get("provider") or {}).get("provider") or "unknown")[:40],
                  str(report.get("inspection_outcome") or "unsupported")[:40],json.dumps(report,ensure_ascii=False,separators=(",",":")),report["inspected_at"]))
     except sqlite3.Error as exc:
         raise HTTPException(500,"The read-only employer form check ran, but its report could not be saved.") from exc
@@ -1050,20 +1074,9 @@ def inspect_saved_application_form(request: FormInspectionRequest):
     report=inspect_public_application_form(saved["url"])
     try: requested_application_url=urlparse(str(saved["url"] or ""))._replace(query="",fragment="").geturl()
     except ValueError: requested_application_url=""
-    try: posting_url=urlparse(str(saved["job_url"] or saved["url"]))._replace(query="",fragment="").geturl()
-    except ValueError: posting_url=""
-    report.update({"job_key":request.job_key,"employer":str(saved["company"] or "")[:160],
-                   "job_title":str(saved["title"] or "")[:200],"posting_url":posting_url,
-                   "requested_application_url":requested_application_url,"inspected_at":now()})
-    report_json=json.dumps(report,ensure_ascii=False,separators=(",",":"))
-    try:
-        provider=(report.get("provider") or {}).get("provider") or "unknown"
-        with connect() as db:
-            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
-                       (str(uuid.uuid4()),USER,request.job_key,str(provider)[:40],str(report.get("inspection_outcome") or "unsupported")[:40],report_json,report["inspected_at"]))
-    except sqlite3.Error as exc:
-        raise HTTPException(500,"The inspection completed, but its report could not be saved. Please retry.") from exc
-    return report
+    report.update({"requested_application_url":requested_application_url})
+    return _save_form_inspection({"job_key":request.job_key,"company":saved["company"],"title":saved["title"],
+        "job_url":saved["job_url"],"application_url":saved["url"]},report)
 
 
 @router.post("/api/applications/form-compatibility-tests", status_code=200)
@@ -1076,19 +1089,10 @@ def inspect_standalone_application_form(request: StandaloneFormCompatibilityRequ
     report=inspect_public_application_form(raw_url)
     report.setdefault("provider",detect_application_provider(raw_url))
     inspection_id=str(uuid.uuid4())
-    report.update({"inspection_id":inspection_id,"inspection_mode":"standalone_read_only",
-                   "source_url":source_url,"inspected_at":now()})
+    report.update({"inspection_id":inspection_id,"inspection_mode":"standalone_read_only","source_url":source_url})
     for key in ("application_url","source_url","posting_url","requested_application_url"):
         if report.get(key): report[key]=_sanitized_inspection_url(report[key])
-    report_json=json.dumps(report,ensure_ascii=False,separators=(",",":"))
-    provider=(report.get("provider") or {}).get("provider") or detect_application_provider(raw_url).get("provider") or "unknown"
-    try:
-        with connect() as db:
-            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
-                       (inspection_id,USER,"standalone:"+inspection_id,str(provider)[:40],str(report.get("inspection_outcome") or "inaccessible")[:40],report_json,report["inspected_at"]))
-    except sqlite3.Error as exc:
-        raise HTTPException(500,"The compatibility check finished, but its sanitized report could not be saved. Please retry.") from exc
-    return report
+    return _save_form_inspection({"job_key":"standalone:"+inspection_id,"application_url":source_url,"job_url":source_url},report)
 
 def _candidate():
     with connect() as db:
@@ -1677,6 +1681,14 @@ def _inspect_controls(page):
         return []
 
 
+def _public_page_metadata(page):
+    """Read public page identity from a visible heading or JSON-LD, never form values."""
+    try:
+        result=page.evaluate("""()=>{const clean=x=>String(x||'').replace(/\\s+/g,' ').trim().slice(0,240);let employer='',jobTitle='',employerSource='',titleSource='';for(const script of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0,12)){const raw=script.textContent||'';if(raw.length>64000)continue;try{const parsed=JSON.parse(raw),stack=Array.isArray(parsed)?[...parsed]:[parsed];while(stack.length){const item=stack.pop();if(!item||typeof item!=='object')continue;if(Array.isArray(item)){stack.push(...item.slice(0,40));continue}if(item['@graph'])stack.push(item['@graph']);const kinds=Array.isArray(item['@type'])?item['@type']:[item['@type']];if(kinds.includes('JobPosting')){const org=item.hiringOrganization;const name=typeof org==='string'?org:org?.name;if(!jobTitle&&clean(item.title)){jobTitle=clean(item.title);titleSource='job_posting_jsonld'}if(!employer&&clean(name)){employer=clean(name);employerSource='job_posting_jsonld'}}}}catch(_){}}const heading=[...document.querySelectorAll('h1')].find(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden'});if(!jobTitle&&heading&&clean(heading.innerText)){jobTitle=clean(heading.innerText);titleSource='visible_heading'}const pageTitle=clean(document.title);if(!employer){const match=pageTitle.match(/^Job Application for .+ at (.+)$/i);if(match&&clean(match[1])){employer=clean(match[1]);employerSource='document_title'}}return {page_title:pageTitle,employer,job_title:jobTitle,employer_source:employerSource,title_source:titleSource}}""")
+        return result if isinstance(result,dict) else {}
+    except Exception:return {}
+
+
 def _visible_form_metadata(page):
     """Read public form labels and control types only; never read form values."""
     try:
@@ -1684,7 +1696,7 @@ def _visible_form_metadata(page):
           const selector='input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]):not([type="image"]),textarea,select,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable="true"],[role="button"][aria-haspopup]';
           const all=[...body.querySelectorAll(selector)].slice(0,150);
           const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return el.getClientRects().length&&r.width>1&&r.height>1&&r.x>-2000&&r.y>-2000&&s.display!=='none'&&s.visibility!=='hidden'&&s.opacity!=='0'&&!el.closest('[aria-hidden="true"]')};
-          const ignored=all.filter(el=>!visible(el)).map(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return {tag:el.tagName.toLowerCase(),input_type:(el.getAttribute('type')||'').toLowerCase(),role:el.getAttribute('role')||'',id:(el.id||'').slice(0,100),name:(el.name||el.getAttribute('name')||'').slice(0,100),reason:el.closest('[aria-hidden="true"]')?'aria_hidden':s.display==='none'?'display_none':s.visibility==='hidden'?'visibility_hidden':s.opacity==='0'?'transparent':r.width<=1||r.height<=1?'zero_size':'offscreen'}});
+          const ignored=all.filter(el=>!visible(el)).map(el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return {tag:el.tagName.toLowerCase(),input_type:(el.getAttribute('type')||'').toLowerCase(),role:el.getAttribute('role')||'',id:(el.id||'').slice(0,100),name:(el.name||el.getAttribute('name')||'').slice(0,100),required:!!el.required||el.getAttribute('aria-required')==='true'||el.getAttribute('aria-required')==='1',reason:el.closest('[aria-hidden="true"]')?'aria_hidden':s.display==='none'?'display_none':s.visibility==='hidden'?'visibility_hidden':s.opacity==='0'?'transparent':r.width<=1||r.height<=1?'zero_size':'offscreen'}});
           const result=all.filter(el=>visible(el)&&!el.disabled).slice(0,100).map(el=>{
             const clean=x=>String(x||'').replace(/\\s+/g,' ').trim();
             const type=(el.getAttribute('type')||'').toLowerCase();
@@ -1745,7 +1757,7 @@ def _inspect_public_controls(page):
             control=controls.nth(index)
             try:
                 visible=control.is_visible()
-                item=control.evaluate("""el=>({tag:el.getAttribute('role')==='button'?'button':el.tagName.toLowerCase(),type:(el.type||el.getAttribute('data-type')||'button').toLowerCase(),label:(el.innerText||el.getAttribute('aria-label')||el.getAttribute('title')||((el.tagName==='INPUT')?el.getAttribute('value'):'')||'').trim().slice(0,180),inside_form:!!el.closest('form'),disabled:!!el.disabled})""")
+                item=control.evaluate("""el=>{const label=(el.innerText||el.getAttribute('aria-label')||el.getAttribute('title')||((el.tagName==='INPUT')?el.value||el.getAttribute('value'):'')||'').trim().slice(0,180);const box=el.closest('[class*="application--field" i],[class*="application-field" i],[class*="field-container" i],[class*="question" i],[data-qa*="field" i],[data-qa*="question" i],fieldset,[role="group"],[role="form"],form')||el.parentElement;const context=String(box?.innerText||'').slice(0,800);const upload=/^(attach|upload|choose file|browse)(\\s+(file|resume|document))?$/i.test(label);const lines=context.split(/\\n+/).map(x=>x.trim()).filter(Boolean);const visibleLabel=box?.querySelector('label,[data-qa*="label" i],[class*="label" i],legend')?.innerText||'';const question=[visibleLabel,...lines].map(x=>String(x||'').replace(/\\s+/g,' ').trim()).find(x=>/resume|curriculum vitae|\\bcv\\b|transcript|cover letter|certificate|portfolio|work sample/i.test(x))||'';const purpose=/resume|curriculum vitae|\\bcv\\b/i.test(question)?'resume':/transcript/i.test(question)?'transcript':/cover letter/i.test(question)?'cover_letter':/certificate/i.test(question)?'certificate':/portfolio|work sample/i.test(question)?'portfolio':'unspecified';const type=el.getAttribute('type')||el.getAttribute('data-type')||(el.tagName==='BUTTON'?(el.closest('form')?'submit':'button'):(el.type||'button'));return {tag:el.getAttribute('role')==='button'?'button':el.tagName.toLowerCase(),type:type.toLowerCase(),label,inside_form:!!el.closest('form,[role="form"]'),disabled:!!el.disabled,upload_prompt:upload&&!!el.closest('form,[role="form"]'),upload_question:question.slice(0,180),upload_purpose:purpose,upload_required:/[*✱＊]/.test(question)}}""")
                 item["action"]=classify_control(item.get("label"),item.get("tag"),item.get("type"),item.get("inside_form"))
                 item["visible"]=bool(visible)
                 if not visible and item["action"]!="final_submission":continue
@@ -1806,7 +1818,7 @@ def inspect_public_application_form(url):
                     try:page.wait_for_timeout(350)
                     except Exception:pass
             except Exception as exc:
-                if policy_state:
+                if policy_state.get("category"):
                     return {"application_url":clean_url,"inspection_outcome":"inaccessible","provider":provider,
                         "form_detected":False,"page_classification":"not_inspected","robots_policy":"not_verified",
                         "failure_category":policy_state.get("category","navigation_blocked"),
@@ -1815,7 +1827,7 @@ def inspect_public_application_form(url):
                 return {"application_url": clean_url, "inspection_outcome": "inaccessible", "provider":provider,
                         "form_detected":False,"page_classification":"not_inspected","robots_policy":"verified_allow",
                         "failure_category":"navigation_error","reason": reason}
-            if policy_state:
+            if policy_state.get("category"):
                 return {"application_url":clean_url,"inspection_outcome":"inaccessible","provider":provider,
                     "form_detected":False,"page_classification":"not_inspected","robots_policy":"not_verified",
                     "failure_category":policy_state.get("category","navigation_blocked"),
@@ -1845,6 +1857,8 @@ def inspect_public_application_form(url):
             application_form,page_classification=_classify_inspected_page(page.url,fields,controls,body)
             report = summarize_form_metadata(detect_application_provider(page.url), fields, controls,
                                              interruption=interruption, expired=expired)
+            report["page_metadata"]=_public_page_metadata(page)
+            report["blocked_non_read_only_request_count"]=int(policy_state.get("blocked_non_read_only_request_count",0))
             report["form_detected"]=application_form
             report["page_classification"]=page_classification
             if not application_form and _posting_redirected_away(clean_url, page.url):
@@ -2093,11 +2107,11 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
             preflight=_save_form_inspection(job,preflight,preparation_preflight=True)
             blocker=_preparation_inspection_blocker(preflight)
             diagnostic["compatibility_report"]={key:preflight.get(key) for key in
-                ("provider","form_detected","page_classification","inspection_outcome","required_fields","unsupported_fields",
-                 "required_control_count","unique_question_count","unique_required_question_count","unique_optional_question_count",
+                ("provider","form_detected","page_classification","inspection_outcome","compatibility_status","page_metadata","canonical_application_url","inspection_timestamp","form_fingerprint","required_fields","unsupported_fields",
+                 "required_control_count","total_dom_control_count","visible_form_control_count","required_dom_control_count","unique_question_count","unique_required_question_count","unique_optional_question_count","unique_unknown_requirement_question_count",
                  "questions","unresolved_controls","ignored_controls","ignored_control_count","conditional_questions","conditional_detection_note",
-                 "file_upload_controls","human_actions_required","multi_step_detected","submission_control_detected",
-                 "submission_control_status","robots_policy","reason")}
+                 "file_upload_controls","upload_prompts","human_actions_required","multi_step_detected","submission_control_detected",
+                 "submission_control_status","blocked_non_read_only_request_count","robots_policy","form_fingerprint","reason")}
             if blocker:
                 diagnostic["message"]=blocker
                 diagnostic["human_actions_required"]=list(preflight.get("human_actions_required") or [])
@@ -2781,25 +2795,34 @@ renderApps=function(apps){
 APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</body></html>", """<script>
 const phase123RenderSavedJobs=renderSavedJobs;
 function appendInspectionReport(card,report){
-  const labels={compatible:'Compatible',partially_compatible:'Partially compatible',needs_human_action:'Needs human action',unsupported:'Unsupported',inaccessible:'Inaccessible'};
-  const panel=document.createElement('details'),summary=node('summary','', 'Form compatibility · '+(labels[report.inspection_outcome]||'Not yet inspected'));panel.className='form-inspection-result';
+  const labels={compatible:'Compatible',partially_compatible:'Partially compatible',needs_human_action:'Needs human action',unsupported:'Unsupported',inaccessible:'Inaccessible',posting_only:'Posting only',inspection_blocked:'Inspection blocked',unresolved:'Unresolved'};
+  const effectiveStatus=report.compatibility_status||(report.failure_category?'inspection_blocked':report.page_classification==='job_posting'?'posting_only':report.inspection_outcome);
+  const panel=document.createElement('details'),summary=node('summary','', 'Form compatibility · '+(labels[effectiveStatus]||'Not yet inspected'));panel.className='form-inspection-result';
   const body=node('div','sub');
   body.append(node('p','sub','Read-only inspection · no candidate information entered · no application prepared or submitted.'));
-  const failureLabels={dns_failure:'DNS lookup failed',timeout:'Request timed out',tls_error:'Secure connection failed',tls_configuration:'TLS trust configuration unavailable',redirect_blocked:'Unsafe redirect blocked',http_status:'Robots server returned an HTTP error',policy_missing:'robots.txt was not found',malformed_policy:'Robots policy could not be parsed',policy_disallowed:'Path disallowed by robots.txt',unsafe_destination:'Unsafe destination blocked',network_error:'Network request failed',navigation_error:'Public page could not be opened'};
+  const pageMeta=report.page_metadata||{},titleMatch=String(pageMeta.page_title||'').match(/^Job Application for .+ at (.+)$/i),employer=report.employer||pageMeta.employer||(titleMatch?.[1]||''),jobTitle=report.job_title||pageMeta.job_title||'';
+  if(employer||jobTitle){const employerSource=pageMeta.employer_source||(titleMatch?'document_title':'');const source=report.employer?'Saved employer and job':'Public page metadata'+(employerSource||pageMeta.title_source?' · source: '+[employerSource,pageMeta.title_source].filter(Boolean).join(', '):'');body.append(node('p','sub',source+': '+(employer||'Employer not identified')+' · '+(jobTitle||'Job title not identified')))}
+  if(report.inspected_at||report.inspection_timestamp)body.append(node('p','sub','Inspected: '+new Date(report.inspected_at||report.inspection_timestamp).toLocaleString()));
+  const failureLabels={dns_failure:'DNS lookup failed',timeout:'Request timed out',tls_error:'Secure connection failed',tls_configuration:'TLS trust configuration unavailable',redirect_blocked:'Unsafe redirect blocked',http_status:'Robots server returned an HTTP error',policy_missing:'robots.txt was not found',malformed_policy:'Robots policy could not be parsed',policy_disallowed:'Path disallowed by robots.txt',unsafe_destination:'Unsafe destination blocked',network_error:'Network request failed',navigation_error:'Public page could not be opened',read_only_method_blocked:'A non-read-only navigation was blocked'};
   if(report.failure_category)body.append(node('p','inspection-diagnostic','Diagnostic: '+(failureLabels[report.failure_category]||'Inspection blocked')));
   if(report.robots_policy==='verified_allow')body.append(node('p','inspection-diagnostic','Robots policy verified for this path.'));
   const pageKinds={application_form:'Application form',job_posting:'Job posting only · no application form exposed',posting_redirected:'Job URL redirected · posting not verified',public_form_unverified:'Public form found · application purpose unverified',public_page_unverified:'Public page · application form unverified'};
   body.append(node('p','sub','Page classification: '+(pageKinds[report.page_classification]||'Not verified')));
   body.append(node('p','sub','Provider: '+(report.provider?.provider||'Not identified')+' · '+(report.provider?.support_level||'compatibility unknown')+' · Form detected: '+(report.form_detected?'Yes':'No')));
-  const submitStatus={detected_visible:'Detected · visible',detected_hidden:'Detected · hidden',not_detected_unresolved:'Not detected · safety unresolved'};
-  body.append(node('p','sub','Unique questions: '+(report.unique_question_count??(report.questions||[]).length)+' · Required questions: '+(report.unique_required_question_count??(report.required_fields||[]).length)+' · Optional questions: '+(report.unique_optional_question_count??0)+' · Required controls: '+(report.required_control_count??(report.required_fields||[]).length)));
-  body.append(node('p',report.submission_control_status==='not_detected_unresolved'?'inspection-diagnostic':'sub','File uploads: '+((report.file_upload_controls||[]).length)+' · Multi-step: '+(report.multi_step_detected?'Detected':'Not detected')+' · Submission control: '+(submitStatus[report.submission_control_status]||'Not verified')));
-  if(report.questions?.length){body.append(node('strong','','Applicant questions'));const fields=document.createElement('ul');report.questions.forEach(question=>fields.append(node('li','',(question.question||'Unresolved question')+' · '+(question.required?'required':'optional')+' · controls: '+(question.control_types||[]).join(', '))));body.append(fields)}
+  const submitStatus={detected_visible:'Detected · visible',detected_hidden:'Detected · hidden',ambiguous_unresolved:'Ambiguous · safety unresolved',not_detected_unresolved:'Not detected · safety unresolved'};
+  const controls=report.total_dom_control_count??report.fields?.length??0,unresolvedCount=report.unresolved_visible_control_count??report.unresolved_controls?.length??0;
+  body.append(node('p','sub','Questions: '+(report.unique_question_count??(report.questions||[]).length)+' · Required questions: '+(report.unique_required_question_count??(report.required_fields||[]).length)+' · Optional questions: '+(report.unique_optional_question_count??0)+' · Requirement unknown: '+(report.unique_unknown_requirement_question_count??0)));
+  body.append(node('p','sub','Visible controls: '+(report.visible_form_control_count??controls)+' · All DOM controls: '+controls+' · Required visible controls: '+(report.required_control_count??(report.required_fields||[]).length)+' · Unresolved controls: '+unresolvedCount));
+  body.append(node('p',report.submission_control_status==='not_detected_unresolved'||report.submission_control_status==='ambiguous_unresolved'?'inspection-diagnostic':'sub','File inputs: '+((report.file_upload_controls||[]).length)+' · Upload buttons without exposed file inputs: '+((report.upload_prompts||[]).length)+' · Multi-step: '+(report.multi_step_detected?'Detected':'Not detected')+' · Submission control: '+(submitStatus[report.submission_control_status]||'Not verified')));
+  if(report.blocked_non_read_only_request_count)body.append(node('p','inspection-diagnostic','Blocked non-read-only background requests: '+report.blocked_non_read_only_request_count+' · Only GET/HEAD/OPTIONS requests were allowed.'));
+  if(report.questions?.length){body.append(node('strong','','Applicant questions'));const fields=document.createElement('ul');report.questions.forEach(question=>{const req=question.required===true?'required':question.required===false?'optional':'requirement unknown';const types=(question.controls||[]).map(control=>[control.kind,control.input_type&&control.input_type!==control.kind?'native '+control.input_type:'',control.role?'role '+control.role:'',control.upload_purpose?'purpose '+control.upload_purpose:'',control.accept?'accept '+control.accept:''].filter(Boolean).join(' · ')).filter(Boolean);fields.append(node('li','',(question.question||'Unresolved question')+' · '+req+' · controls: '+(types.length?types.join(', '):(question.control_types||[]).join(', '))+(question.question_id?' · ID: '+question.question_id:'')))});body.append(fields)}
   if(report.unresolved_controls?.length){body.append(node('strong','','Unresolved controls · may block preparation'));const fields=document.createElement('ul');report.unresolved_controls.forEach(item=>fields.append(node('li','',(item.question||'Unlabeled control')+' · '+(item.kind||'unknown')+' · '+(item.required===true?'required':item.required==='unknown'?'required status unknown':'optional')+' · '+(item.reasons||[]).join('; '))));body.append(fields)}
   if(report.ignored_controls?.length){body.append(node('strong','','Hidden or non-visible controls excluded from question counts'));const fields=document.createElement('ul');report.ignored_controls.forEach(item=>fields.append(node('li','',(item.tag||'control')+(item.input_type?' · '+item.input_type:'')+(item.role?' · '+item.role:'')+' · '+(item.reason||'not visible'))));body.append(fields)}
+  if(report.upload_prompts?.length){body.append(node('strong','','Upload buttons needing confirmation'));const fields=document.createElement('ul');report.upload_prompts.forEach(item=>fields.append(node('li','',(item.question||'File upload question unresolved')+' · purpose: '+(item.purpose||'unknown')+' · required: '+(item.required===true?'yes':item.required===false?'no':'unknown')+' · file input verified: No')));body.append(fields)}
   if(report.reason)body.append(node('p','sub',report.reason));
   for(const [title,items] of [['File upload questions',report.file_upload_controls],['Supported fields',report.supported_fields],['Unsupported fields',report.unsupported_fields],['Human actions required',report.human_actions_required]])if(items?.length){body.append(node('strong','',title));const list=document.createElement('ul');items.forEach(x=>list.append(node('li','',x)));body.append(list)}
-  if(report.application_url){const link=node('a','sub','Open inspected application page');link.href=report.application_url;link.target='_blank';link.rel='noopener noreferrer';body.append(link)}
+  if(report.posting_url){const link=node('a','sub','Open official posting');link.href=report.posting_url;link.target='_blank';link.rel='noopener noreferrer';body.append(link)}
+  if(report.canonical_application_url||report.application_url){const link=node('a','sub','Open inspected application page');link.href=report.canonical_application_url||report.application_url;link.target='_blank';link.rel='noopener noreferrer';body.append(link)}
   panel.append(summary,body);card.append(panel);
 }
 const standaloneForm=document.querySelector('#standalone-inspection-form');
