@@ -11,6 +11,7 @@ from job_connectors import EmployerSource
 from job_relevance import (evaluate_location, extract_experience_requirements, infer_prompt_preferences,
                            normalize_job_record, relevance_for_job,
                            apply_prompt_preferences, prompt_constraints)
+from job_relevance import evaluate_relocation_preference
 
 
 def posting(job_id, title, **overrides):
@@ -51,6 +52,21 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("session_id=${encodeURIComponent(currentMatchSessionId)}",page)
         self.assertIn("Checkpoint saved; Resume continues this session without rediscovery.",page)
         self.assertIn("const pauseLabel=",page)
+
+    def test_find_jobs_formats_structured_match_errors_and_keeps_import_progress_targeted(self):
+        page=jobs.find_jobs_page()
+        if hasattr(page,"body"):page=page.body.decode("utf-8")
+        self.assertIn("function apiErrorMessage(payload",page)
+        self.assertIn("Another matching session is using the worker",page)
+        self.assertIn("This selected job was not started",page)
+        self.assertIn("job_keys:[importedJobKey]",page)
+        self.assertIn("currentMatchJobKeys=[importedJobKey]",page)
+        self.assertIn("&job_keys=${encodeURIComponent(currentMatchJobKeys.join(','))}",page)
+        self.assertIn("recovery?.same_jobs",page)
+        self.assertIn("The server returned an unreadable response",page)
+        self.assertIn("This matching attempt did not finish. Completed results are preserved",page)
+        self.assertIn("resumeButton.hidden=state.status!=='paused'",page)
+        self.assertIn("recoverButton.hidden=!state.recovery_available||!state.session_id",page)
 
     @staticmethod
     def prefs(**changes):
@@ -785,6 +801,37 @@ class DiscoveryTests(unittest.TestCase):
             found, error = jobs.fetch_board("Example", "example")
         self.assertEqual(found, [])
         self.assertIn("Malformed response", error)
+
+
+class RelocationPreferenceTests(unittest.TestCase):
+    def test_anywhere_is_compatible_but_does_not_assert_work_authorization(self):
+        decision=evaluate_relocation_preference({"location":"New York, NY","work_arrangement":"On-site"},{"relocation_preference":"anywhere"})
+        self.assertEqual(decision[0],"eligible")
+        self.assertIn("work authorization is evaluated separately",decision[1])
+
+    def test_selected_country_state_and_city_destinations(self):
+        prefs={"relocation_preference":"selected_locations","relocation_destinations":[{"country":"United States","state_province":"California","city":"San Francisco"}]}
+        for location in ("San Francisco, CA, United States",):
+            decision=evaluate_relocation_preference({"location":location,"work_arrangement":"On-site"},prefs)
+            self.assertEqual(decision[0],"eligible",location)
+        decision=evaluate_relocation_preference({"location":"New York, NY, United States","work_arrangement":"On-site"},prefs)
+        self.assertEqual(decision[0],"mismatch")
+        state_only={"relocation_preference":"selected_locations","relocation_destinations":[{"country":"United States","state_province":"CA"}]}
+        self.assertEqual(evaluate_relocation_preference({"location":"Oakland, California, United States","work_arrangement":"On-site"},state_only)[0],"eligible")
+
+    def test_selected_location_unknown_and_remote_roles_do_not_create_false_conflicts(self):
+        prefs={"relocation_preference":"selected_locations","relocation_destinations":[{"country":"United States","state_province":"California","city":"San Francisco"}]}
+        decision=evaluate_relocation_preference({"location":"New York, NY, United States","work_arrangement":"On-site"},prefs)
+        self.assertEqual(decision[0],"mismatch")
+        remote=evaluate_relocation_preference({"location":"New York","work_arrangement":"Remote"},prefs)
+        self.assertIsNone(remote)
+
+    def test_no_relocation_needs_confirmed_residence_and_per_job_stays_unknown(self):
+        job={"location":"New York, NY, United States","work_arrangement":"On-site"}
+        self.assertEqual(evaluate_relocation_preference(job,{"relocation_preference":"no"})[0],"unknown")
+        self.assertEqual(evaluate_relocation_preference(job,{"relocation_preference":"per_job"})[0],"unknown")
+        decision=evaluate_relocation_preference(job,{"relocation_preference":"no","_confirmed_current_location":{"city":"San Francisco","state_province":"California","country":"United States"}})
+        self.assertEqual(decision[0],"unknown")
 
 
 if __name__ == "__main__":

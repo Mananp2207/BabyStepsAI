@@ -314,7 +314,55 @@ class ResumeJobMatcherTests(unittest.TestCase):
         result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
             {"title":"New Graduate Software Engineer","content":"Applicants must be Class of 2026."})
         self.assertEqual(result.classification,"needs_review")
-        self.assertTrue(any("confirmed graduation year is unknown" in x for x in result.missing_information))
+        self.assertTrue(any("graduation" in x.casefold() and "missing" in x.casefold() for x in result.missing_information))
+
+    def test_atoms_saved_posting_extracts_required_gpa_and_seasonal_graduation(self):
+        from job_relevance import extract_gpa_requirements, extract_graduation_windows
+        description=("<h3>Basic Qualifications</h3><p>Graduating in Winter 2026 or Spring/Summer 2027</p>"
+                     "<p>3.7 GPA Minimum</p><h3>Preferred Qualifications</h3><p>Docker experience</p>")
+        gpa=extract_gpa_requirements(description)
+        windows=extract_graduation_windows(description)
+        self.assertEqual([(x["minimum_score"],x["scale"],x["status"]) for x in gpa["required"]],[(3.7,None,"required")])
+        self.assertFalse(gpa["preferred"])
+        self.assertEqual({(x.get("season"),x["season_year"],x["status"]) for x in windows},
+                         {("winter",2026,"required"),("spring",2027,"required"),("summer",2027,"required")})
+
+    def test_missing_confirmed_gpa_keeps_atoms_job_in_review_and_confirms_graduation(self):
+        description=("Basic Qualifications: Graduating in Winter 2026 or Spring/Summer 2027; 3.7 GPA Minimum.")
+        result=matcher.apply_safety_rules(valid_result(),{"graduation_date":"2026-12",
+            "education":[{"degree":"Bachelor's","major":"Computer Science"}]},"user_reviewed",{},
+            {"title":"Software Engineer - New Grad","content":description})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertIn("3.7",result.gpa_assessment)
+        self.assertIn("no confirmed candidate GPA",result.gpa_assessment)
+        self.assertTrue(any("GPA" in x and "missing" in x for x in result.missing_information))
+        self.assertIn("met",result.graduation_assessment)
+        self.assertTrue(any("Graduation window" in x.requirement and x.status=="met" for x in result.education_requirements))
+
+    def test_confirmed_gpa_shortfall_and_out_of_window_graduation_are_ineligible(self):
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),{"graduation_date":"2025-12",
+            "education":[{"degree":"Bachelor's","gpa":"3.6","gpa_scale":"4.0"}]},"user_reviewed",{},
+            {"title":"Software Engineer - New Grad",
+             "content":"Basic Qualifications: Graduating in Winter 2026 or Spring/Summer 2027; GPA minimum 3.7/4.0."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertTrue(any("Confirmed candidate GPA is below" in x for x in result.gaps))
+        self.assertTrue(any("graduation falls outside" in x.casefold() for x in result.gaps))
+
+    def test_preferred_gpa_does_not_become_a_mandatory_cutoff(self):
+        result=matcher.apply_safety_rules(valid_result(),{"education":[{"degree":"Bachelor's","gpa":"3.2","gpa_scale":"4.0"}]},
+            "user_reviewed",{}, {"title":"Software Engineer","content":"Preferred Qualifications: 3.7 GPA minimum."})
+        self.assertEqual(result.classification,"needs_review" if result.missing_information else "potential_match")
+        self.assertIn("Preferred GPA",result.gpa_assessment)
+        self.assertFalse(any("mandatory threshold" in x.casefold() for x in result.gaps))
+
+    def test_ai_cannot_erase_or_override_deterministic_gpa_requirement(self):
+        result=valid_result(education_requirements=[matcher.SkillEvidence(requirement="3.7 GPA minimum",
+            status="met",candidate_evidence=["AI said GPA is sufficient"])])
+        checked=matcher.apply_safety_rules(result,{"education":[{"degree":"Bachelor's"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Basic Qualifications: GPA minimum 3.7/4.0."})
+        self.assertEqual(checked.classification,"needs_review")
+        gpa=next(item for item in checked.education_requirements if "GPA" in item.requirement)
+        self.assertEqual(gpa.status,"unclear")
 
     def test_deterministic_experience_threshold_survives_ai_denial(self):
         bad=valid_result(experience_assessment="The posting does not specify an experience requirement.",
@@ -349,7 +397,132 @@ class ResumeJobMatcherTests(unittest.TestCase):
             row=db.execute("SELECT freshness_status,result_json FROM job_match_results WHERE job_key=? AND resume_id=?",(key,resume_id)).fetchone()
         self.assertEqual(row["freshness_status"],"stale")
         self.assertIsNotNone(row["result_json"])
-        self.assertIn("job-match-v5-education-evidence",matcher.matching_engine_version("ollama","test-model"))
+        self.assertIn("job-match-v12-relocation-preferences",matcher.matching_engine_version("ollama","test-model"))
+
+    def test_fall_graduation_window_includes_confirmed_december_term(self):
+        self.assertTrue(matcher._graduation_window_matches({"season":"fall","season_year":2026,
+            "start_year":2026,"end_year":2026},"2026-12"))
+        from job_relevance import extract_education_requirements
+        requirements=extract_education_requirements(
+            "<h3>Requirements</h3><ul><li>B.S. or M.S. in Computer Science or a related field.</li>"
+            "</ul><h3>Preferred Qualifications</h3><ul><li>Ph.D. preferred.</li></ul>")
+        self.assertTrue(any("Bachelor's" in x and "Master's" in x and "Computer Science" in x
+                            for x in requirements["required"]))
+        self.assertTrue(any("doctoral" in x for x in requirements["preferred"]))
+
+    def test_preferred_internship_is_not_a_mandatory_eligibility_gap(self):
+        from job_relevance import extract_internship_requirements
+        description=("Requirements: Experience building web applications through personal projects, coursework, or internships. "
+                     "Nice to Haves: Prior internship experience in a fast-paced environment.")
+        extracted=extract_internship_requirements(description)
+        self.assertFalse(extracted["required"])
+        self.assertEqual(extracted["preferred"][0]["status"],"preferred")
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),{"education":[{"degree":"Bachelor's"}]},
+            "user_reviewed",{}, {"title":"New Grad Software Engineer","content":description})
+        self.assertFalse(any("internship" in x.casefold() for x in result.missing_information))
+        self.assertTrue(any("internship" in x.requirement.casefold() and x.status=="preferred"
+                            for x in result.preferred_experience))
+
+    def test_sanitized_authentic_qualification_evidence_is_grounded(self):
+        from job_relevance import extract_education_requirements, extract_internship_requirements
+        posting=("<p><strong>Responsibilities</strong></p><ul><li>Build and ship features across our React frontend and Python backend.</li>"
+                 "<li>Education includes mentoring teammates and participating in architecture discussions.</li></ul>"
+                 "<p><strong>Requirements</strong></p><ul><li>B.S. or M.S. in Computer Science or a related field "
+                 "(recently graduated or graduating Fall 2026/Spring 2027)</li>"
+                 "<li>Experience building web applications (personal projects, coursework, or internships)</li></ul>"
+                 "<p><strong>Nice to Haves</strong></p><ul><li>Prior internship experience in fast-paced environments</li></ul>")
+        education=extract_education_requirements(posting)
+        internships=extract_internship_requirements(posting)
+        self.assertEqual(len(education["required"]),1)
+        self.assertIn("Bachelor's",education["required"][0])
+        self.assertIn("Master's",education["required"][0])
+        self.assertFalse(any("Responsibilities" in item for bucket in education.values() for item in bucket))
+        self.assertEqual(internships["required"],[])
+        self.assertEqual(internships["preferred"][0]["status"],"preferred")
+
+        result=matcher.apply_safety_rules(valid_result(
+            education_assessment="Candidate education matches the required degree.",
+            explanation="Candidate education matches the required degree.",
+            education_requirements=[
+                matcher.SkillEvidence(requirement="or M.S",status="confirmed_mismatch"),
+                matcher.SkillEvidence(requirement="Responsibilities Build and ship features across our React frontend",status="confirmed_mismatch")]),
+            {"education":[{"degree":"B.S.","major":"Computer Science","graduation_date":"2026-12"}]},
+            "user_reviewed",{},
+            {"title":"New Grad Software Engineer","content":posting,"employment_type":""})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.education_requirements[0].status,"met")
+        self.assertFalse(any("internship" in item.casefold() for item in result.missing_information))
+        self.assertIn("does not specify employment type",result.employment_type_assessment)
+        self.assertTrue(result.evidence_consistency)
+
+    def test_complete_degree_alternatives_and_equivalent_experience_are_preserved(self):
+        from job_relevance import extract_education_requirements
+        variants=("B.S. or M.S. in Computer Science.",
+                  "Bachelor's or master's degree in Computer Science.",
+                  "Bachelor's degree or equivalent practical experience.")
+        for sentence in variants:
+            with self.subTest(sentence=sentence):
+                extracted=extract_education_requirements("Basic Qualifications: "+sentence)
+                self.assertEqual(len(extracted["required"]),1)
+                self.assertNotIn("or m s",matcher._qualification_text(extracted["required"][0]))
+
+    def test_confirmed_mandatory_masters_mismatch_remains_ineligible(self):
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),
+            {"education":[{"degree":"Bachelor's","major":"Computer Science"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Basic Qualifications: Master's degree in Computer Science required."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertTrue(any(item.status=="confirmed_mismatch" for item in result.education_requirements))
+
+    def test_mandatory_internship_without_verified_record_needs_review(self):
+        from job_relevance import extract_internship_requirements
+        description="Basic Qualifications: Previous internship experience required."
+        self.assertEqual(extract_internship_requirements(description)["required"][0]["status"],"required")
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),{"education":[{"degree":"Bachelor's"}]},
+            "user_reviewed",{}, {"title":"Software Engineer","content":description})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertTrue(any("internship" in x.casefold() for x in result.missing_information))
+
+    def test_ai_cannot_claim_unknown_employment_type_is_full_time(self):
+        result=valid_result(employment_type_assessment="Full-time is specified and matches the candidate preference.")
+        checked=matcher.apply_safety_rules(result,{"education":[{"degree":"Bachelor's"}]},"user_reviewed",
+            {"employment_types":["Full-time"]},{"title":"Software Engineer","employment_type":"",
+             "content":"Requirements: Bachelor's degree."})
+        self.assertIn("does not specify",checked.employment_type_assessment)
+        self.assertTrue(any("does not provide an employment type" in x for x in checked.evidence_consistency))
+        self.assertEqual(checked.classification,"needs_review")
+
+    def test_pre_ai_check_keeps_unknown_gpa_reviewable_and_detects_comparable_shortfall(self):
+        profile={"education":[{"degree":"Bachelor's","major":"Computer Science","gpa":"3.69","gpa_scale":"4.0"}]}
+        unknown={"title":"Software Engineer","content":"Basic Qualifications: Minimum GPA 3.7."}
+        comparable={"title":"Software Engineer","content":"Basic Qualifications: Minimum GPA 3.7/4.0."}
+        self.assertIsNone(matcher._pre_ai_mandatory_conflict(unknown,profile,"user_reviewed"))
+        self.assertIn("confirmed GPA is below",matcher._pre_ai_mandatory_conflict(comparable,profile,"user_reviewed"))
+
+    def test_pre_ai_check_accepts_december_fall_graduate_and_detects_outside_date(self):
+        description="Requirements: Bachelor's degree in Computer Science; graduation in Fall 2026 or Spring 2027."
+        profile={"graduation_date":"2026-12","education":[{"degree":"Bachelor's","major":"Computer Science"}]}
+        job={"title":"New Grad Software Engineer","content":description}
+        self.assertIsNone(matcher._pre_ai_mandatory_conflict(job,profile,"user_reviewed"))
+        profile["graduation_date"]="2025-12"
+        self.assertIn("graduation date falls outside",matcher._pre_ai_mandatory_conflict(job,profile,"user_reviewed"))
+
+    def test_comparable_gpa_conflict_is_saved_before_ai_without_calling_model(self):
+        resume_id,_,profile=matcher.active_candidate()
+        profile["education"]=[{"degree":"Bachelor's","major":"Computer Science","gpa":"3.6","gpa_scale":"4.0"}]
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET description=? WHERE job_key=?",
+                       ("Basic Qualifications: Minimum GPA 3.7/4.0.","greenhouse:cloudflare:42"))
+            db.execute("UPDATE resume_profiles SET profile_json=? WHERE resume_id=?",
+                       (json.dumps(profile),resume_id))
+        with patch.object(matcher.executor,"submit",return_value=None), \
+             patch.object(matcher,"analyze_with_ollama") as model:
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        model.assert_not_called()
+        self.assertEqual(response["prechecked_not_eligible"],1)
+        row=matcher._match_rows(["greenhouse:cloudflare:42"],resume_id)[0]
+        self.assertEqual(row["classification"],"not_eligible")
+        self.assertEqual(row["freshness_status"],"current")
+        self.assertIn("confirmed GPA is below",row["match"]["gaps"][0])
 
     def test_notion_december_new_grad_uses_verified_education_without_false_mismatch(self):
         description=("Software Engineer, New Grad (Dec 2026). You must graduate in December 2026 and be able to "
@@ -451,7 +624,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
             {"title": "New Graduate Software Engineer 2026",
              "description": "Candidates must have graduated by 2026 and hold a bachelor's degree."})
         self.assertEqual(result.classification, "needs_review")
-        self.assertTrue(any("graduation year" in note for note in result.missing_information))
+        self.assertTrue(any("graduation" in note.casefold() and "missing" in note.casefold() for note in result.missing_information))
         no_education = matcher.apply_safety_rules(valid_result(), {"technical_skills": ["Python"]}, "user_reviewed", {},
             {"title": "Software Engineer", "description": "A bachelor's degree is required."})
         self.assertEqual(no_education.classification, "needs_review")
@@ -635,7 +808,8 @@ class ResumeJobMatcherTests(unittest.TestCase):
     def test_successful_verified_match_is_structured_and_grounded(self):
         response = Mock()
         response.raise_for_status.return_value = None
-        response.json.return_value = {"response": valid_result().model_dump_json()}
+        response.json.return_value = {"response": valid_result(
+            employment_type_assessment="The posting does not specify employment type.").model_dump_json()}
         job = {"title": "Software Engineer I", "content": "Python experience required."}
         with patch.object(matcher.requests, "post", return_value=response) as post:
             model_result = matcher.analyze_with_ollama({"technical_skills": ["Python"]}, "user_reviewed", {}, job)
@@ -706,6 +880,57 @@ class ResumeJobMatcherTests(unittest.TestCase):
                     break
                 time.sleep(0.01)
         self.assertEqual(rows[0]["status"], "completed")
+
+    def test_targeted_atoms_analysis_creates_a_single_job_session(self):
+        key="greenhouse:cssmerge:8687930002"
+        with jobs.database() as db:
+            db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES(?,?,?,?,?,?,?)",
+                (jobs.USER,key,"ATOMS Careers page","Software Engineer - New Grad","Multiple Locations Available",
+                 "https://job-boards.greenhouse.io/cssmerge/jobs/8687930002",matcher.now()))
+        fake_job={"id":"8687930002","title":"Software Engineer - New Grad","content":"Python experience required.",
+            "absolute_url":"https://job-boards.greenhouse.io/cssmerge/jobs/8687930002","location":{"name":"Multiple Locations Available"},
+            "company_name":"ATOMS Careers page","_source_platform":"greenhouse"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)),patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=[key],batch_size=3))
+        self.assertEqual(response["status"],"queued")
+        with jobs.database() as db:
+            session=db.execute("SELECT status,job_keys_json,total_jobs FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+        self.assertEqual(session["status"],"queued")
+        self.assertEqual(json.loads(session["job_keys_json"]),[key])
+        self.assertEqual(session["total_jobs"],1)
+
+    def test_unrelated_active_56_job_session_returns_structured_conflict_unchanged(self):
+        import os,socket
+        from fastapi import HTTPException
+        key="greenhouse:cssmerge:8687930002";stamp=matcher.now();session_id="live-56-batch"
+        unrelated=[f"greenhouse:other:{i}" for i in range(56)]
+        with jobs.database() as db:
+            db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES(?,?,?,?,?,?,?)",
+                (jobs.USER,key,"ATOMS Careers page","Software Engineer - New Grad","United States",
+                 "https://job-boards.greenhouse.io/cssmerge/jobs/8687930002",stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,
+                workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES(?,?,'resume-v1','running',?,3,56,'','live-owner',?,?,?,?,?,?)""",
+                (session_id,jobs.USER,json.dumps(unrelated),os.getpid(),socket.gethostname(),stamp,
+                 "2999-01-01T00:00:00+00:00",stamp,stamp))
+        fake_job={"id":"8687930002","title":"Software Engineer - New Grad","content":"Python experience required.",
+            "absolute_url":"https://job-boards.greenhouse.io/cssmerge/jobs/8687930002","location":{"name":"United States"},
+            "company_name":"ATOMS Careers page","_source_platform":"greenhouse"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)):
+            with self.assertRaises(HTTPException) as caught:
+                matcher.analyze_matches(matcher.MatchRequest(job_keys=[key],batch_size=3))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertEqual(caught.exception.detail["code"],"active_worker")
+        self.assertEqual(caught.exception.detail["same_jobs"],False)
+        self.assertEqual(caught.exception.detail["status"],"running")
+        self.assertEqual(caught.exception.detail["total_jobs"],56)
+        with jobs.database() as db:
+            old=db.execute("SELECT status,job_keys_json,owner_token FROM job_match_sessions WHERE session_id=?",(session_id,)).fetchone()
+            atoms=db.execute("SELECT COUNT(*) FROM job_match_sessions WHERE user_id=? AND job_keys_json LIKE ?",(jobs.USER,f"%{key}%")).fetchone()[0]
+        self.assertEqual(old["status"],"running")
+        self.assertEqual(json.loads(old["job_keys_json"]),unrelated)
+        self.assertEqual(old["owner_token"],"live-owner")
+        self.assertEqual(atoms,0)
 
     def test_ai_matching_requires_explicit_application_authorization(self):
         from fastapi import HTTPException

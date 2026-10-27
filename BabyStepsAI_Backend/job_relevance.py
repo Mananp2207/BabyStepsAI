@@ -1,5 +1,6 @@
 """Platform-independent normalization and relevance checks for job records."""
 
+import html
 import re
 from datetime import datetime, timezone
 
@@ -389,6 +390,69 @@ def evaluate_location(job, requested_location):
     return "unknown", f"Posting location cannot be verified against the requested location ({requested_location})."
 
 
+def evaluate_relocation_preference(job, preferences):
+    """Compare an explicit relocation choice with an actual work location.
+
+    This is separate from current residence, preferred work location, and work
+    authorization. None means relocation is irrelevant or not configured.
+    """
+    preferences=preferences or {}
+    mode=str(preferences.get("relocation_preference") or "unspecified").casefold()
+    if mode in {"", "unspecified"}:return None
+    description=html.unescape(re.sub(r"<[^>]+>"," ",str(job.get("description") or job.get("content") or "")))
+    arrangement=_arrangement(str(job.get("work_arrangement") or job.get("workplaceType") or ""))
+    if not arrangement:arrangement=_arrangement(description)
+    if arrangement=="Remote" or re.search(r"\b(?:fully remote|remote anywhere|work from anywhere)\b",description,re.I):return None
+    relocation_required=arrangement in {"On-site","Hybrid"}
+    if mode=="anywhere":return "eligible","Confirmed willingness to relocate anywhere is compatible with this location; work authorization is evaluated separately."
+    if mode=="per_job":return "unknown","Confirm relocation willingness separately for this job before preparation."
+    values=_location_values(job);location_text=" | ".join(values)
+    countries=_country_hits(values);states=_state_hits(values)
+    first_location=next((str(value) for value in values if value),"")
+    job_city=str(job.get("city") or first_location.split(",",1)[0]).strip()
+    if mode=="selected_locations":
+        destinations=preferences.get("relocation_destinations") or []
+        if not destinations:return "unknown","Selected relocation is enabled, but no destination has been confirmed."
+        uncertain=False
+        reverse_states={abbrev.casefold():name for name,abbrev in US_STATES.items()}
+        for target in destinations:
+            if not isinstance(target,dict):continue
+            country=str(target.get("country") or "").strip().casefold()
+            state=str(target.get("state_province") or "").strip().casefold()
+            city=str(target.get("city") or "").strip()
+            expected_country={"us":"united states","usa":"united states","u.s.":"united states","uk":"united kingdom","u.k.":"united kingdom"}.get(country,country)
+            expected_state=reverse_states.get(state,state)
+            city_match=bool(city and normalize_text(city)==normalize_text(job_city))
+            country_match=not expected_country or expected_country in countries
+            state_hits=_state_hits([expected_state],allow_bare_abbreviation=True) if expected_state else set()
+            state_match=not state_hits or bool(state_hits & states)
+            if expected_country and not countries:uncertain=True
+            if expected_state and not states:uncertain=True
+            if expected_country and not country_match:continue
+            if expected_state and not state_match:continue
+            if city and not city_match:continue
+            if expected_country or expected_state or city:return "eligible","Job location matches a confirmed relocation destination."
+            uncertain=True
+        if uncertain or not location_text:return "unknown","The job location cannot be compared confidently with the selected relocation destinations."
+        if not relocation_required:return "unknown","The job does not confirm an on-site or hybrid requirement, so relocation incompatibility cannot be established."
+        return "mismatch","The on-site or hybrid location is outside the confirmed relocation destinations."
+    if mode=="no":
+        current=preferences.get("_confirmed_current_location") or {}
+        if not isinstance(current,dict) or not any(current.values()):
+            return "unknown","Current residence is not confirmed, so relocation refusal cannot be compared with this job."
+        current_countries=_country_hits([str(current.get("country") or "")])
+        current_states=_state_hits([str(current.get("state_province") or "")],allow_bare_abbreviation=True)
+        current_city=str(current.get("city") or "")
+        if relocation_required and current_countries and countries and current_countries.isdisjoint(countries):
+            return "mismatch","The job requires an out-of-country move and relocation is declined."
+        if relocation_required and current_states and states and current_states.isdisjoint(states):
+            return "unknown","The job is outside the confirmed state, but commuting distance is unknown and relocation is declined; confirm before proceeding."
+        if current_city and normalize_text(current_city)==normalize_text(job_city):
+            return "eligible","The job location matches the confirmed current city; relocation is not needed."
+        return "unknown","Relocation is declined, but commuting distance from the confirmed residence is not established."
+    return "unknown","Relocation preference is not recognized and needs review."
+
+
 def prompt_constraints(prompt):
     """Extract explicit, safely enforceable refinements from a search prompt."""
     text = str(prompt or "").casefold()
@@ -498,17 +562,38 @@ def extract_experience_requirements(description):
     return output
 
 
+def _qualification_section_status(text, position, explicit_minimum=False):
+    headings=re.compile(r"\b(basic qualifications|minimum qualifications|required qualifications|requirements|preferred qualifications|preferred experience|nice to haves?|bonus points)\b",re.I)
+    preceding=[item.group(1).casefold() for item in headings.finditer(text,0,position)]
+    section=preceding[-1] if preceding else ""
+    if section in {"preferred qualifications","preferred experience","nice to have","nice to haves","bonus points"}:return "preferred"
+    if section in {"basic qualifications","minimum qualifications","required qualifications","requirements"}:return "required"
+    before=text[max(0,position-100):position].casefold()
+    if explicit_minimum or re.search(r"\b(?:required|must|minimum|min\.?|at least|no less than)\b[^.;]{0,80}$",before):return "required"
+    if re.search(r"\b(?:preferred|desired|nice to have|bonus)\b",before[-70:]):return "preferred"
+    return "unclear"
+
+
 def extract_graduation_windows(description):
     """Return explicit employer graduation windows as evidence, without inferring eligibility."""
-    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(str(description or ""))))
     month_names=r"January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?"
     month_numbers={"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"sept":9,"oct":10,"nov":11,"dec":12}
     month_pattern=re.compile(rf"\b(?:graduate|graduating|graduated)\s+(?:(?:in|by)\s+)?({month_names})\s+(20\d{{2}})\b",re.I)
     windows=[]
+    season_pattern=re.compile(r"\b(?P<seasons>(?:winter|spring|summer|fall)(?:\s*/\s*(?:winter|spring|summer|fall))*)\s+(?P<year>20\d{2})\b",re.I)
+    for match in season_pattern.finditer(text):
+        year=int(match.group("year"))
+        seasons=[value.strip().casefold() for value in re.split(r"\s*/\s*",match.group("seasons"))]
+        for season in seasons:
+            item={"start_year":year,"end_year":year,"season":season,"season_year":year,
+                  "status":_qualification_section_status(text,match.start()),"requirement":match.group(0)}
+            if item not in windows:windows.append(item)
     for match in month_pattern.finditer(text):
         month=month_numbers[match.group(1)[:3].casefold()]
         item={"start_year":int(match.group(2)),"end_year":int(match.group(2)),
-              "start_month":month,"end_month":month,"requirement":match.group(0)}
+              "start_month":month,"end_month":month,
+              "status":_qualification_section_status(text,match.start()),"requirement":match.group(0)}
         if item not in windows:windows.append(item)
     patterns = (
         re.compile(r"\b(?:class(?:es)? of|graduat(?:e|ing) in)\s+(20\d{2})(?:\s*(?:-|–|to|or)\s*(20\d{2}))?\b", re.I),
@@ -519,29 +604,94 @@ def extract_graduation_windows(description):
     for index,pattern in enumerate(patterns):
         for match in pattern.finditer(text):
             start, end = ("1900",match.group(1)) if index>=2 else (match.group(1), match.group(2) or match.group(1))
-            item = {"start_year": int(start), "end_year": int(end), "requirement": match.group(0)}
+            item = {"start_year": int(start), "end_year": int(end),
+                    "status":_qualification_section_status(text,match.start()),"requirement": match.group(0)}
             if item not in windows:
                 windows.append(item)
     return windows
 
 
+def extract_gpa_requirements(description):
+    """Extract explicit GPA minimums and label them from posting sections."""
+    text=html.unescape(re.sub(r"<[^>]+>"," ",str(description or "")))
+    text=re.sub(r"\s+"," ",text)
+    number=r"(?P<score>\d{1,2}(?:\.\d{1,3})?)"
+    patterns=(
+        re.compile(rf"\b(?:minimum|min\.?|at least|no less than)\s+(?:cumulative\s+)?GPA\s*(?:of|:)?\s*{number}(?:\s*/\s*(?P<scale>\d{{1,2}}(?:\.\d{{1,3}})?))?",re.I),
+        re.compile(rf"\b{number}(?:\s*/\s*(?P<scale>\d{{1,2}}(?:\.\d{{1,3}})?))?\s*(?:cumulative\s+)?GPA\s*(?:minimum|min\.?|at least|or higher|or above)",re.I),
+        re.compile(rf"\b(?:cumulative\s+)?GPA\s*(?:minimum|min\.?|of|:|>=|≥)\s*{number}(?:\s*/\s*(?P<scale>\d{{1,2}}(?:\.\d{{1,3}})?))?",re.I),
+        re.compile(rf"\bGPA\s*(?:>=|≥)\s*{number}(?:\s*/\s*(?P<scale>\d{{1,2}}(?:\.\d{{1,3}})?))?",re.I),
+    )
+    heading_pattern=re.compile(r"\b(basic qualifications|minimum qualifications|required qualifications|requirements|preferred qualifications|preferred experience|nice to haves?|bonus points)\b",re.I)
+    required_headings={"basic qualifications","minimum qualifications","required qualifications","requirements"}
+    preferred_headings={"preferred qualifications","preferred experience","nice to have","nice to haves","bonus points"}
+    found=[];seen=set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            try:score=float(match.group("score"));scale=float(match.groupdict().get("scale") or 0) or None
+            except (TypeError,ValueError):continue
+            if score<0 or score>100 or (scale is not None and (scale<=0 or score>scale)):continue
+            preceding=[item.group(1).casefold() for item in heading_pattern.finditer(text,0,match.start())]
+            section=preceding[-1] if preceding else ""
+            before=text[max(0,match.start()-90):match.start()].casefold()
+            after=text[match.end():min(len(text),match.end()+50)].casefold()
+            if section in preferred_headings:status="preferred"
+            elif section in required_headings:status="required"
+            elif re.search(r"\b(?:required|must|min(?:imum)?|at least)\b[^.;]{0,80}$",before) or re.search(r"\b(?:required|minimum)\b",after):status="required"
+            elif re.search(r"\b(?:preferred|desired|nice to have|bonus)\b",before[-70:]+" "+after):status="preferred"
+            else:status="unclear"
+            item={"minimum_score":score,"scale":scale,"status":status,"requirement":match.group(0).strip()}
+            identity=(score,scale,status)
+            if identity not in seen:found.append(item);seen.add(identity)
+    return {"required":[x for x in found if x["status"]=="required"],
+            "preferred":[x for x in found if x["status"]=="preferred"],
+            "unclear":[x for x in found if x["status"]=="unclear"]}
+
+
+def extract_internship_requirements(description):
+    """Classify explicit internship requirements by the posting's section."""
+    text=html.unescape(re.sub(r"<[^>]+>"," ",str(description or "")))
+    text=re.sub(r"\s+"," ",text)
+    pattern=re.compile(r"\b(?:(?:prior|previous|relevant|industry)\s+){1,3}(?:internship|internships|co[- ]op)(?:\s+experience)?\b|\b(?:internship|internships)(?:\s+experience)?\s+(?:is\s+)?required\b",re.I)
+    found=[];seen=set()
+    for match in pattern.finditer(text):
+        context=text[max(0,match.start()-80):min(len(text),match.end()+80)]
+        explicit=bool(re.search(r"\b(?:required|must have|minimum|at least one)\b",context,re.I))
+        status=_qualification_section_status(text,match.start(),explicit)
+        item={"requirement":match.group(0).strip(),"status":status}
+        if item["requirement"].casefold() not in seen:
+            found.append(item);seen.add(item["requirement"].casefold())
+    return {"required":[x for x in found if x["status"]=="required"],
+            "preferred":[x for x in found if x["status"]=="preferred"],
+            "unclear":[x for x in found if x["status"]=="unclear"]}
+
+
 def extract_education_requirements(description):
     """Extract degree evidence into required/preferred/unclear buckets."""
-    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(description or "")))
-    degree = re.compile(r"\b(?:bachelor(?:'s)?|master(?:'s)?|doctoral?|ph\.?d\.?|b\.?s\.?|b\.?a\.?|m\.?s\.?|m\.?a\.?|degree)\b", re.I)
-    headings = re.compile(r"\b(?:nice to have|bonus points|preferred qualifications|preferred experience|requirements|required qualifications|minimum qualifications|basic qualifications|qualifications)", re.I)
-    preferred = {"nice to have", "bonus points", "preferred qualifications", "preferred experience"}
+    text=html.unescape(str(description or ""))
+    text=re.sub(r"<\s*li\b[^>]*>|</\s*(?:li|p|h[1-6]|div|br|ul|ol)\s*>","\n",text,flags=re.I)
+    text=re.sub(r"<[^>]+>"," ",text)
+    abbreviations=((r"\bB\s*\.\s*S\s*\.?", "Bachelor's"),(r"\bB\s*\.\s*A\s*\.?", "Bachelor's"),
+                   (r"\bM\s*\.\s*S\s*\.?", "Master's"),(r"\bM\s*\.\s*A\s*\.?", "Master's"),
+                   (r"\bPh\s*\.\s*D\s*\.?", "doctoral"))
+    for pattern,replacement in abbreviations:text=re.sub(pattern,replacement,text,flags=re.I)
+    text="\n".join(re.sub(r"\s+"," ",line).strip() for line in text.splitlines())
+    degree=re.compile(r"\b(?:bachelor(?:'s)?|master(?:'s)?|doctoral?|ph\.?d\.?|degree)\b",re.I)
+    headings=re.compile(r"\b(?:nice to haves?|bonus points|preferred qualifications|preferred experience|requirements|required qualifications|minimum qualifications|basic qualifications|qualifications|responsibilities|duties|what you(?:'|’)ll do|about the role)",re.I)
+    preferred={"nice to have","nice to haves","bonus points","preferred qualifications","preferred experience"}
+    non_qualification_sections={"responsibilities","duties","what you'll do","what you’ll do","about the role"}
     output = {"required": [], "preferred": [], "unclear": []}
     for match in degree.finditer(text):
-        start = max(0, text.rfind(".", 0, match.start()) + 1)
-        end = text.find(".", match.end())
-        if end < 0:
-            end = min(len(text), match.end() + 180)
-        sentence = text[start:end].strip()
+        start=max(text.rfind("\n",0,match.start()),text.rfind(".",0,match.start()),text.rfind(";",0,match.start()))+1
+        endings=[index for token in ("\n",";",".") if (index:=text.find(token,match.end()))>=0]
+        end=min(endings) if endings else min(len(text),match.end()+220)
+        sentence=re.sub(r"\s+"," ",text[start:end]).strip()
         if not sentence:
             continue
-        sections = [item.group(0).casefold() for item in headings.finditer(text, 0, match.start())]
+        sections=[item.group(0).casefold() for item in headings.finditer(text,0,match.start())]
         section = sections[-1] if sections else ""
+        if section in non_qualification_sections:
+            continue
         if section in preferred:
             bucket = "preferred"
         elif section in {"requirements", "required qualifications", "minimum qualifications", "basic qualifications", "qualifications"}:
@@ -552,7 +702,7 @@ def extract_education_requirements(description):
             bucket = "preferred"
         else:
             bucket = "unclear"
-        normalized = sentence[:300]
+        normalized=sentence[:300]
         if normalized not in output[bucket]:
             output[bucket].append(normalized)
     return output

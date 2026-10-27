@@ -1083,6 +1083,20 @@ class ApplicationAgentTests(unittest.TestCase):
         with self.assertRaises(HTTPException):app_agent.review_saved_job_eligibility("saved-simple",app_agent.EligibilityReviewRequest(reviewed=True))
         self.assertFalse(next(x for x in app_agent.list_saved_application_jobs()["results"] if x["job_key"]=="saved-simple")["preparation_allowed"])
 
+    def test_missing_confirmed_gpa_blocks_dry_run_preparation(self):
+        from fastapi import HTTPException
+        result={"education_requirements":[{"requirement":"Minimum GPA 3.7/4.0","status":"unclear",
+            "candidate_evidence":[]}],"missing_information":["Confirmed candidate GPA evidence is missing."]}
+        with app_agent.connect() as db:
+            db.execute("UPDATE job_match_results SET result_json=?,classification='needs_review' WHERE user_id=? AND job_key='saved-simple' AND resume_id='r1'",
+                       (json.dumps(result),USER))
+        self.assertTrue(app_agent._unresolved_mandatory(json.dumps(result),"Basic Qualifications: GPA minimum 3.7/4.0."))
+        with self.assertRaises(HTTPException) as caught:
+            app_agent.prepare_saved_job(app_agent.DryRunRequest(job_key="saved-simple"))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertFalse(next(x for x in app_agent.list_saved_application_jobs()["results"]
+                              if x["job_key"]=="saved-simple")["preparation_allowed"])
+
     def test_source_backed_year_requirement_cannot_be_reviewed_away_without_matching_evidence(self):
         description="THE SKILLSET YOU'LL BRING 6+ years of professional engineering experience."
         self.assertTrue(app_agent._unresolved_mandatory("{}",description))
@@ -1143,6 +1157,9 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(self.client.last_page.submission_count,0)
 
     def test_checkbox_and_radio_answers_use_confirmed_profile_values(self):
+        with app_agent.connect() as db:
+            db.execute("CREATE TABLE career_preferences(user_id TEXT PRIMARY KEY,preferences_json TEXT NOT NULL)")
+            db.execute("INSERT INTO career_preferences VALUES(?,?)",(USER,json.dumps({"relocation_preference":"anywhere","relocation_destinations":[]})))
         app_agent.start_dry_run(app_agent.DryRunRequest(job={"job_key":"mock-choice-fields","company":"Mock Co","title":"Developer","application_url":"http://127.0.0.1:8000/mock-apps/choices"}))
         item=app_agent.list_applications()[0]
         self.assertEqual(item["state"],"ready_for_review")
@@ -1370,6 +1387,75 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(facts["graduation_year"],"2026"); self.assertEqual(facts["graduation_month"],"12")
         value,key=app_agent._answer({"label":"Graduation month and year"},facts,{})
         self.assertEqual((value,key),("December 2026","graduation_date"))
+
+    def test_reusable_answer_matching_obeys_global_and_job_specific_scope(self):
+        candidate={}
+        question={"label":"When can you start?","type":"text"}
+        scoped={"__job_key":"saved-simple","custom:answer":{"question":"What is your earliest available start date?","answer":"June 1","confirmed":True,"auto_reuse":True,"sensitive":False,"reuse_scope":"job_specific","scope_job_key":"saved-simple"}}
+        self.assertEqual(app_agent._answer(question,candidate,scoped)[0],"June 1")
+        scoped["__job_key"]="another-job"
+        self.assertIsNone(app_agent._answer(question,candidate,scoped)[0])
+        scoped["custom:answer"]["reuse_scope"]="general_preference"
+        self.assertEqual(app_agent._answer(question,candidate,scoped)[0],"June 1")
+        legacy,source=app_agent._answer({"label":"What work arrangement do you prefer?"},
+            {"work_arrangement_preferences":["Remote"]},{})
+        self.assertIsNone(legacy); self.assertIsNone(source)
+
+    def test_grouped_missing_question_answer_preserves_scope_and_never_resumes_apps(self):
+        with app_agent.connect() as db:
+            for app_id,job_key,company,title in (("a1","saved-simple","Example Co","First Engineer"),("a2","saved-second","Other Co","Second Engineer")):
+                db.execute("INSERT INTO applications(id,user_id,resume_id,job_key,company,title,application_url,state,diagnostic_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'needs_user_input',?,?,?)",
+                           (app_id,USER,"r1",job_key,company,title,"https://example.test/apply",json.dumps({"unanswered_fields":["When can you start?"]}),"2026-01-01","2026-01-01"))
+        grouped=app_agent.grouped_application_questions()
+        self.assertEqual(grouped["job_count"],2)
+        self.assertEqual(len(grouped["groups"]),1)
+        saved=app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(
+            question="When can you start?",answer="June 1",application_ids=["a1","a2"],
+            reuse_scope="general_preference",confirmed=True))
+        self.assertTrue(saved["persisted_verified"])
+        self.assertEqual(saved["reuse_scope"],"general_preference")
+        with app_agent.connect() as db:
+            states=[row[0] for row in db.execute("SELECT state FROM applications WHERE id IN ('a1','a2') ORDER BY id")]
+            answer=db.execute("SELECT reuse_scope,answer,auto_reuse FROM application_answers WHERE question_category='availability'").fetchone()
+        self.assertEqual(states,["needs_user_input","needs_user_input"])
+        self.assertEqual(tuple(answer),("general_preference","June 1",1))
+
+    def test_grouped_answer_rejects_sensitive_global_reuse_and_conflicting_questions(self):
+        from fastapi import HTTPException
+        with app_agent.connect() as db:
+            for app_id,job_key,question in (("a1","saved-simple","Are you legally authorized to work in the United States?"),("a2","saved-second","How much notice do you need?")):
+                db.execute("INSERT INTO applications(id,user_id,resume_id,job_key,company,title,application_url,state,diagnostic_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'needs_user_input',?,?,?)",
+                           (app_id,USER,"r1",job_key,"Example Co","Engineer","https://example.test/apply",json.dumps({"unanswered_fields":[question]}),"2026-01-01","2026-01-01"))
+        with self.assertRaises(HTTPException) as sensitive:
+            app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(question="Are you legally authorized to work in the United States?",answer="Yes",application_ids=["a1"],reuse_scope="matching_jobs",confirmed=True))
+        self.assertEqual(sensitive.exception.status_code,422)
+        scoped=app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(
+            question="Are you legally authorized to work in the United States?",answer="Yes",application_ids=["a1"],
+            reuse_scope="this_job",job_key="saved-simple",confirmed=True))
+        self.assertEqual(scoped["reuse_scope"],"job_specific")
+        with app_agent.connect() as db:
+            sensitive_row=db.execute("SELECT answer,answer_encrypted,reuse_scope,scope_job_key,auto_reuse FROM application_answers WHERE sensitive=1 AND question_category='work_authorization'").fetchone()
+        self.assertEqual(sensitive_row["answer"],""); self.assertTrue(sensitive_row["answer_encrypted"])
+        self.assertEqual((sensitive_row["reuse_scope"],sensitive_row["scope_job_key"],sensitive_row["auto_reuse"]),("job_specific","saved-simple",0))
+        with self.assertRaises(HTTPException) as conflict:
+            app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(question="When can you start?",answer="June 1",application_ids=["a1","a2"],reuse_scope="matching_jobs",confirmed=True))
+        self.assertEqual(conflict.exception.status_code,409)
+
+    def test_grouped_job_only_answer_is_bound_to_one_selected_job(self):
+        with app_agent.connect() as db:
+            for app_id,job_key in (("a1","saved-simple"),("a2","saved-second")):
+                db.execute("INSERT INTO applications(id,user_id,resume_id,job_key,company,title,application_url,state,diagnostic_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'needs_user_input',?,?,?)",
+                           (app_id,USER,"r1",job_key,"Example Co","Engineer","https://example.test/apply",json.dumps({"unanswered_fields":["How much notice do you need?"]}),"2026-01-01","2026-01-01"))
+        saved=app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(
+            question="How much notice do you need?",answer="Two weeks",application_ids=["a1","a2"],
+            reuse_scope="this_job",job_key="saved-simple",confirmed=True))
+        self.assertEqual(saved["reuse_scope"],"job_specific")
+        self.assertEqual([job["job_key"] for job in saved["affected_jobs"]],["saved-simple"])
+        with app_agent.connect() as db:
+            answer=db.execute("SELECT reuse_scope,scope_job_key,auto_reuse FROM application_answers WHERE question_category='availability'").fetchone()
+            states=[row[0] for row in db.execute("SELECT state FROM applications WHERE id IN ('a1','a2') ORDER BY id")]
+        self.assertEqual(tuple(answer),("job_specific","saved-simple",1))
+        self.assertEqual(states,["needs_user_input","needs_user_input"])
 
     def test_preferred_name_uses_only_separate_confirmed_profile_fact(self):
         value,source=app_agent._answer({"label":"Preferred name","type":"text"},{"preferred_name":"Alex"}, {})

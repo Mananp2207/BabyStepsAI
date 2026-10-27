@@ -56,6 +56,15 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         state=onboarding.onboarding_state(self.request)
         self.assertTrue(state["steps"]["contact"])
 
+    def test_relocation_step_progress_is_saved_and_preferences_remain_separate_from_residence(self):
+        saved=onboarding.update_onboarding_step("locations",onboarding.OnboardingStep(completed=True),self.request)
+        self.assertTrue(saved["saved"])
+        state=onboarding.onboarding_state(self.request)
+        self.assertTrue(state["steps"]["locations"])
+        self.assertEqual(state["preferences"]["relocation_preference"],"unspecified")
+        self.assertIn("Current residence is saved separately",onboarding.ONBOARDING_PAGE)
+        self.assertIn("onboarding-relocation-",onboarding.ONBOARDING_PAGE)
+
     def test_onboarding_save_feedback_is_accessible_and_optional_contact_does_not_block(self):
         page=onboarding.ONBOARDING_PAGE
         self.assertIn("role=\"status\"",page)

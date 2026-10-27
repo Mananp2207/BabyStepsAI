@@ -27,7 +27,9 @@ from pydantic import BaseModel, Field
 
 from job_search_agent import USER, DB as JOB_DB, fetch_board
 from candidate_verification import (verified_profile_facts, save_application_answer, AnswerUpdate,
-                                    verified_values_from_json, _answer_plaintext)
+                                    verified_values_from_json, _answer_plaintext,
+                                    canonical_answer_identity, stable_answer_key)
+from job_relevance import evaluate_relocation_preference, normalize_text
 from application_browser import (apply_targets, classify_control, detect_application_provider,
                                  page_interruption, submission_controls, summarize_form_metadata)
 from application_answer_assistant import get_authorization, generate_draft, draft_safe_profile, ORDINARY_PROMPT, SENSITIVE_PROMPT, MAX_ANSWER_CHARS
@@ -583,6 +585,15 @@ class MissingAnswerRequest(BaseModel):
     question: str
     answer: str
     reusable: bool = False
+    reuse_scope: str = ""
+    confirmed: bool = False
+
+class GroupedAnswerRequest(BaseModel):
+    question: str = Field(min_length=3,max_length=500)
+    answer: str = Field(min_length=1,max_length=4000)
+    application_ids: list[str] = Field(default_factory=list,max_length=50)
+    reuse_scope: str = "this_job"
+    job_key: str = Field(default="",max_length=300)
     confirmed: bool = False
 
 def _get_job(req):
@@ -661,7 +672,10 @@ def _preparation_snapshot(job_key,resume_id,application_url):
         opening=db.execute("SELECT company,title,COALESCE(job_url,url) AS posting_url,url,content_fingerprint,description FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,job_key)).fetchone()
         profile=db.execute("SELECT values_json,confirmed_json,updated_at FROM candidate_verifications WHERE user_id=? AND resume_id=?",(USER,resume_id)).fetchone()
         resume=db.execute("SELECT stored_name FROM resumes WHERE user_id=? AND id=?",(USER,resume_id)).fetchone()
-        try:answer_rows=db.execute("SELECT question_key,updated_at,confirmed,revoked_at,auto_reuse,sensitive FROM application_answers WHERE user_id=? AND resume_id=? ORDER BY question_key",(USER,resume_id)).fetchall()
+        try:answer_rows=db.execute("""SELECT question_key,updated_at,confirmed,revoked_at,auto_reuse,sensitive,reuse_scope,scope_job_key,question_category,question_context
+            FROM application_answers WHERE user_id=? AND resume_id=? AND
+            (reuse_scope IN ('matching_jobs','general_preference') OR (reuse_scope='job_specific' AND scope_job_key=?)) ORDER BY question_key""",
+            (USER,resume_id,job_key)).fetchall()
         except sqlite3.OperationalError:answer_rows=[]
         try:document_rows=db.execute("SELECT document_id,document_type,sha256,updated_at FROM application_documents WHERE user_id=? AND resume_id=? ORDER BY document_id",(USER,resume_id)).fetchall()
         except sqlite3.OperationalError:document_rows=[]
@@ -721,8 +735,12 @@ def _preparation_options(candidate,answers):
             value=candidate.get(key) or candidate.get("sponsorship_needs_by_country")
         if value not in (None,"",[],{}):
             fields.append({"key":key,"label":label,"sensitive":key in {"work_authorization","requires_sponsorship","salary_expectations"}})
+    job_key=answers.get("__job_key","")
     for key,item in answers.items():
-        if key.startswith("custom:") and item.get("confirmed") and item.get("auto_reuse") and not item.get("sensitive") and item.get("answer"):
+        if not key.startswith("custom:") or not isinstance(item,dict):continue
+        scope=item.get("reuse_scope") or ("matching_jobs" if item.get("auto_reuse") else "none")
+        in_scope=scope in {"matching_jobs","general_preference"} or (scope=="job_specific" and item.get("scope_job_key")==job_key)
+        if item.get("confirmed") and item.get("auto_reuse") and in_scope and not item.get("sensitive") and item.get("answer"):
             fields.append({"key":key,"label":"Reusable answer: "+str(item.get("question") or "Saved answer")[:180],"sensitive":False})
     documents=[{"type":"resume","label":"Active resume"}]
     seen=set()
@@ -862,6 +880,7 @@ def _saved_preparation_context(job_key):
     if _mock_allowed(job.get("application_url")):
         raise HTTPException(409,"Local synthetic forms use the separate test mode and do not need real-employer authorization.")
     resume,candidate,answers=_candidate()
+    answers=_application_context(job,answers)
     with connect() as db:
         classification,reviewed,unresolved=_eligibility_gate(db,job_key,resume["id"])
         match=db.execute("SELECT status,classification,updated_at,freshness_status,matching_model_version FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,job_key,resume["id"])).fetchone()
@@ -1101,12 +1120,15 @@ def _candidate():
         resume=db.execute("SELECT r.id,r.stored_name,r.original_name FROM resumes r WHERE r.user_id=? AND r.active=1 LIMIT 1",(USER,)).fetchone()
         if not resume: raise HTTPException(409,"Upload and activate a resume before starting a dry run.")
         v=db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE resume_id=? AND user_id=?",(resume["id"],USER)).fetchone()
-        ans=db.execute("SELECT id,question_key,question_text,answer,answer_encrypted,sensitive,auto_reuse,answer_type,jurisdiction FROM application_answers WHERE user_id=? AND resume_id=? AND confirmed=1 AND revoked_at IS NULL",(USER,resume["id"])).fetchall()
+        ans=db.execute("SELECT id,question_key,question_text,answer,answer_encrypted,sensitive,auto_reuse,answer_type,jurisdiction,question_category,question_context,reuse_scope,scope_job_key,profile_version FROM application_answers WHERE user_id=? AND resume_id=? AND confirmed=1 AND revoked_at IS NULL",(USER,resume["id"])).fetchall()
         answers_by_key={}
         for item in ans:
             answers_by_key[item["question_key"]]={"answer":_answer_plaintext(item,db),"question":item["question_text"],
                 "sensitive":bool(item["sensitive"]),"auto_reuse":bool(item["auto_reuse"]),"confirmed":True,
-                "answer_type":item["answer_type"],"jurisdiction":item["jurisdiction"]}
+                "answer_type":item["answer_type"],"jurisdiction":item["jurisdiction"],
+                "category":item["question_category"],"context":item["question_context"],
+                "reuse_scope":item["reuse_scope"],"scope_job_key":item["scope_job_key"],
+                "profile_version":item["profile_version"]}
     stored=Path(str(resume["stored_name"] or ""))
     resume_path=(STORAGE/stored.name).resolve()
     if stored.name!=str(resume["stored_name"] or "") or resume_path.parent!=STORAGE.resolve() or not resume_path.is_file():
@@ -1201,7 +1223,8 @@ def _required_marker(label):
     return bool(re.search(r"[*✱＊]\s*$|(?<!\w)[*✱＊](?!\w)|\brequired\b\s*$",str(label or ""),re.I))
 
 def _application_context(job,answers):
-    context={"company":job.get("company",""),"title":job.get("title",""),"location":job.get("location",""),"source":""}
+    context={"company":job.get("company",""),"title":job.get("title",""),"location":job.get("location",""),
+             "work_arrangement":job.get("work_arrangement",""),"source":""}
     preferences={}
     with connect() as db:
         try:
@@ -1215,9 +1238,10 @@ def _application_context(job,answers):
             if row: preferences=json.loads(row["preferences_json"] or "{}")
         except (sqlite3.OperationalError,TypeError,json.JSONDecodeError): pass
     answers["__job_context"]=context
+    answers["__job_key"]=str(job.get("job_key") or "")
     answers["__job_description"]=str(job.get("description") or "")[:12000]
     answers["__preferences"]=preferences
-    preferences["_reusable_answers"]=[{"question":v.get("question",""),"answer":v.get("answer",""),"type":v.get("answer_type","factual")} for k,v in answers.items() if k.startswith("custom:") and isinstance(v,dict) and v.get("auto_reuse") and not v.get("sensitive")]
+    preferences["_reusable_answers"]=[{"question":v.get("question",""),"answer":v.get("answer",""),"type":v.get("answer_type","factual")} for k,v in answers.items() if k.startswith("custom:") and isinstance(v,dict) and v.get("auto_reuse") and v.get("reuse_scope") in {"matching_jobs","general_preference"} and not v.get("sensitive")]
     answers["__job_source"]=context["source"]
     answers["__is_local_mock"]=_mock_allowed(job.get("application_url",""))
     return answers
@@ -1357,6 +1381,25 @@ def _option_alias(value,field_label):
 
 def _answer(info,candidate,answers):
     label=_label(info)
+    category,question_context,question_sensitive=canonical_answer_identity(label)
+    if category=="relocation":
+        preferences=answers.get("__preferences",{})
+        context=answers.get("__job_context",{})
+        if question_context and normalize_text(question_context) not in normalize_text(context.get("location","")):
+            return None,None
+        for saved_key,saved in answers.items():
+            if (saved_key.startswith("custom:") and saved.get("confirmed") and saved.get("auto_reuse") and
+                not saved.get("sensitive") and saved.get("reuse_scope")=="job_specific" and
+                saved.get("scope_job_key")==answers.get("__job_key") and saved.get("category")=="relocation" and
+                saved.get("context","")==question_context and saved.get("answer")):
+                return saved["answer"],saved_key
+        mode=str(preferences.get("relocation_preference") or "unspecified").casefold()
+        if mode=="anywhere":return "Yes","relocation_preference"
+        if mode in {"selected_locations","no"}:
+            decision=evaluate_relocation_preference({"location":context.get("location",""),
+                "work_arrangement":context.get("work_arrangement","")},preferences)
+            if decision and decision[0]=="eligible":return ("No" if mode=="no" else "Yes"),"relocation_preference"
+        return None,None
     if re.search(r"city.*state.*country|city state and country|city.{0,35}state|state.{0,35}country|where do you live|residential location",label):
         location=_confirmed_location(candidate)
         if location: return location,"location"
@@ -1382,8 +1425,7 @@ def _answer(info,candidate,answers):
       (r"email|e mail","email"),(r"phone|mobile|telephone","phone"),(r"full name|first and last name|your name|name","full_name"),
       (r"github","github"),(r"linkedin","linkedin"),(r"portfolio","portfolio"),(r"personal website|website|web site","website"),(r"current location|city and state|where are you located|location","location"),
       (r"education history|education details|university|school|college","university"),(r"degree","degree"),(r"major|field of study","major"),(r"graduation month.{0,24}year|graduation date","graduation_date"),(r"graduation month","graduation_month"),(r"graduation year|expected graduation","graduation_year"),
-      (r"authorization|authorisation|authorized to work|authorised to work","work_authorization"),(r"sponsorship|sponsor|visa","requires_sponsorship"),(r"relocat","relocation_willingness"),(r"salary|compensation expectation","salary_expectations"),(r"salary currency|currency","salary_currency"),(r"earliest available|earliest start|available to start","earliest_available_date"),(r"availability|start date|notice period","availability"),(r"travel|willingness to travel","willingness_to_travel"),
-      (r"remote|hybrid|on site|on-site|work arrangement","work_arrangement_preferences"),
+      (r"authorization|authorisation|authorized to work|authorised to work","work_authorization"),(r"sponsorship|sponsor|visa","requires_sponsorship"),(r"salary|compensation expectation","salary_expectations"),(r"salary currency|currency","salary_currency"),(r"earliest available|earliest start|available to start","earliest_available_date"),(r"availability|start date|notice period","availability"),(r"travel|willingness to travel","willingness_to_travel"),
       (r"work experience|employment history|professional experience","work_experience"),(r"internship","internships"),(r"technical skills|programming languages","technical_skills"),(r"project(s)? description|projects","projects"),(r"certification","certifications"),(r"license|licence","licenses"),(r"employment preference|full time or part time","employment_preferences"),(r"additional information|anything else","additional_information"))
     for pattern,key in direct:
         if re.search(pattern,label):
@@ -1401,15 +1443,15 @@ def _answer(info,candidate,answers):
             if val: return str(val),key
             saved=answers.get(key)
             if isinstance(saved,dict) and saved.get("answer") and saved.get("auto_reuse"): return saved["answer"],key
-    # A user-confirmed reusable answer can support a custom question only when
-    # the field text substantially matches the question they saved.
-    tokens=set(re.findall(r"[a-z0-9]{4,}",label))-{"your","what","when","where","please","provide","question"}
+    # Reuse requires an exact deterministic category and context match.
     for key,item in answers.items():
-        if not key.startswith("custom:") or item.get("sensitive") or not item.get("auto_reuse"): continue
-        known=set(re.findall(r"[a-z0-9]{4,}",str(item.get("question","")).casefold()))-{"your","what","when","where","please","provide","question"}
-        shared=len(tokens & known); required_shared=1 if min(len(tokens),len(known))<=2 else 2
-        if tokens and known and shared>=required_shared and shared/max(1,min(len(tokens),len(known)))>=0.6:
-            return item["answer"],key
+        if (not key.startswith("custom:") or item.get("sensitive") or not item.get("confirmed") or
+            not item.get("auto_reuse") or _sensitive(info) or _requires_human_confirmation(info)): continue
+        item_category,item_context,_=canonical_answer_identity(item.get("question",""))
+        scope=item.get("reuse_scope") or ("matching_jobs" if item.get("auto_reuse") else "none")
+        scope_ok=(scope in {"matching_jobs","general_preference"} or (scope=="job_specific" and item.get("scope_job_key")==answers.get("__job_key")))
+        if not scope_ok or item_category!=category or item_context!=question_context or question_sensitive:continue
+        if item.get("answer"):return item["answer"],key
     if info.get("type")=="file":
         if re.search(r"resume|curriculum vitae|cv upload",label):return "__RESUME__","resume"
         doc_type=("transcript" if re.search(r"transcript",label) else
@@ -2501,7 +2543,7 @@ def save_missing_application_answer(application_id:str,request:MissingAnswerRequ
     if not question or not request.answer.strip(): raise HTTPException(422,"Enter an answer before saving.")
     if not request.confirmed: raise HTTPException(422,"Confirm that this answer is accurate before saving it.")
     with connect() as db:
-        app=db.execute("SELECT state,diagnostic_json,resume_id FROM applications WHERE id=? AND user_id=?",(application_id,USER)).fetchone()
+        app=db.execute("SELECT state,diagnostic_json,resume_id,job_key FROM applications WHERE id=? AND user_id=?",(application_id,USER)).fetchone()
     if not app: raise HTTPException(404,"Application not found.")
     if app["state"]!="needs_user_input": raise HTTPException(409,"This application is not waiting for answers.")
     try: diagnostic=json.loads(app["diagnostic_json"] or "{}")
@@ -2512,10 +2554,102 @@ def save_missing_application_answer(application_id:str,request:MissingAnswerRequ
     if resume["id"]!=app["resume_id"]: raise HTTPException(409,"Activate the resume version associated with this attempt before saving answers.")
     sensitive=_sensitive({"label":question}) or _requires_human_confirmation({"label":question})
     key="application-question-"+hashlib.sha256(question.casefold().encode()).hexdigest()[:24]
+    reuse_scope=request.reuse_scope or ("matching_jobs" if request.reusable else "none")
+    if sensitive and reuse_scope in {"matching_jobs","general_preference"}:raise HTTPException(422,"Sensitive or legal answers cannot be reused across jobs.")
+    if sensitive:reuse_scope="job_specific"
+    if reuse_scope=="job_specific":scope_job_key=app["job_key"]
+    else:scope_job_key=""
     answer_payload=AnswerUpdate(question=question,answer=request.answer[:4000],sensitive=sensitive,confirmed=True,
-        answer_type="sensitive" if sensitive else "factual",auto_reuse=bool(request.reusable and not sensitive))
+        answer_type="sensitive" if sensitive else "factual",auto_reuse=reuse_scope!="none",
+        reuse_scope=reuse_scope,scope_job_key=scope_job_key)
     save_application_answer(key,answer_payload)
-    return {"saved":True,"reusable":bool(request.reusable and not sensitive),"requires_manual_action":_requires_human_confirmation({"label":question}),"message":"Confirmed answer saved. Resume the dry run when ready."}
+    return {"saved":True,"reusable":bool(reuse_scope!="none" and not sensitive),"reuse_scope":reuse_scope,
+        "requires_manual_action":_requires_human_confirmation({"label":question}),"message":"Confirmed answer saved. Resume the dry run when ready."}
+
+
+@router.get("/api/application-questions/attention")
+def grouped_application_questions():
+    with connect() as db:
+        rows=db.execute("SELECT id,job_key,company,title,diagnostic_json FROM applications WHERE user_id=? AND state='needs_user_input' ORDER BY updated_at DESC",(USER,)).fetchall()
+    groups={}
+    for row in rows:
+        try:diagnostic=json.loads(row["diagnostic_json"] or "{}")
+        except (TypeError,json.JSONDecodeError):diagnostic={}
+        seen=set()
+        for raw in diagnostic.get("unanswered_fields",[]) if isinstance(diagnostic.get("unanswered_fields"),list) else []:
+            exact=str(raw or "").strip()[:500];question=_display_question(exact)
+            category,context,sensitive=canonical_answer_identity(question)
+            sensitive=bool(sensitive or _sensitive({"label":question}) or _requires_human_confirmation({"label":question}))
+            identity=(category,context)
+            if not question or identity in seen:continue
+            seen.add(identity)
+            group=groups.setdefault(identity,{"canonical_category":category,"context":context,"question":question,
+                "sensitive":sensitive,"jobs":[]})
+            group["jobs"].append({"application_id":row["id"],"job_key":row["job_key"],
+                "company":row["company"],"title":row["title"],"question":question})
+    result=sorted(groups.values(),key=lambda item:(item["canonical_category"],item["context"],item["question"].casefold()))
+    return {"groups":result,"job_count":sum(len(item["jobs"]) for item in result)}
+
+
+@router.post("/api/application-questions/answer")
+def save_grouped_application_answer(request:GroupedAnswerRequest):
+    question=re.sub(r"\s+"," ",request.question.strip())[:500]
+    answer=request.answer.strip()
+    if not request.confirmed:raise HTTPException(422,"Confirm that the answer is accurate before saving it.")
+    category,context,sensitive=canonical_answer_identity(question)
+    sensitive=bool(sensitive or _sensitive({"label":question}) or _requires_human_confirmation({"label":question}))
+    if request.reuse_scope not in {"this_job","matching_jobs","general_preference"}:
+        raise HTTPException(422,"Choose how this confirmed answer may be reused.")
+    if category=="relocation" and request.reuse_scope!="this_job":
+        raise HTTPException(422,"Set relocation anywhere, selected destinations, no relocation, or decide per job in Career Preferences. A job-specific answer cannot become a general relocation preference.")
+    if sensitive and request.reuse_scope!="this_job":
+        raise HTTPException(422,"Sensitive, legal, and human-verification answers can only be saved for this job and are never automatically reused.")
+    ids=list(dict.fromkeys(request.application_ids))
+    if not ids:raise HTTPException(422,"Select at least one affected saved application.")
+    marks=",".join("?" for _ in ids)
+    with connect() as db:
+        apps=db.execute(f"SELECT id,job_key,company,title,state,diagnostic_json,resume_id FROM applications WHERE user_id=? AND id IN ({marks})",
+                         (USER,*ids)).fetchall()
+    if len(apps)!=len(ids) or any(row["state"]!="needs_user_input" for row in apps):
+        raise HTTPException(409,"One or more selected applications no longer need answers. Refresh this list.")
+    matching=[]
+    for row in apps:
+        try:diagnostic=json.loads(row["diagnostic_json"] or "{}")
+        except (TypeError,json.JSONDecodeError):diagnostic={}
+        found=False
+        for raw in diagnostic.get("unanswered_fields",[]) if isinstance(diagnostic.get("unanswered_fields"),list) else []:
+            if canonical_answer_identity(_display_question(str(raw)) )[:2]==(category,context):found=True;break
+        if found:matching.append(row)
+    if len(matching)!=len(apps):raise HTTPException(409,"The selected jobs do not share this canonical question. Refresh and answer each distinct question separately.")
+    if request.reuse_scope=="this_job":
+        target=next((row for row in matching if row["job_key"]==request.job_key),None)
+        if not target:raise HTTPException(422,"Choose one of the listed jobs for job-only reuse.")
+        active,_,_=_candidate()
+        if active["id"]!=target["resume_id"]:
+            raise HTTPException(409,"Activate the resume version associated with this application before saving its answer.")
+        reuse_scope="job_specific"
+        scope_job=target["job_key"]
+        resume_id=target["resume_id"]
+        affected=[target]
+    else:
+        reuse_scope="matching_jobs" if request.reuse_scope=="matching_jobs" else "general_preference"
+        scope_job=""
+        resume_id=matching[0]["resume_id"]
+        active,_,_=_candidate()
+        if active["id"]!=resume_id or any(row["resume_id"]!=resume_id for row in matching):
+            raise HTTPException(409,"The grouped jobs use different resume versions. Answer them separately.")
+        affected=matching
+    if category=="relocation":raise HTTPException(422,"Use structured Career Preferences for relocation decisions.")
+    key=stable_answer_key(category,context,reuse_scope,scope_job)
+    saved=save_application_answer(key,AnswerUpdate(question=question,answer=answer,confirmed=True,
+        sensitive=sensitive,answer_type="sensitive" if sensitive else ("preference" if request.reuse_scope=="general_preference" else "factual"),
+        auto_reuse=reuse_scope!="none",reuse_scope=reuse_scope,scope_job_key=scope_job))
+    if not saved.get("persisted_verified"):
+        raise HTTPException(500,"The confirmed answer was not verified after saving. Refresh before continuing.")
+    return {"saved":True,"persisted_verified":True,"canonical_category":category,"reuse_scope":reuse_scope,
+        "affected_jobs":[{"job_key":row["job_key"],"company":row["company"],"title":row["title"]} for row in affected],
+        "requires_manual_action":sensitive or category in {"legal_attestation","human_verification"},
+        "message":("Sensitive answer stored encrypted for this job. It will not be filled automatically; provide it yourself if the employer asks." if sensitive else "Answer saved. No application was resumed or prepared; return to each dry run when ready.")}
 
 @router.get("/api/applications/{application_id}/questions")
 def list_missing_application_questions(application_id:str):
@@ -2738,6 +2872,7 @@ APPLICATIONS_PAGE=r'''<!doctype html>
 <div id="summary" class="cards" aria-live="polite"></div><div class="toolbar" aria-label="Application controls"><button id="load-jobs" onclick="loadJobs()">Load saved jobs</button><button id="pause" onclick="action('/api/applications/pause')">Pause processing</button><button id="resume" onclick="action('/api/applications/resume')">Resume processing</button><button type="button" id="theme-toggle" aria-label="Toggle dark mode">Dark mode</button><span class="muted" id="run-state">Checking status…</span></div>
 <div class="section-head"><h2>Local test forms</h2><span class="sub">Clearly labeled test workflows</span></div><div class="toolbar"><button onclick="mock('simple')">Test simple form</button><button onclick="mock('multi-step')">Test multi-step form</button><button onclick="mock('uncertain')">Test uncertain questions</button><button onclick="mock('captcha')">Test human-check stop</button></div>
 <div class="section-head"><h2>Saved jobs</h2><span class="sub">Prepare one opening or explicitly queue selected openings</span></div><div class="toolbar" aria-label="Saved job filters"><label>Search <input id="job-search" type="search" placeholder="Title, company, or location"></label><label>Eligibility <select id="job-eligibility"><option value="all">All results</option><option value="potential_match">Potential match</option><option value="needs_review">Needs review</option><option value="not_eligible">Not eligible</option><option value="unmatched">Not analyzed</option></select></label><button id="filter-jobs" onclick="loadJobs()">Search saved jobs</button><button id="queue-selected" onclick="queueSelected()">Queue selected dry runs</button></div><div id="jobs" class="grid"><div class="empty">Load saved jobs to choose a dry run.</div></div>
+<div class="section-head"><h2>Questions Requiring Your Attention</h2><span class="sub">Confirm once, then choose the reuse scope</span></div><div id="question-attention" class="grid"><div class="empty">Loading unresolved application questions…</div></div>
 <div class="section-head"><h2>Application history</h2><span class="sub">Refreshes automatically</span></div><div id="apps" class="grid"></div><p id="status" role="status" aria-live="polite"></p></main>
 <script>
 let busy=false,jobsLoaded=false;const labels={queued:'Queued',opening:'Opening employer site',inspecting:'Inspecting application form',filling:'Filling verified information',uploading_resume:'Uploading resume',paused:'Paused',needs_user_input:'Needs your input',ready_for_review:'Ready for review',failed:'Failed',unsupported:'Unsupported website',skipped_duplicate:'Already applied / duplicate skipped',submitted:'Submitted'};const progress={queued:8,opening:20,inspecting:35,filling:65,uploading_resume:82,paused:68,needs_user_input:82,ready_for_review:100,failed:100,unsupported:100,skipped_duplicate:100,submitted:100};
@@ -2755,7 +2890,8 @@ function node(tag,cls,text){const e=document.createElement(tag);if(cls)e.classNa
 function renderSummary(apps,p){const counts=p.counts||{},quota=p.submission_quota||{},entries=[['Applications',apps.length],['Queued',counts.queued||0],['In progress',(counts.opening||0)+(counts.inspecting||0)+(counts.filling||0)+(counts.uploading_resume||0)],['Paused',counts.paused||0],['Needs your input',counts.needs_user_input||0],['Ready for review',counts.ready_for_review||0],['Failed / unsupported',(counts.failed||0)+(counts.unsupported||0)],['Confirmed submissions · 24h',quota.successful_last_24h||0],['Future capacity · live submission off',quota.remaining??p.daily_submission_limit??200]];const box=document.querySelector('#summary');box.replaceChildren(...entries.map(([label,value])=>{const c=node('div','metric');c.append(node('strong','',value),node('span','',label));return c}));document.querySelector('#run-state').textContent=p.paused?'Processing is paused':p.processing_state==='running'?'Processing is active':'Processing is ready';document.querySelector('#pause').disabled=!!p.paused||busy;document.querySelector('#resume').disabled=!p.paused||busy}
 function renderApps(apps){const box=document.querySelector('#apps');box.replaceChildren();if(!apps.length){box.append(node('div','empty','No application attempts yet. Start a dry run from a saved job or choose a local test form.'));return}for(const app of apps){const card=node('article','app'),head=node('h3','',escapeText(app.title)),company=node('div','sub',escapeText(app.company));const test=String(app.job_key||'').startsWith('local-mock:');const badge=node('span','pill',test?'Local test':'Saved job');const state=node('div','status',labels[app.state]||'Needs review');state.dataset.state=app.state;state.prepend(node('i','dot'));const bar=node('div','bar');const fill=node('i');fill.style.width=(progress[app.state]||15)+'%';bar.append(fill);const timing=node('div','sub','Last updated '+new Date(app.updated_at).toLocaleString()+(app.started_at?' · Attempt started '+new Date(app.started_at).toLocaleString():''));card.append(head,company,badge,state,bar,timing);if(app.diagnostic?.message)card.append(node('p','sub',app.diagnostic.message));if(app.diagnostic?.unanswered_fields?.length){card.append(node('p','sub','Needs your input: '+app.diagnostic.unanswered_fields.join(' · ')));const link=node('a','sub','Review candidate profile and answers');link.href='/candidate-profile';card.append(link)}if(['paused','failed','needs_user_input','unsupported'].includes(app.state)){const btn=node('button','',app.diagnostic?.interrupted?'Review and retry':'Retry dry run');btn.onclick=()=>retry(app.id);card.append(btn)}const detail=document.createElement('details'),summary=node('summary','','Diagnostics and attempt history');const body=node('div');if(app.error)body.append(node('p','', 'Technical error: '+app.error));if(app.diagnostic?.steps)body.append(node('p','', 'Form steps visited: '+app.diagnostic.steps));if(app.diagnostic?.filled_fields?.length)body.append(node('p','', 'Fields filled: '+app.diagnostic.filled_fields.filter(x=>x.result==='filled').length));if(app.diagnostic?.screenshot){const shot=node('a','sub','View private dry-run screenshot');shot.href='/api/applications/'+encodeURIComponent(app.id)+'/screenshot';shot.target='_blank';shot.rel='noopener';body.append(shot)}if(app.diagnostic?.interrupted)body.append(node('p','', 'This attempt was interrupted. It was not automatically retried because its outcome may be uncertain.'));detail.append(summary,body);detail.addEventListener('toggle',async()=>{if(!detail.open||detail.dataset.loaded)return;detail.dataset.loaded='1';try{const attempts=await req('/api/applications/'+encodeURIComponent(app.id)+'/attempts');for(const attempt of attempts){const item=node('p','sub','Attempt '+attempt.attempt_number+' · '+(labels[attempt.state]||attempt.state)+' · '+(attempt.started_at?'started '+new Date(attempt.started_at).toLocaleString():'not started'));body.append(item);if(attempt.diagnostic?.message)body.append(node('p','sub',attempt.diagnostic.message));if(attempt.error)body.append(node('p','sub','Technical error type: '+attempt.error))}}catch(e){body.append(node('p','sub',e.message))}});card.append(detail);box.append(card)}}
 async function retry(id){await runBusy('Starting the selected retry…',async()=>{await req('/api/applications/'+encodeURIComponent(id)+'/resume',{method:'POST'});say('Retry started. Previously completed attempts and diagnostics remain in history.')})}
-async function refresh(){try{const [apps,p]=await Promise.all([req('/api/applications'),req('/api/applications/progress')]);renderSummary(apps,p);renderApps(apps);if(jobsLoaded)await renderSavedJobs(true)}catch(e){say(e.message)}}
+async function renderQuestionAttention(){const root=document.getElementById('question-attention');if(!root)return;root.replaceChildren();try{const data=await req('/api/application-questions/attention');if(!data.groups?.length){root.append(node('div','empty','No saved applications currently need additional answers.'));return}for(const group of data.groups){const card=node('article','app'),title=node('h3','',group.question);card.append(title,node('p','sub',(group.jobs.length===1?'1 saved job':'Shared across '+group.jobs.length+' saved jobs')+' · '+group.canonical_category.replaceAll('_',' ')));for(const job of group.jobs){const line=node('p','sub',job.company+' · '+job.title+' — '+job.question);card.append(line)}if(group.sensitive)card.append(node('p','sub','Sensitive or legal answer: stored encrypted, never automatically reused, and the employer may still require your action.'));const answer=document.createElement('textarea');answer.rows=3;answer.maxLength=4000;answer.required=true;answer.setAttribute('aria-label','Confirmed answer for '+group.question);answer.placeholder='Enter only an answer you have confirmed.';const scope=document.createElement('select');scope.setAttribute('aria-label','Answer reuse scope');for(const [value,label] of [['this_job','Use for this job only'],['matching_jobs','Reuse for matching jobs'],['general_preference','Save as a general preference']]){const option=document.createElement('option');option.value=value;option.textContent=label;scope.append(option)}if(group.sensitive||group.canonical_category==='relocation')scope.value='this_job';if(group.sensitive){for(const option of scope.options)if(option.value!=='this_job')option.disabled=true}if(group.canonical_category==='relocation'){for(const option of scope.options)if(option.value!=='this_job')option.disabled=true;card.append(node('p','sub','For future roles, set your structured relocation choice and destinations in Career Preferences.'))}const target=document.createElement('select');target.setAttribute('aria-label','Job for one-job reuse');for(const job of group.jobs){const option=document.createElement('option');option.value=job.job_key;option.textContent=job.company+' · '+job.title;target.append(option)}const confirmLabel=document.createElement('label'),confirm=document.createElement('input');confirm.type='checkbox';confirmLabel.append(confirm,document.createTextNode(' I confirm this answer is accurate.'));const save=node('button','primary','Save confirmed answer');const status=node('p','sub','');status.setAttribute('role','status');save.onclick=async()=>{if(!answer.value.trim()||!confirm.checked){status.textContent='Enter an answer and confirm that it is accurate.';return}save.disabled=true;status.textContent='Saving and verifying…';try{const result=await req('/api/application-questions/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:group.question,answer:answer.value,application_ids:group.jobs.map(x=>x.application_id),reuse_scope:scope.value,job_key:scope.value==='this_job'?target.value:'',confirmed:true})});if(!result.persisted_verified)throw Error('The saved answer could not be verified.');status.textContent=result.requires_manual_action?'Saved encrypted for this job only. It will not be auto-filled; enter it yourself in the employer form when asked.':'Saved. No application was resumed; choose a dry run in Application history when ready.';say(result.message);await renderQuestionAttention()}catch(error){status.textContent=error.message;save.disabled=false}};card.append(answer,scope);if(!group.sensitive&&group.canonical_category!=='relocation'){const profileLink=node('a','sub','Review your profile and permissions');profileLink.href='/candidate-profile';card.append(profileLink)}if(group.jobs.length>1)card.append(target);card.append(confirmLabel,save,status);root.append(card)}}catch(error){root.append(node('p','sub','Could not load grouped application questions: '+error.message))}}
+async function refresh(){try{const [apps,p]=await Promise.all([req('/api/applications'),req('/api/applications/progress')]);renderSummary(apps,p);renderApps(apps);await renderQuestionAttention();if(jobsLoaded)await renderSavedJobs(true)}catch(e){say(e.message)}}
 document.querySelectorAll('.toolbar button').forEach(button=>button.addEventListener('click',()=>{if(busy)button.disabled=true}));refresh();setInterval(refresh,3000);const localTestHeading=[...document.querySelectorAll('.section-head')].find(x=>x.querySelector('h2')?.textContent==='Local test forms'),localTestToolbar=localTestHeading?.nextElementSibling;if(localTestToolbar){const answerTest=node('button','','Test AI-written answer');answerTest.onclick=()=>mock('written');localTestToolbar.append(answerTest)}
 Object.assign(labels,{opening:'Opening employer website',inspecting:'Finding application form',filling:'Filling candidate details'});if(!document.querySelector('nav a[href="/application-settings"]')){const settingsNav=document.createElement('a');settingsNav.href='/application-settings';settingsNav.textContent='Application settings';document.querySelector('nav')?.append(settingsNav)}
 const baseRenderApps=renderApps;renderApps=function(apps){baseRenderApps(apps);const cards=document.querySelectorAll('#apps .app');apps.forEach((app,index)=>{const drafts=app.diagnostic?.draft_answers;if(!Array.isArray(drafts)||!drafts.length)return;const card=cards[index];if(!card)return;const panel=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Review AI-drafted answers';panel.append(summary);for(const draft of drafts){const question=node('p','sub',draft.question||'Application question'),answer=document.createElement('textarea');answer.value=draft.answer||'';answer.rows=4;answer.maxLength=1200;answer.setAttribute('aria-label','Edit AI-drafted answer');const reuse=document.createElement('label'),check=document.createElement('input');check.type='checkbox';reuse.append(check,document.createTextNode(' Allow automatic reuse after confirming'));const save=node('button','','Confirm and save answer');save.onclick=async()=>{try{save.disabled=true;await req('/api/application-answers/ai-'+Date.now().toString(36),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:draft.question,answer:answer.value,confirmed:true,sensitive:false,answer_type:'generated',auto_reuse:check.checked})});save.textContent='Saved';say('Your reviewed answer was saved to the active profile.')}catch(e){save.disabled=false;say(e.message)}};panel.append(question,answer,reuse,save)}card.append(panel)})};

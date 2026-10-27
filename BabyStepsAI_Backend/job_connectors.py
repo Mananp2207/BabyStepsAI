@@ -636,6 +636,85 @@ def _posting_is_expired(value):
         return False
 
 
+def _greenhouse_job_detail(token, job_id, getter=None):
+    """Fetch one documented public Greenhouse board posting record."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", token or ""):
+        return None, "The Greenhouse board token is invalid."
+    if not re.fullmatch(r"[0-9]{1,24}", str(job_id or "")):
+        return None, "The Greenhouse job ID is invalid."
+    endpoint = f"https://boards-api.greenhouse.io/v1/boards/{quote(token, safe='')}/jobs/{job_id}"
+    allowed, reason = _robots_allow(endpoint, getter)
+    if not allowed:
+        return None, reason or "The Greenhouse public API is disallowed by robots.txt."
+    payload = None
+    error = None
+    for attempt in range(3):
+        try:
+            response = _safe_get(endpoint, getter=getter, trusted_initial=True, params={"content": "true"},
+                timeout=REQUEST_TIMEOUT, headers={"Accept": "application/json"})
+            status = getattr(response, "status_code", 200)
+            if status in {404, 410}:
+                return None, "The Greenhouse posting is unavailable or expired."
+            if status in {401, 403}:
+                return None, "Greenhouse public API unavailable: access restricted."
+            response.raise_for_status()
+            if len(getattr(response, "content", b"")) > MAX_RESPONSE_BYTES:
+                return None, "Greenhouse public API response exceeded the configured size limit."
+            payload = response.json()
+            break
+        except requests.Timeout:
+            error = "request timed out"
+        except requests.RequestException as exc:
+            error = _http_failure("Greenhouse public API", exc)
+            if getattr(getattr(exc, "response", None), "status_code", 0) < 500:
+                break
+        except (ValueError, TypeError):
+            return None, "Unsupported Greenhouse public API response: invalid JSON."
+        if attempt < 2:
+            time.sleep(0.2 * (2 ** attempt))
+    if payload is None:
+        return None, f"Greenhouse public API unavailable: {error or 'request failed'}"
+    if not isinstance(payload, dict) or str(payload.get("id") or "") != str(job_id):
+        return None, "Unsupported Greenhouse public API response: job identity did not match the requested ID."
+    title = str(payload.get("title") or "").strip()
+    absolute_url = str(payload.get("absolute_url") or "").strip()
+    expected = f"https://boards.greenhouse.io/{token}/jobs/{job_id}"
+    if not title or not absolute_url:
+        return None, "Unsupported Greenhouse public API response: required job identity or posting URL is missing."
+    try:
+        absolute_url = validate_public_https_url(absolute_url)
+    except ValueError:
+        return None, "Unsupported Greenhouse public API response: posting URL is unsafe."
+    published = urlparse(absolute_url)
+    expected_parts = urlparse(expected)
+    if ((published.hostname or "").casefold() not in {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+            or published.path.rstrip("/") != expected_parts.path.rstrip("/")):
+        return None, "Unsupported Greenhouse public API response: posting URL did not match the requested board and job."
+    description = _plain(payload.get("content") or "")
+    location = _get_path(payload, "location", "name") or ""
+    departments = payload.get("departments") if isinstance(payload.get("departments"), list) else []
+    employment = ""
+    for meta in payload.get("metadata") or []:
+        if isinstance(meta, dict) and "employment" in str(meta.get("name") or "").lower():
+            employment = str(meta.get("value") or "")
+            break
+    application_url = absolute_url
+    detail = {"provider": "greenhouse", "source_token": token, "id": str(job_id),
+        "title": title, "employer": str(payload.get("company_name") or "").strip(),
+        "employer_identity_source": "greenhouse_api_company_name" if payload.get("company_name") else "unavailable",
+        "description": description, "location": str(location), "country": "",
+        "employment_type": employment, "department": ", ".join(str(d.get("name") or "") for d in departments if isinstance(d, dict) and d.get("name")),
+        "date_posted": payload.get("first_published") or payload.get("updated_at"),
+        "url": absolute_url, "application_url": application_url,
+        "application_url_source": "official_posting_page", "active": True,
+        "source_url": endpoint, "retrieved_url": endpoint,
+        "retrieved_at": datetime.now(timezone.utc).isoformat(), "robots_checked": True,
+        "source_type": "greenhouse_job_detail_api"}
+    if not description:
+        return None, "The Greenhouse posting has no usable public job description."
+    return detail, None
+
+
 def fetch_public_job_url(url: str, getter=None):
     """Read one public job posting without executing scripts or submitting forms.
 
@@ -671,7 +750,9 @@ def fetch_public_job_url(url: str, getter=None):
         for document in parser.documents:
             jobs.extend(_jsonld_jobs(document))
         if not jobs:
-            provider, _, _ = _job_provider_for_url(final_url)
+            provider, token, path_id = _job_provider_for_url(final_url)
+            if provider == "greenhouse":
+                return _greenhouse_job_detail(token, path_id, getter=getter)
             if provider == "workday":
                 record, reason = _workday_public_record(getattr(response, "text", "") or "", final_url)
                 if record:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from career_catalog import (
     initialize_catalog,
@@ -56,6 +56,29 @@ TYPES = [
 ]
 
 WORK = ["Any", "Remote", "Hybrid", "On-site"]
+RELOCATION_OPTIONS = {"unspecified", "anywhere", "selected_locations", "no", "per_job"}
+
+US_STATE_ALIASES = {
+    "al":"Alabama","ak":"Alaska","az":"Arizona","ar":"Arkansas","ca":"California","co":"Colorado",
+    "ct":"Connecticut","de":"Delaware","fl":"Florida","ga":"Georgia","hi":"Hawaii","id":"Idaho",
+    "il":"Illinois","in":"Indiana","ia":"Iowa","ks":"Kansas","ky":"Kentucky","la":"Louisiana",
+    "me":"Maine","md":"Maryland","ma":"Massachusetts","mi":"Michigan","mn":"Minnesota","ms":"Mississippi",
+    "mo":"Missouri","mt":"Montana","ne":"Nebraska","nv":"Nevada","nh":"New Hampshire","nj":"New Jersey",
+    "nm":"New Mexico","ny":"New York","nc":"North Carolina","nd":"North Dakota","oh":"Ohio","ok":"Oklahoma",
+    "or":"Oregon","pa":"Pennsylvania","ri":"Rhode Island","sc":"South Carolina","sd":"South Dakota",
+    "tn":"Tennessee","tx":"Texas","ut":"Utah","vt":"Vermont","va":"Virginia","wa":"Washington",
+    "wv":"West Virginia","wi":"Wisconsin","wy":"Wyoming","dc":"District of Columbia"}
+
+
+class LocationDestination(BaseModel):
+    country: str = Field(default="", max_length=100)
+    state_province: str = Field(default="", max_length=100)
+    city: str = Field(default="", max_length=100)
+
+    @field_validator("country", "state_province", "city")
+    @classmethod
+    def normalize_place(cls, value):
+        return " ".join(str(value or "").split())
 
 
 class Preferences(BaseModel):
@@ -73,12 +96,36 @@ class Preferences(BaseModel):
         default="United States", max_length=200
     )
     work_arrangement: str = "Any"
+    relocation_preference: str = Field(default="unspecified", max_length=30)
+    relocation_destinations: list[LocationDestination] = Field(default_factory=list, max_length=30)
     instructions: str = Field(
         default="", max_length=3000
     )
     max_applications_per_day: int = Field(
         default=200, ge=1, le=200
     )
+
+
+def _normalize_relocation(data):
+    mode=str(data.get("relocation_preference") or "unspecified").strip().casefold()
+    if mode not in RELOCATION_OPTIONS:
+        raise HTTPException(400,"Choose a supported relocation option.")
+    destinations=[];seen=set()
+    for item in data.get("relocation_destinations",[]):
+        if isinstance(item,dict):
+            country=str(item.get("country") or "").strip();state=str(item.get("state_province") or "").strip();city=str(item.get("city") or "").strip()
+        else:
+            country=item.country.strip();state=item.state_province.strip();city=item.city.strip()
+        aliases={"us":"United States","u.s.":"United States","usa":"United States","uk":"United Kingdom","u.k.":"United Kingdom"}
+        country=aliases.get(country.casefold(),country)
+        state=US_STATE_ALIASES.get(state.casefold(),state)
+        if not (country or state or city):continue
+        value={"country":country,"state_province":state,"city":city}
+        key=tuple(str(value[k]).casefold() for k in ("country","state_province","city"))
+        if key not in seen:destinations.append(value);seen.add(key)
+    data["relocation_preference"]=mode
+    data["relocation_destinations"]=destinations
+    return data
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -239,7 +286,7 @@ def save_preferences(preferences: Preferences):
             400, "Invalid work arrangement"
         )
 
-    data=preferences.model_dump()
+    data=_normalize_relocation(preferences.model_dump())
     digest=fingerprint(data)
     with connect() as db:
         columns={row[1] for row in db.execute("PRAGMA table_info(career_preferences)")}
@@ -261,7 +308,7 @@ def save_preferences(preferences: Preferences):
             preferences_fingerprint=excluded.preferences_fingerprint
         """, (
             USER,
-            preferences.model_dump_json(),version,digest
+            json.dumps(data,ensure_ascii=False),version,digest
         ))
         if changed:
             table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
@@ -289,133 +336,106 @@ content="width=device-width,initial-scale=1">
 <title>BabyStepsAI - Career Preferences</title>
 
 <style>
-* {
-    box-sizing: border-box;
+* { box-sizing: border-box; }
+:root {
+    --cp-ink: var(--bsa-ink, #17263b);
+    --cp-muted: #52647b;
+    --cp-line: var(--bsa-line, #dfe7f1);
+    --cp-surface: var(--bsa-surface, #ffffff);
+    --cp-wash: var(--bsa-wash, #f4f7fb);
+    --cp-accent: #2859a5;
+    --cp-selected: #e8f0ff;
+    --cp-selected-ink: #173f79;
+    --cp-input: #ffffff;
+    --cp-focus: #245fcc;
 }
-
+html { color-scheme: light; }
+html[data-bsa-theme="dark"] {
+    color-scheme: dark;
+    --cp-ink: #e7edf6;
+    --cp-muted: #bdc8d8;
+    --cp-line: #46556c;
+    --cp-surface: #182337;
+    --cp-wash: #101827;
+    --cp-accent: #a9c4ff;
+    --cp-selected: #293a58;
+    --cp-selected-ink: #e7edf6;
+    --cp-input: #111b2b;
+    --cp-focus: #a9c4ff;
+}
 body {
     font-family: system-ui, sans-serif;
     max-width: 1000px;
     margin: 30px auto;
     padding: 0 18px;
-    background: #f8fafc;
-    color: #172033;
+    background: var(--cp-wash);
+    color: var(--cp-ink);
 }
-
 header, section {
-    background: white;
-    border: 1px solid #e2e8f0;
+    background: var(--cp-surface);
+    color: var(--cp-ink);
+    border: 1px solid var(--cp-line);
     border-radius: 14px;
     padding: 22px;
     margin-bottom: 18px;
 }
-.invalid-field{border:2px solid #b42318!important;box-shadow:0 0 0 3px #b4231822}.status-error{color:#a3261d}.status-success{color:#137451}.optional-note{color:#64748b;font-size:13px}.field-hint{display:block;color:#64748b;font-size:12px;margin-top:4px}
-
-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-}
-
-h1 {
-    margin: 0;
-}
-
-h2 {
-    margin-top: 0;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns:
-        repeat(auto-fit, minmax(190px, 1fr));
-    gap: 10px;
-}
-
+.invalid-field{border:2px solid #b42318!important;box-shadow:0 0 0 3px #b4231822}
+.status-error{color:#a3261d!important}.status-success{color:#137451!important}
+html[data-bsa-theme="dark"] .status-error{color:#ffb4ab!important}
+html[data-bsa-theme="dark"] .status-success{color:#8fe0b4!important}
+.optional-note,.field-hint{color:var(--cp-muted);font-size:13px}
+.field-hint{display:block;font-size:12px;margin-top:4px}
+header { display:flex; align-items:center; justify-content:space-between; }
+h1 { margin:0; } h2 { margin-top:0; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; }
 .chip {
-    padding: 12px;
-    border: 1px solid #cbd5e1;
-    border-radius: 9px;
-    background: white;
-    cursor: pointer;
-    text-align: left;
-    font-size: 14px;
+    padding:12px; min-height:44px; border:1px solid var(--cp-line);
+    border-radius:9px; background:var(--cp-surface); color:var(--cp-ink);
+    cursor:pointer; text-align:left; font-size:14px;
 }
-
 .chip.active {
-    background: #eff6ff;
-    border-color: #2563eb;
-    color: #1d4ed8;
+    background:var(--cp-selected); border:2px solid var(--cp-accent);
+    color:var(--cp-selected-ink); font-weight:650;
 }
-
-input[type=text],
-input[type=number],
-textarea,
-select {
-    width: 100%;
-    padding: 11px;
-    margin: 8px 0;
-    border: 1px solid #cbd5e1;
-    border-radius: 8px;
-    font: inherit;
+input[type=text], input[type=search], input[type=number], textarea, select {
+    width:100%; padding:11px; margin:8px 0; border:1px solid var(--cp-line);
+    border-radius:8px; font:inherit; background:var(--cp-input); color:var(--cp-ink);
 }
-
-.options {
-    display: grid;
-    grid-template-columns:
-        repeat(auto-fit, minmax(170px, 1fr));
+input::placeholder,textarea::placeholder{color:var(--cp-muted);opacity:1}
+input:focus-visible,textarea:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid var(--cp-focus);outline-offset:2px}
+.options { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); }
+.options label { padding:7px; color:var(--cp-ink); border-radius:8px; }
+input[type=checkbox]{accent-color:var(--cp-accent)}
+button { cursor:pointer; font:inherit; }
+.primary { padding:13px 24px; min-height:44px; background:#174f9b; color:#fff; border:0; border-radius:9px; }
+html[data-bsa-theme="dark"] .primary{background:#a9c4ff;color:#111b2b}
+.secondary,#add-destination,.destination-row button,#addCustom {
+    min-height:42px; padding:9px 14px; border:1px solid var(--cp-line);
+    border-radius:9px; background:var(--cp-surface); color:var(--cp-ink);
 }
-
-.options label {
-    padding: 7px;
+#add-destination{margin:8px 0 2px}
+.muted { color:var(--cp-muted); }
+#results { max-height:330px; overflow-y:auto; }
+.pill { display:inline-flex; align-items:center; gap:8px; background:var(--cp-wash); color:var(--cp-ink); border:1px solid var(--cp-line); padding:8px 12px; margin:5px; border-radius:20px; }
+.pill button { border:0; background:none; color:var(--cp-ink); font-size:18px; }
+.row { display:flex; gap:10px; align-items:center; }
+.row input { flex:1; }
+.destination-row {
+    display:grid; grid-template-columns:repeat(3,minmax(0,1fr)) auto;
+    gap:12px; align-items:end; padding:14px; margin:10px 0;
+    background:var(--cp-wash); border:1px solid var(--cp-line); border-radius:10px;
 }
-
-button {
-    cursor: pointer;
-    font: inherit;
-}
-
-.primary {
-    padding: 13px 24px;
-    background: #2563eb;
-    color: white;
-    border: none;
-    border-radius: 9px;
-}
-
-.muted {
-    color: #64748b;
-}
-
-#results {
-    max-height: 330px;
-    overflow-y: auto;
-}
-
-.pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    background: #e2e8f0;
-    padding: 8px 12px;
-    margin: 5px;
-    border-radius: 20px;
-}
-
-.pill button {
-    border: none;
-    background: none;
-    font-size: 18px;
-}
-
-.row {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-}
-
-.row input {
-    flex: 1;
+.destination-row label{min-width:0;font-size:14px;color:var(--cp-ink)}
+.destination-row input{margin-bottom:0}
+.destination-intro{margin:4px 0 8px}
+button:disabled{opacity:.65;cursor:wait}
+@media(max-width:640px){
+    body{margin:14px auto;padding:0 12px}
+    header,section{padding:16px}
+    header{align-items:flex-start;gap:12px;flex-wrap:wrap}
+    .destination-row{grid-template-columns:1fr;gap:4px}
+    .row{flex-wrap:wrap}
+    .row button{min-height:44px}
 }
 </style>
 </head>
@@ -497,6 +517,20 @@ button {
     </label>
 
     <label>
+        Relocation Preference <span class="field-hint">Does not establish current residence or work authorization</span>
+        <select id="relocation">
+            <option value="unspecified">Not decided yet</option>
+            <option value="anywhere">Willing to relocate anywhere</option>
+            <option value="selected_locations">Willing to relocate only to selected locations</option>
+            <option value="no">Not willing to relocate</option>
+            <option value="per_job">Decide separately for each job</option>
+        </select>
+    </label>
+    <div id="relocation-destinations" hidden></div>
+    <button id="add-destination" type="button" hidden>Add relocation destination</button>
+    <p class="field-hint destination-intro" hidden>Enter a country, state or province, or city. Destinations are retained when you switch options, but apply only while selected locations is active.</p>
+
+    <label>
         Work Arrangement
         <select id="work">
             <option>Any</option>
@@ -544,6 +578,7 @@ let selected = new Set();
 let selectedCategories = new Set();
 let levels = new Set();
 let types = new Set();
+let relocationDestinations = [];
 
 let allCategories = [];
 let searchVersion = 0;
@@ -571,6 +606,7 @@ function careerButton(title) {
 
     button.className = "chip" +
         (selected.has(title) ? " active" : "");
+    button.setAttribute("aria-pressed", String(selected.has(title)));
 
     button.textContent =
         (selected.has(title) ? "✓ " : "+ ") + title;
@@ -599,6 +635,7 @@ function renderCategories() {
             button.className = "chip" +
                 (selectedCategories.has(category)
                     ? " active" : "");
+            button.setAttribute("aria-pressed", String(selectedCategories.has(category)));
 
             button.textContent =
                 (selectedCategories.has(category)
@@ -720,6 +757,28 @@ function checkboxes(id, values, selectedSet) {
     );
 }
 
+function renderRelocationDestinations(){
+    const root=$("relocation-destinations");root.replaceChildren();
+    const active=$("relocation").value==="selected_locations";
+    root.hidden=!active;
+    $("add-destination").hidden=!active;
+    document.querySelector(".destination-intro").hidden=!active;
+    const suggestions={country:["United States","Canada","United Kingdom","Australia","India","Germany","France","Ireland","Netherlands","New Zealand","Singapore","Mexico"],state_province:["Alabama","Alaska","Arizona","California","Colorado","Florida","Georgia","Illinois","Massachusetts","Michigan","New Jersey","New York","North Carolina","Ohio","Oregon","Pennsylvania","Texas","Virginia","Washington","Ontario","Quebec","British Columbia","Alberta"]};
+    for(const [key,values] of Object.entries(suggestions)){const list=document.createElement("datalist");list.id="relocation-"+key+"-options";for(const value of values){const option=document.createElement("option");option.value=value;list.append(option)}root.append(list)}
+    relocationDestinations.forEach((item,index)=>{
+        const row=document.createElement("div");row.className="destination-row";
+        for(const [key,labelText] of [["country","Country"],["state_province","State or province"],["city","City"]]){
+            const label=document.createElement("label");label.textContent=labelText;
+            const input=document.createElement("input");input.type="search";input.value=item[key]||"";
+            if(key!=="city")input.setAttribute("list","relocation-"+key+"-options");
+            input.setAttribute("aria-label",labelText+" for relocation destination "+(index+1));
+            input.oninput=()=>item[key]=input.value;label.append(input);row.append(label);
+        }
+        const remove=document.createElement("button");remove.type="button";remove.textContent="Remove";
+        remove.onclick=()=>{relocationDestinations.splice(index,1);renderRelocationDestinations()};row.append(remove);root.append(row);
+    });
+}
+
 async function initialize() {
     try {
         const [careers, preferences] = await Promise.all([
@@ -748,6 +807,9 @@ async function initialize() {
 
         $("location").value = preferences.location;
         $("work").value = preferences.work_arrangement;
+        $("relocation").value=preferences.relocation_preference||"unspecified";
+        relocationDestinations=Array.isArray(preferences.relocation_destinations)?preferences.relocation_destinations.map(x=>({...x})):[];
+        renderRelocationDestinations();
 
         $("limit").value =
             preferences.max_applications_per_day;
@@ -800,6 +862,8 @@ $("save").onclick = async () => {
         employment_types: [...types],
         location: $("location").value.trim(),
         work_arrangement: $("work").value,
+        relocation_preference:$("relocation").value,
+        relocation_destinations:relocationDestinations.filter(x=>x.country||x.state_province||x.city),
         instructions: $("instructions").value,
         max_applications_per_day: Number(
             $("limit").value
@@ -807,7 +871,7 @@ $("save").onclick = async () => {
     };
 
     button.disabled=true;button.setAttribute("aria-busy","true");status.className="";status.textContent="";
-    document.querySelectorAll(".invalid-field").forEach(x=>x.classList.remove("invalid-field"));
+    document.querySelectorAll(".invalid-field").forEach(x=>{x.classList.remove("invalid-field");x.removeAttribute("aria-invalid")});
     try {
         const saved=await api("/api/career-preferences", {
             method: "PUT",
@@ -818,9 +882,14 @@ $("save").onclick = async () => {
         });
         if(!saved.saved)throw new Error("The server did not confirm that preferences were saved.");
         const persisted=await api("/api/career-preferences");
-        const keys=["categories","roles","levels","employment_types","location","work_arrangement","instructions","max_applications_per_day"];
+        const keys=["categories","roles","levels","employment_types","location","work_arrangement","relocation_preference","instructions","max_applications_per_day"];
         const canonical=value=>Array.isArray(value)?"["+value.map(canonical).join(",")+"]":value&&typeof value==="object"?"{"+Object.keys(value).sort().map(k=>JSON.stringify(k)+":"+canonical(value[k])).join(",")+"}":JSON.stringify(value);
         for(const key of keys){if(canonical(persisted[key])!==canonical(preferences[key]))throw new Error("The saved "+key.replaceAll("_"," ")+" could not be verified. No success confirmation was shown.");}
+        const stateNames={al:'alabama',ak:'alaska',az:'arizona',ar:'arkansas',ca:'california',co:'colorado',ct:'connecticut',de:'delaware',fl:'florida',ga:'georgia',hi:'hawaii',id:'idaho',il:'illinois',in:'indiana',ia:'iowa',ks:'kansas',ky:'kentucky',la:'louisiana',me:'maine',md:'maryland',ma:'massachusetts',mi:'michigan',mn:'minnesota',ms:'mississippi',mo:'missouri',mt:'montana',ne:'nebraska',nv:'nevada',nh:'new hampshire',nj:'new jersey',nm:'new mexico',ny:'new york',nc:'north carolina',nd:'north dakota',oh:'ohio',ok:'oklahoma',or:'oregon',pa:'pennsylvania',ri:'rhode island',sc:'south carolina',sd:'south dakota',tn:'tennessee',tx:'texas',ut:'utah',vt:'vermont',va:'virginia',wa:'washington',wv:'west virginia',wi:'wisconsin',wy:'wyoming',dc:'district of columbia'};
+        const destinationKey=item=>{let country=(item.country||'').trim().toLowerCase(),state=(item.state_province||'').trim().toLowerCase(),city=(item.city||'').trim().toLowerCase();country=({us:'united states','u.s.':'united states',usa:'united states',uk:'united kingdom','u.k.':'united kingdom'})[country]||country;state=stateNames[state]||state;return JSON.stringify([country,state,city])};
+        const expectedDestinations=[...new Set(preferences.relocation_destinations.map(destinationKey))].sort(),actualDestinations=[...new Set((persisted.relocation_destinations||[]).map(destinationKey))].sort();
+        if(JSON.stringify(expectedDestinations)!==JSON.stringify(actualDestinations))throw new Error("The saved relocation destinations could not be verified.");
+        relocationDestinations=persisted.relocation_destinations.map(x=>({...x}));
         status.className="status-success";
         status.textContent="Preferences saved and verified. Unset preferences remain optional and do not block saving.";
 
@@ -837,6 +906,9 @@ $("save").onclick = async () => {
         button.disabled=false;button.removeAttribute("aria-busy");
     }
 };
+
+$("relocation").onchange=renderRelocationDestinations;
+$("add-destination").onclick=()=>{relocationDestinations.push({country:"",state_province:"",city:""});renderRelocationDestinations();$("relocation-destinations").querySelector("input")?.focus()};
 
 initialize();
 </script>

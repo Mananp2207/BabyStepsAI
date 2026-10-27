@@ -174,6 +174,60 @@ class ConnectorTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIn("expired",error)
 
+    def test_greenhouse_direct_import_uses_public_detail_api_without_jsonld(self):
+        url="https://job-boards.greenhouse.io/cssmerge/jobs/8687930002"
+        description="Responsibilities include building reliable products. Qualifications include Python and a related degree. "*5
+        payload={"id":8687930002,"title":"Software Engineer","absolute_url":"https://boards.greenhouse.io/cssmerge/jobs/8687930002",
+            "location":{"name":"New York, NY"},"content":description,"departments":[{"name":"Engineering"}],"metadata":[]}
+        calls=[]
+        def getter(target,**kwargs):
+            calls.append(target)
+            if target.endswith("/robots.txt"):
+                return SimpleNamespace(status_code=404,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+            if target.endswith("/jobs/8687930002"):
+                body=json.dumps(payload).encode()
+                return SimpleNamespace(status_code=200,headers={},content=body,text="",url=target,
+                    json=lambda:payload,raise_for_status=lambda:None)
+            page="<html><h1>Software Engineer</h1></html>"
+            return SimpleNamespace(status_code=200,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["id"],"8687930002")
+        self.assertEqual(result["provider"],"greenhouse")
+        self.assertEqual(result["url"],payload["absolute_url"])
+        self.assertEqual(result["application_url"],payload["absolute_url"])
+        self.assertEqual(result["department"],"Engineering")
+        self.assertIn("Responsibilities",result["description"])
+        self.assertTrue(result["retrieved_at"])
+        self.assertTrue(any("boards-api.greenhouse.io" in target for target in calls))
+
+    def test_greenhouse_direct_import_rejects_invalid_board_and_job_identifiers(self):
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            detail,error=connectors._greenhouse_job_detail("bad/token","123")
+            self.assertIsNone(detail)
+            self.assertIn("board token",error)
+            detail,error=connectors._greenhouse_job_detail("valid-board","1%2F2")
+            self.assertIsNone(detail)
+            self.assertIn("job ID",error)
+
+    def test_greenhouse_direct_import_reports_missing_description_and_expired_api_record(self):
+        base={"id":123,"title":"Software Engineer","absolute_url":"https://boards.greenhouse.io/example/jobs/123"}
+        def getter_for(status,payload=None):
+            def getter(target,**_kwargs):
+                if target.endswith("/robots.txt"):
+                    return SimpleNamespace(status_code=404,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+                return SimpleNamespace(status_code=status,headers={},content=json.dumps(payload or {}).encode(),text="",url=target,
+                    json=lambda:payload or {},raise_for_status=lambda:None)
+            return getter
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            detail,error=connectors._greenhouse_job_detail("example","123",getter=getter_for(200,base))
+            self.assertIsNone(detail)
+            self.assertIn("no usable public job description",error)
+            detail,error=connectors._greenhouse_job_detail("example","123",getter=getter_for(404))
+        self.assertIsNone(detail)
+        self.assertIn("unavailable or expired",error)
+
     def test_direct_public_import_reports_unsupported_provider_layout(self):
         url="https://tenant.wd5.myworkdayjobs.com/External/job/Remote/Engineering"
         page="<html><body>Careers</body></html>"

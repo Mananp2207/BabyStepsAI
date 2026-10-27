@@ -48,6 +48,55 @@ class CareerPreferenceSaveTests(unittest.TestCase):
         self.assertIn("Unset preferences remain optional", page)
         self.assertIn("No success confirmation was shown", page)
         self.assertIn("Save failed:", page)
+        self.assertIn('document.createElement("datalist")',page)
+
+    def test_career_preferences_uses_shared_light_and_dark_theme_tokens(self):
+        from ui_theme import apply_ui_theme
+        themed=apply_ui_theme(prefs.PAGE)
+        for token in ("--bsa-surface", "--cp-surface", "--cp-ink", "--cp-muted", "--cp-line"):
+            self.assertIn(token,themed)
+        self.assertIn('html[data-bsa-theme="dark"] section',themed)
+        self.assertIn(".chip.active",themed)
+        self.assertIn('aria-pressed',themed)
+        self.assertIn("@media(max-width:640px)",themed)
+        self.assertIn("#add-destination",themed)
+
+    def test_relocation_destinations_are_conditional_but_retained_for_later_selection(self):
+        page=prefs.PAGE
+        self.assertIn('<div id="relocation-destinations" hidden>',page)
+        self.assertIn('id="add-destination" type="button" hidden',page)
+        self.assertIn('const active=$("relocation").value==="selected_locations"',page)
+        self.assertIn('root.hidden=!active',page)
+        self.assertIn('$("add-destination").hidden=!active',page)
+        self.assertIn('relocationDestinations=Array.isArray(preferences.relocation_destinations)?preferences.relocation_destinations.map(x=>({...x})):[]',page)
+        self.assertIn('relocation_destinations:relocationDestinations.filter',page)
+
+    def test_relocation_destinations_are_conservatively_normalized_and_verified(self):
+        result=prefs.save_preferences(self.preferences(
+            relocation_preference="selected_locations",
+            relocation_destinations=[{"country":"usa","state_province":"CA","city":" San Francisco "},
+                                     {"country":"USA","state_province":"ca","city":"San Francisco"},
+                                     {"country":"Canada","state_province":"Ontario","city":"Toronto"}]))
+        self.assertTrue(result["saved"])
+        saved=prefs.get_preferences()
+        self.assertEqual(saved["relocation_preference"],"selected_locations")
+        self.assertEqual(saved["relocation_destinations"],[
+            {"country":"United States","state_province":"California","city":"San Francisco"},
+            {"country":"Canada","state_province":"Ontario","city":"Toronto"}])
+
+    def test_relocation_mode_rejects_unrecognized_values_without_overwriting(self):
+        from fastapi import HTTPException
+        prefs.save_preferences(self.preferences(relocation_preference="anywhere"))
+        with self.assertRaises(HTTPException):
+            prefs.save_preferences(self.preferences(relocation_preference="probably"))
+        self.assertEqual(prefs.get_preferences()["relocation_preference"],"anywhere")
+
+    def test_onboarding_and_preferences_expose_distinct_accessible_relocation_choices(self):
+        import onboarding
+        for page in (prefs.PAGE,onboarding.ONBOARDING_PAGE):
+            for value in ("anywhere","selected_locations","per_job"):
+                self.assertIn(value,page)
+        self.assertIn("Current residence is saved separately",onboarding.ONBOARDING_PAGE)
 
 
 if __name__ == "__main__":

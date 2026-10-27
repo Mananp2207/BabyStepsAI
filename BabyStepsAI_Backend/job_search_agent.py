@@ -24,7 +24,7 @@ from io import StringIO
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from job_relevance import (_arrangement, evaluate_location, extract_experience_requirements,
+from job_relevance import (_arrangement, evaluate_location, evaluate_relocation_preference, extract_experience_requirements,
                            infer_prompt_preferences, normalize_job_record, relevance_for_job,
                            classify_experience_level, discovery_relevance_score,
                            extract_graduation_windows, extract_education_requirements,
@@ -147,6 +147,7 @@ def initialize():
             ("description", "TEXT NOT NULL DEFAULT ''"), ("posting_date", "TEXT"),
             ("last_verified_at", "TEXT"), ("active", "INTEGER NOT NULL DEFAULT 1"),
             ("content_fingerprint", "TEXT NOT NULL DEFAULT ''"), ("job_url", "TEXT NOT NULL DEFAULT ''"),
+            ("department", "TEXT NOT NULL DEFAULT ''"),
             ("career_category","TEXT"),("experience_level","TEXT"),("salary_json","TEXT"),
             ("required_qualifications_json","TEXT"),("preferred_qualifications_json","TEXT"),
             ("graduation_windows_json","TEXT NOT NULL DEFAULT '[]'"),
@@ -463,7 +464,8 @@ def assess_job(job, prefs, terms, confirmed_experience_years=None):
         else:
             review_reasons.append("Employment type is not provided in Greenhouse metadata.")
 
-    geo_status, geo_reason = evaluate_location(job, prefs.get("location", ""))
+    relocation=evaluate_relocation_preference(job,prefs)
+    geo_status, geo_reason = relocation or evaluate_location(job, prefs.get("location", ""))
     if geo_status == "mismatch":
         return False, "location", []
     if geo_status == "unknown":
@@ -1428,9 +1430,17 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
 
     company = str(detail.get("employer") or "").strip()
     if not company:
+        if detail.get("provider") == "greenhouse":
+            with database() as db:
+                rows=db.execute("SELECT * FROM employers WHERE source_type='greenhouse' AND source_token=?",(detail.get("source_token"),)).fetchall()
+            verified={str(row["name"]).strip() for row in rows if row["active"] and row["connector_status"]=="healthy" and row["discovery_status"]=="verified" and row["last_success_at"] and row["source_fingerprint"]==_source_fingerprint(dict(row))}
+            if len(verified)==1:
+                company=next(iter(verified))
+                detail["employer_identity_source"]="verified_greenhouse_board_record"
         # Resolve identity from the actual page host only. A publisher-controlled
         # hiringOrganization.url field alone is not proof that it owns the post.
-        company=_verified_registered_employer(str(detail.get("retrieved_url") or payload.url))
+        if not company:
+            company=_verified_registered_employer(str(detail.get("retrieved_url") or payload.url))
     title = str(detail.get("title") or "").strip()
     if not company:
         raise HTTPException(422, "Employer identity is unavailable: the posting has no hiring-organization name or supported Workday employer metadata, and no verified employer record matches its official domain. Try the employer's official careers page or another public posting URL that exposes the hiring organization; no job was saved.")
@@ -1447,6 +1457,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
     application_url = str(detail.get("application_url") or "")
     description = str(detail.get("description") or "")
     employment_type = str(detail.get("employment_type") or "")
+    department = str(detail.get("department") or "")
     location = str(detail.get("location") or "")
     country = str(detail.get("country") or "")
     fingerprint = hashlib.sha256((title.casefold() + "\n" + description).encode()).hexdigest()
@@ -1477,7 +1488,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
     except (TypeError, ValueError, KeyError):
         review_reasons = ["Eligibility could not be fully assessed from the imported posting; review is required."]
 
-    stamp = datetime.now(timezone.utc).isoformat()
+    stamp = str(detail.get("retrieved_at") or datetime.now(timezone.utc).isoformat())
     with database() as db:
         existing = db.execute("""SELECT o.job_key,o.source_platform,o.source_id,o.discovered_at,o.content_fingerprint
             FROM discovered_openings o LEFT JOIN job_source_provenance p ON p.source_job_key=o.job_key
@@ -1501,25 +1512,25 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
                     cols = {row[1] for row in db.execute("PRAGMA table_info(job_match_results)")}
                     if "freshness_status" in cols:
                         db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=?", (USER, job_key))
-            db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,country=?,
+            db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,department=?,country=?,
                  work_arrangement=?,description=?,posting_date=?,last_verified_at=?,active=?,content_fingerprint=?,job_url=?,
                 experience_level=?,required_qualifications_json=?,preferred_qualifications_json=?,graduation_windows_json=?,
                 availability_status=?,imported_source_url=?,import_eligibility_status=?,import_review_json=?
                 WHERE user_id=? AND job_key=?""",
-                (company,title,location,application_url,employment_type,country,str(detail.get("work_arrangement") or ""),description,detail.get("date_posted"),stamp,
+                (company,title,location,application_url,employment_type,department,country,str(detail.get("work_arrangement") or ""),description,detail.get("date_posted"),stamp,
                  int(detail.get("active", True)),fingerprint,posting_url,level,json.dumps(qualifications),json.dumps(detail.get("preferred_qualifications") or []),
                  json.dumps(graduation_windows),"expired" if not detail.get("active",True) else "current",str(detail.get("source_url") or payload.url),eligibility,json.dumps(review_reasons),USER,job_key))
         else:
             db.execute("""INSERT INTO discovered_openings
                 (user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,
                  search_prompt,discovery_source,source_platform,source_id,country,work_arrangement,description,posting_date,
-                 last_verified_at,active,content_fingerprint,job_url,career_category,experience_level,
+                 last_verified_at,active,content_fingerprint,job_url,department,career_category,experience_level,
                  required_qualifications_json,preferred_qualifications_json,graduation_windows_json,availability_status,imported_source_url,
                  import_eligibility_status,import_review_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (USER,job_key,company,title,location,application_url,stamp,employment_type,location_status,location_reason,
                  "Direct official job URL import",f"Official company posting ({provider})",provider,source_id,country,str(detail.get("work_arrangement") or ""),description,
-                 detail.get("date_posted"),stamp,int(detail.get("active", True)),fingerprint,posting_url,
+                 detail.get("date_posted"),stamp,int(detail.get("active", True)),fingerprint,posting_url,department,
                  classify_career_category(title,prefs),level,json.dumps(qualifications),json.dumps(detail.get("preferred_qualifications") or []),
                  json.dumps(graduation_windows),"expired" if not detail.get("active",True) else "current",str(detail.get("source_url") or payload.url),
                  eligibility,json.dumps(review_reasons)))
@@ -1530,7 +1541,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
 
     return {"job_key":job_key,"provider":provider,"employer":company,
         "employer_identity_source":detail.get("employer_identity_source") or ("verified_employer_record" if not detail.get("employer") else "provider_posting_metadata"),"title":title,"location":location,
-        "employment_type":employment_type,"posting_url":posting_url,"application_url":application_url,
+        "employment_type":employment_type,"department":department,"posting_url":posting_url,"application_url":application_url,
         "application_url_source":detail.get("application_url_source") or "structured_application_url",
         "description_available":usable_posting_description(description),"description_length":len(description),
         "experience_level":level,"experience_level_evidence":level_evidence,"experience_requirements":experience,
@@ -2041,45 +2052,66 @@ const matchStatus=document.getElementById('matchStatus');
 const matchResults=document.getElementById('matchResults');
 const pauseButton=document.getElementById('pause');
 const resumeButton=document.getElementById('resume');
+const recoverButton=document.createElement('button');recoverButton.textContent='Recover abandoned analysis';recoverButton.hidden=true;resumeButton.insertAdjacentElement('afterend',recoverButton);
 let currentJobKeys=[];
 let currentJobs=[];
 let polling=false;
+let pollingGeneration=0;
 let currentMatchSessionId=null;
+let currentMatchJobKeys=[];
 let discoveryRunId=null;
 let discoveryTimer=null;
 let currentDiagnostics={};
 let importedJobKey=null;
+function apiErrorMessage(payload,fallback='The request could not be completed.'){
+  const detail=payload&&typeof payload==='object'&&'detail' in payload?payload.detail:payload;
+  if(typeof detail==='string'&&detail.trim())return detail;
+  if(Array.isArray(detail))return detail.map(item=>{const where=Array.isArray(item?.loc)?item.loc.filter(x=>x!=='body').join('.'):'';return `${where?where+': ':''}${item?.msg||item?.message||'Invalid request'}`}).join('; ')||fallback;
+  if(detail&&typeof detail==='object'){
+    if(detail.code==='active_worker'&&detail.status==='paused')return `A separate matching session${Number(detail.total_jobs)?` (${Number(detail.total_jobs)} jobs)`:''} is paused but still owns the matching slot. This selected job was not started. Resume or finish that session in its own view, then retry Analyze with AI. This page did not change that session.`;
+    if(detail.code==='active_worker')return 'Another matching session is using the worker. This selected job was not started. Wait for that session to finish, then retry Analyze with AI.';
+    return String(detail.message||detail.error||fallback);
+  }
+  return fallback;
+}
+async function readApiResponse(response,fallback){
+  let payload;try{payload=await response.json()}catch(_){throw new Error(`The server returned an unreadable response (HTTP ${response.status}).`)}
+  if(!response.ok){const error=new Error(apiErrorMessage(payload,fallback));const detail=payload?.detail;error.recovery=detail&&typeof detail==='object'?detail:null;throw error}
+  if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new Error('The server returned an unexpected response. Please retry.');
+  return payload;
+}
 document.getElementById('importJob').addEventListener('click',async()=>{
   const button=document.getElementById('importJob'),status=document.getElementById('importStatus'),details=document.getElementById('importDetails');
   button.disabled=true;status.className='';status.textContent='Checking public access and reading the posting…';details.hidden=true;
   document.getElementById('enrichImport').hidden=true;document.getElementById('analyzeImport').hidden=true;document.getElementById('prepareImport').hidden=true;document.getElementById('reviewImportLabel').hidden=true;
   try{
     const response=await fetch('/api/jobs/import-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.getElementById('jobUrl').value.trim()})});
-    const data=await response.json();if(!response.ok)throw Error(data.detail||'The job posting could not be imported.');
-    importedJobKey=data.job_key;currentJobKeys=[importedJobKey];currentMatchSessionId=null;details.hidden=false;
+    const data=await readApiResponse(response,'The job posting could not be imported.');
+    importedJobKey=data.job_key;currentJobKeys=[importedJobKey];currentMatchJobKeys=[importedJobKey];currentMatchSessionId=null;pollingGeneration++;polling=false;matchStatus.textContent='';matchStatus.className='';matchResults.replaceChildren();pauseButton.hidden=true;resumeButton.hidden=true;recoverButton.hidden=true;details.hidden=false;
     details.textContent=`${data.employer} · ${data.title}\nProvider: ${data.provider}\nEmployer identity: ${data.employer_identity_source||'public posting metadata'}\nDescription: ${data.description_available?'available':'missing or incomplete'}${data.description_length?` (${data.description_length} characters)`:''}\nExperience evidence: ${data.experience_level} — ${(data.experience_level_evidence||[]).join(' ')}\nEligibility: ${data.eligibility_classification}${data.review_reasons?.length?`\nReview: ${data.review_reasons.join(' ')}`:''}\nApplication entry: ${data.application_url_source==='official_posting_page'?'official posting page (no separate application link was published)':'official application link'}\n${data.duplicate?'This posting was already saved; the existing record was updated.':'Saved to your existing jobs list.'}`;
     const postingLink=document.createElement('a');postingLink.href=data.posting_url;postingLink.target='_blank';postingLink.rel='noopener noreferrer';postingLink.textContent='View original posting';details.append(document.createElement('br'),postingLink);
     status.textContent='Import complete. Matching and dry-run actions use your existing authorizations and eligibility checks.';
-    renderProgress().catch(()=>{});
+    renderProgress().then(state=>{if(state&&['queued','running','paused'].includes(state.status))startPolling(state.session_id)}).catch(()=>{});
     document.getElementById('enrichImport').hidden=!!data.description_available;document.getElementById('analyzeImport').hidden=!data.description_available;document.getElementById('reviewImportLabel').hidden=false;document.getElementById('prepareImport').hidden=false;
   }catch(error){status.className='error';status.textContent=error.message}
   finally{button.disabled=false}
 });
 document.getElementById('enrichImport').addEventListener('click',async()=>{
   if(!importedJobKey)return;const button=document.getElementById('enrichImport');button.disabled=true;
-  try{const response=await fetch('/api/jobs/enrich-descriptions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:[importedJobKey],force:false})});const data=await response.json();if(!response.ok)throw Error(data.detail||'Description enrichment could not start.');const item=data.results?.[0];document.getElementById('importStatus').textContent=item?.status==='succeeded'?`Description retrieved from ${item.source}. Run AI analysis when ready.`:item?.reason||'No public description was available.';if(item?.status==='succeeded'){document.getElementById('enrichImport').hidden=true;document.getElementById('analyzeImport').hidden=false}}
+  try{const response=await fetch('/api/jobs/enrich-descriptions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:[importedJobKey],force:false})});const data=await readApiResponse(response,'Description enrichment could not start.');const item=data.results?.[0];document.getElementById('importStatus').textContent=item?.status==='succeeded'?`Description retrieved from ${item.source}. Run AI analysis when ready.`:item?.reason||'No public description was available.';if(item?.status==='succeeded'){document.getElementById('enrichImport').hidden=true;document.getElementById('analyzeImport').hidden=false}}
   catch(error){document.getElementById('importStatus').className='error';document.getElementById('importStatus').textContent=error.message}
   finally{button.disabled=false}
 });
 document.getElementById('analyzeImport').addEventListener('click',async()=>{
-  if(!importedJobKey)return;const button=document.getElementById('analyzeImport');button.disabled=true;matchStatus.textContent='Starting AI analysis for the imported job…';
-  try{const response=await fetch('/api/jobs/analyze-matches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:[importedJobKey],batch_size:3})});const data=await response.json();if(!response.ok)throw Error(data.detail||'Could not start AI analysis.');currentMatchSessionId=data.session_id||null;matchStatus.textContent='Analysis queued. Progress and eligibility will appear below.';startPolling(currentMatchSessionId)}
-  catch(error){matchStatus.className='error';matchStatus.textContent=error.message}finally{button.disabled=false}
+  if(!importedJobKey)return;const button=document.getElementById('analyzeImport');button.disabled=true;currentMatchJobKeys=[importedJobKey];currentMatchSessionId=null;pollingGeneration++;polling=false;matchStatus.className='';matchStatus.textContent='Starting AI analysis for the imported job…';recoverButton.hidden=true;
+  try{const response=await fetch('/api/jobs/analyze-matches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:[importedJobKey],batch_size:3})});const data=await readApiResponse(response,'Could not start AI analysis.');if(!data.session_id&&data.status!=='completed')throw new Error('The server did not create a matching session for this job. Please retry.');currentMatchSessionId=data.session_id||null;matchStatus.textContent='Analysis queued for this job only. Progress and eligibility will appear below.';startPolling(currentMatchSessionId)}
+  catch(error){matchStatus.className='error';matchStatus.textContent=error.message;const recovery=error.recovery;if(recovery?.recovery_available&&recovery?.same_jobs&&recovery?.session_id){currentMatchSessionId=recovery.session_id;recoverButton.hidden=false;recoverButton.dataset.sessionId=recovery.session_id}}
+  finally{button.disabled=false}
 });
 document.getElementById('prepareImport').addEventListener('click',async()=>{
   if(!importedJobKey)return;if(!document.getElementById('reviewImport').checked){document.getElementById('importStatus').className='error';document.getElementById('importStatus').textContent='Review the job and confirm before requesting a dry run.';return}
   const button=document.getElementById('prepareImport');button.disabled=true;
-  try{let response=await fetch(`/api/applications/saved-jobs/${encodeURIComponent(importedJobKey)}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewed:true})});let data=await response.json();if(!response.ok)throw Error(data.detail||'Eligibility review could not be saved.');response=await fetch('/api/applications/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_key:importedJobKey})});data=await response.json();if(!response.ok)throw Error(data.detail||'Dry-run preparation is not available for this job.');document.getElementById('importStatus').textContent=data.message||`Dry run status: ${data.status}. Live submission is disabled.`}
+  try{let response=await fetch(`/api/applications/saved-jobs/${encodeURIComponent(importedJobKey)}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reviewed:true})});await readApiResponse(response,'Eligibility review could not be saved.');response=await fetch('/api/applications/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_key:importedJobKey})});const data=await readApiResponse(response,'Dry-run preparation is not available for this job.');document.getElementById('importStatus').textContent=data.message||`Dry run status: ${data.status}. Live submission is disabled.`}
   catch(error){document.getElementById('importStatus').className='error';document.getElementById('importStatus').textContent=error.message}
   finally{button.disabled=false}
 });
@@ -2118,13 +2150,13 @@ for(const id of ['filterText','filterCompany','filterCategory','filterLocation',
 
 button.addEventListener('click',async()=>{
   button.disabled=true;cancelSearch.hidden=false;status.textContent='Starting discovery…';status.className='';
-  currentMatchSessionId=null;
+  currentMatchSessionId=null;currentMatchJobKeys=[];pollingGeneration++;polling=false;
   results.replaceChildren();diagnostics.replaceChildren();matchResults.replaceChildren();document.getElementById('coverageMetrics').hidden=true;analyzeButton.hidden=true;currentJobKeys=[];currentJobs=[];currentDiagnostics={};document.getElementById('jobFilters').hidden=true;
   discoveryRunId=(globalThis.crypto&&crypto.randomUUID)?crypto.randomUUID():`run-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   discoveryTimer=setInterval(async()=>{try{const r=await fetch(`/api/jobs/discovery/${encodeURIComponent(discoveryRunId)}`);if(!r.ok)return;const s=await r.json();status.textContent=`Searching ${s.sources_checked} of ${s.total_sources} sources · ${s.postings_retrieved} postings retrieved${s.cancel_requested?' · cancelling after current source':''}`;}catch(_){/* final search response remains authoritative */}},700);
   try{
     const response=await fetch('/api/jobs/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.getElementById('prompt').value.trim()||'Find jobs matching my saved preferences',run_id:discoveryRunId})});
-    const data=await response.json();if(!response.ok)throw new Error(data.detail||'Search failed');
+    const data=await readApiResponse(response,'Search failed');
     const messages={cancelled:'Discovery cancelled safely; completed source results were retained.',all_sources_unavailable:'All configured job sources are unavailable.',no_matching_openings:'No matching openings were returned by the available sources.',filters_too_restrictive:'Openings were retrieved, but the current filters rejected them.',preliminary_matches:`${data.count} preliminary match${data.count===1?'':'es'} need review.`};
     status.textContent=messages[data.status]||'Search complete.';
     const d=data.diagnostics;currentDiagnostics=d||{};
@@ -2143,23 +2175,25 @@ cancelSearch.addEventListener('click',async()=>{if(!discoveryRunId)return;cancel
 
 analyzeButton.addEventListener('click',async()=>{
   if(!currentJobKeys.length)return;
-  analyzeButton.disabled=true;matchStatus.textContent='Starting sequential local Ollama analysis…';matchResults.replaceChildren();
+  analyzeButton.disabled=true;currentMatchJobKeys=[...currentJobKeys];currentMatchSessionId=null;pollingGeneration++;polling=false;matchStatus.textContent='Starting matching for the selected jobs…';matchStatus.className='';recoverButton.hidden=true;matchResults.replaceChildren();
   try{
     const response=await fetch('/api/jobs/analyze-matches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:currentJobKeys,batch_size:Number(document.getElementById('batchSize').value)})});
-    const data=await response.json();if(!response.ok)throw new Error(data.detail||'Could not queue match analysis');
+    const data=await readApiResponse(response,'Could not queue match analysis');if(!data.session_id&&data.status!=='completed')throw new Error('The server did not create a matching session. Please retry.');
     currentMatchSessionId=data.session_id||null;startPolling(currentMatchSessionId);
-  }catch(error){matchStatus.textContent=error.message;matchStatus.className='error'}finally{analyzeButton.disabled=false}
+  }catch(error){matchStatus.textContent=error.message;matchStatus.className='error';const recovery=error.recovery;if(recovery?.recovery_available&&recovery?.same_jobs&&recovery?.session_id){currentMatchSessionId=recovery.session_id;recoverButton.hidden=false;recoverButton.dataset.sessionId=recovery.session_id}}finally{analyzeButton.disabled=false}
 });
 
-function matchProgressUrl(){if(currentMatchSessionId)return `/api/jobs/match-progress?session_id=${encodeURIComponent(currentMatchSessionId)}`;if(currentJobKeys.length)return `/api/jobs/match-progress?job_keys=${encodeURIComponent(currentJobKeys.join(','))}`;return '/api/jobs/match-progress'}
+function matchProgressUrl(){if(currentMatchSessionId){const scope=currentMatchJobKeys.length?`&job_keys=${encodeURIComponent(currentMatchJobKeys.join(','))}`:'';return `/api/jobs/match-progress?session_id=${encodeURIComponent(currentMatchSessionId)}${scope}`}if(currentMatchJobKeys.length)return `/api/jobs/match-progress?job_keys=${encodeURIComponent(currentMatchJobKeys.join(','))}`;return null}
 async function renderProgress(){
-  const poll=await fetch(matchProgressUrl());const state=await poll.json();if(!poll.ok)throw new Error(state.detail||'Could not retrieve analysis status');if(state.session_id)currentMatchSessionId=state.session_id;
+  const url=matchProgressUrl();if(!url)return null;const poll=await fetch(url);const state=await readApiResponse(poll,'Could not retrieve analysis status');if(state.session_id)currentMatchSessionId=state.session_id;
+  if(!state.session_id&&state.status==='idle'){pauseButton.hidden=true;resumeButton.hidden=true;recoverButton.hidden=true;return state}
   const currentLabel=state.current_job?` · Current: ${state.current_job.company} — ${state.current_job.title}${state.current_elapsed_seconds!==null?` (${state.current_elapsed_seconds}s)`:''}`:'';
   const pauseLabel=state.status==='paused'?` · Paused: ${state.error||'Checkpoint saved; Resume continues this session without rediscovery.'}`:state.worker_health==='stalled_recoverable'?' · Worker appears abandoned; safe recovery is available.':'';
   const failureLabel=state.error&&state.status!=='paused'?` · ${state.error}`:'';
   matchStatus.textContent=`AI analysis: ${state.completed+state.failed+state.excluded} of ${state.total} processed · ${state.pending} pending · Potential matches ${state.potential_match} · Needs review ${state.needs_review} · Not eligible ${state.not_eligible} · Excluded as unrelated ${state.excluded} · Status: ${state.status}${currentLabel}${pauseLabel}${failureLabel}`;const resultByKey=new Map((state.results||[]).filter(x=>x.job_key).map(x=>[x.job_key,x]));currentJobs=currentJobs.map(job=>{const match=resultByKey.get(job.job_key);return match?{...job,matching_status:match.stale?'stale':match.status,eligibility_classification:match.stale?'needs_review':(match.classification||'needs_review'),matching_failure_reason:match.error||''}:job});renderCoverage();renderJobs();
-  pauseButton.hidden=state.status!=='running'&&state.status!=='queued';resumeButton.hidden=state.status!=='paused';
+  pauseButton.hidden=state.status!=='running'&&state.status!=='queued';resumeButton.hidden=state.status!=='paused';recoverButton.hidden=!state.recovery_available||!state.session_id;recoverButton.dataset.sessionId=state.session_id||'';
   matchResults.replaceChildren();
+      if(state.status==='failed'||state.status==='interrupted'||state.failed>0){const retry=document.createElement('p');retry.className='error';retry.textContent='This matching attempt did not finish. Completed results are preserved; use Analyze with AI to retry this selected job.';matchResults.append(retry)}
       for(const item of state.results||[]){
         const article=document.createElement('article');article.className='job';
         const heading=document.createElement('h3');heading.textContent=`${item.title||'Job'} · ${item.status==='completed'?item.classification:item.status==='excluded'?'unrelated':item.status}`;article.append(heading);
@@ -2170,13 +2204,13 @@ async function renderProgress(){
           const score=document.createElement('p');score.textContent=`Match score: ${item.match.match_score}/100 · Ranking aid only`;
           const explanation=document.createElement('p');explanation.textContent=`Evidence-based assessment: ${item.match.explanation}`;article.append(score,explanation);
           for(const field of ['evidence_consistency','strengths','gaps','missing_information']){if(item.match[field]?.length){const p=document.createElement('p');p.className=field==='evidence_consistency'?'error':'note';p.textContent=(field==='missing_information'?'Missing information':field==='evidence_consistency'?'Evidence consistency review':field[0].toUpperCase()+field.slice(1))+': '+item.match[field].join('; ');article.append(p)}}
-          for(const field of ['required_skills','preferred_skills','required_experience','preferred_experience','education_requirements','education_assessment','experience_assessment','experience_level_assessment','location_assessment','employment_type_assessment']){const value=item.match[field];if(value===undefined)continue;const p=document.createElement('p');p.className='note';p.textContent=field.replaceAll('_',' ')+': '+(Array.isArray(value)?value.map(e=>`${e.requirement} (${e.status}; profile evidence: ${e.candidate_evidence.length?e.candidate_evidence.join(', '):'not provided'})`).join('; '):value);article.append(p)}
+          for(const field of ['required_skills','preferred_skills','required_experience','preferred_experience','education_requirements','preferred_education_requirements','education_assessment','gpa_assessment','graduation_assessment','experience_assessment','experience_level_assessment','location_assessment','employment_type_assessment']){const value=item.match[field];if(value===undefined)continue;const p=document.createElement('p');p.className='note';p.textContent=field.replaceAll('_',' ')+': '+(Array.isArray(value)?value.map(e=>`${e.requirement} (${e.status}; profile evidence: ${e.candidate_evidence.length?e.candidate_evidence.join(', '):'not provided'})`).join('; '):value);article.append(p)}
         }
         matchResults.append(article);
       }
 }
-async function startPolling(sessionId=currentMatchSessionId){if(sessionId)currentMatchSessionId=sessionId;if(polling)return;polling=true;try{while(polling){await renderProgress();const state=await (await fetch(matchProgressUrl())).json();if(['idle','completed','failed','cancelled'].includes(state.status))break;await new Promise(resolve=>setTimeout(resolve,1300));}}catch(error){matchStatus.textContent=error.message;matchStatus.className='error'}finally{polling=false}}
-pauseButton.addEventListener('click',async()=>{const url=currentMatchSessionId?`/api/jobs/matches/pause?session_id=${encodeURIComponent(currentMatchSessionId)}`:'/api/jobs/matches/pause';await fetch(url,{method:'POST'});await renderProgress()});
-resumeButton.addEventListener('click',async()=>{const url=currentMatchSessionId?`/api/jobs/matches/resume?session_id=${encodeURIComponent(currentMatchSessionId)}`:'/api/jobs/matches/resume';const response=await fetch(url,{method:'POST'});if(!response.ok){const error=await response.json();matchStatus.textContent=error.detail||'Could not resume analysis';return}startPolling(currentMatchSessionId)});
-renderProgress().catch(()=>{});
+async function startPolling(sessionId=currentMatchSessionId){if(sessionId)currentMatchSessionId=sessionId;const generation=++pollingGeneration;polling=true;try{while(polling&&generation===pollingGeneration){const state=await renderProgress();if(!state||['idle','completed','failed','cancelled','interrupted','paused'].includes(state.status))break;await new Promise(resolve=>setTimeout(resolve,1300));}}catch(error){matchStatus.textContent=error.message;matchStatus.className='error'}finally{if(generation===pollingGeneration)polling=false}}
+pauseButton.addEventListener('click',async()=>{if(!currentMatchSessionId)return;const url=`/api/jobs/matches/pause?session_id=${encodeURIComponent(currentMatchSessionId)}`;try{await readApiResponse(await fetch(url,{method:'POST'}),'Could not pause analysis');await renderProgress()}catch(error){matchStatus.textContent=error.message;matchStatus.className='error'}});
+resumeButton.addEventListener('click',async()=>{if(!currentMatchSessionId)return;const url=`/api/jobs/matches/resume?session_id=${encodeURIComponent(currentMatchSessionId)}`;try{await readApiResponse(await fetch(url,{method:'POST'}),'Could not resume analysis');startPolling(currentMatchSessionId)}catch(error){matchStatus.textContent=error.message;matchStatus.className='error'}});
+recoverButton.addEventListener('click',async()=>{const sessionId=recoverButton.dataset.sessionId;if(!sessionId||!confirm('Confirm this selected matching worker is abandoned. Recovery preserves completed results and does not resume matching automatically.'))return;recoverButton.disabled=true;try{await readApiResponse(await fetch(`/api/jobs/matches/${encodeURIComponent(sessionId)}/recover`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm_abandoned:true})}),'Could not recover the selected checkpoint');currentMatchSessionId=null;recoverButton.hidden=true;matchStatus.textContent='Abandoned checkpoint recovered. Completed results are preserved; click Analyze with AI to retry the remaining selected job.'}catch(error){matchStatus.textContent=error.message;matchStatus.className='error'}finally{recoverButton.disabled=false}});
 </script></body></html>'''

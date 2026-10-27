@@ -3,6 +3,7 @@ import json
 import re
 import sqlite3
 import ipaddress
+import hashlib
 from urllib.parse import urlparse
 from typing import Any
 from datetime import datetime, timezone
@@ -77,6 +78,52 @@ FIELDS = {
 }
 
 
+def canonical_answer_identity(question):
+    """Return a conservative answer category and destination qualifier."""
+    text=re.sub(r"\s+"," ",str(question or "").casefold()).strip()
+    categories=(
+        ("human_verification",r"captcha|verification code|human verification|sign in|login"),
+        ("work_authorization",r"work authorization|work authori[sz]ed|legally authori[sz]ed|right to work"),
+        ("sponsorship",r"sponsor|visa"),
+        ("demographic",r"gender|race|ethnic|veteran|disability|sexual orientation|pronouns"),
+        ("legal_attestation",r"attest|certify|agree to|terms and conditions|criminal background|background check"),
+        ("relocation",r"relocat|move to|willing to move|open to moving"),
+        ("availability",r"earliest.*start|when can you start|available to start|start date|notice period|how much notice"),
+        ("work_arrangement",r"remote|hybrid|on.site|work arrangement"),
+        ("employment_type",r"employment type|full.time|part.time|contract role"),
+        ("linkedin",r"linkedin"),("github",r"github"),("portfolio",r"portfolio|personal website"),
+        ("education",r"education|degree|university|college|graduat|gpa"),
+        ("internship",r"internship|intern experience"),("professional_experience",r"work experience|professional experience|employment history"),
+        ("location",r"current location|where do you live|city|state|province|country of residence"),
+    )
+    category=next((name for name,pattern in categories if re.search(pattern,text)),"other")
+    context=""
+    if category=="relocation":
+        match=re.search(r"\b(?:relocat(?:e|ion|ing)|move|moving)\s+to\s+([^?.!,;]{2,100})",str(question or ""),re.I)
+        if match:
+            context=re.sub(r"\s+(?:for|in)\s+(?:this|the|a)\s+(?:position|job|role)\b.*$","",match.group(1),flags=re.I)
+            context=re.sub(r"[^a-z0-9 ]+"," ",context.casefold()).strip()
+    elif category=="availability":
+        context="notice_period" if re.search(r"notice period|how much notice",text) else "earliest_start_date"
+    elif category=="education":
+        if re.search(r"\bgpa\b|grade point average",text):context="gpa"
+        elif re.search(r"graduat",text):context="graduation"
+        elif re.search(r"degree|major|field of study",text):context="degree"
+        elif re.search(r"university|college|school",text):context="institution"
+        else:context="education_details"
+    elif category=="sponsorship":
+        context="future" if re.search(r"future|in the future|later",text) else "current"
+    elif category=="other":
+        context=re.sub(r"[^a-z0-9 ]+"," ",text).strip()[:180]
+    sensitive=category in {"work_authorization","sponsorship","demographic","legal_attestation","human_verification"}
+    return category,context,sensitive
+
+
+def stable_answer_key(category,context="",scope="matching_jobs",job_key=""):
+    raw="|".join((category,context,scope,job_key))
+    return "answer-"+hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try:
@@ -118,8 +165,27 @@ def initialize():
                                  ("answer_encrypted","TEXT NOT NULL DEFAULT ''"),
                                  ("question_category","TEXT NOT NULL DEFAULT 'other'"),
                                  ("sensitivity_classification","TEXT NOT NULL DEFAULT 'ordinary'"),
-                                 ("confirmation_at","TEXT")):
+                                 ("confirmation_at","TEXT"),
+                                 ("reuse_scope","TEXT NOT NULL DEFAULT 'none'"),
+                                 ("scope_job_key","TEXT NOT NULL DEFAULT ''"),
+                                 ("question_context","TEXT NOT NULL DEFAULT ''"),
+                                 ("profile_version","TEXT NOT NULL DEFAULT ''")):
             if name not in existing: db.execute(f"ALTER TABLE application_answers ADD COLUMN {name} {declaration}")
+        # Upgrade legacy sensitive rows immediately. Never persist them in the
+        # ordinary answer column as a fallback when encryption is unavailable.
+        for row in db.execute("SELECT id,answer FROM application_answers WHERE sensitive=1 AND answer<>'' AND answer_encrypted='' ").fetchall():
+            ciphertext=encrypt_text(row["answer"])
+            db.execute("UPDATE application_answers SET answer='',answer_encrypted=? WHERE id=?",(ciphertext,row["id"]))
+        db.execute("UPDATE application_answers SET reuse_scope=CASE WHEN auto_reuse=1 AND sensitive=0 THEN 'matching_jobs' ELSE 'none' END WHERE reuse_scope='none'")
+        for row in db.execute("SELECT id,question_text,question_category,question_context,profile_version,resume_id FROM application_answers").fetchall():
+            category,context,_=canonical_answer_identity(row["question_text"])
+            db.execute("UPDATE application_answers SET question_category=?,question_context=?,profile_version=COALESCE(NULLIF(profile_version,''),?) WHERE id=?",
+                       (category,context,row["resume_id"],row["id"]))
+        db.execute("CREATE INDEX IF NOT EXISTS idx_application_answers_reuse_scope ON application_answers(user_id,resume_id,question_category,question_context,reuse_scope,scope_job_key,confirmed,revoked_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS application_answer_history(
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL,resume_id TEXT NOT NULL,
+            question_key TEXT NOT NULL,recorded_at TEXT NOT NULL,event TEXT NOT NULL,snapshot_json TEXT NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_application_answer_history_key ON application_answer_history(user_id,resume_id,question_key,recorded_at)")
 
 
 initialize()
@@ -179,6 +245,29 @@ def _answer_plaintext(row,db=None):
         db.execute("UPDATE application_answers SET answer='',answer_encrypted=? WHERE id=?",
                    (encrypt_text(legacy),row["id"]))
     return legacy
+
+
+def _archive_application_answer(db,row,event):
+    if not row:return
+    if row["sensitive"] and row["answer"] and not (row["answer_encrypted"] if "answer_encrypted" in row.keys() else ""):
+        _answer_plaintext(row,db)
+        row=db.execute("SELECT * FROM application_answers WHERE id=?",(row["id"],)).fetchone()
+    db.execute("INSERT INTO application_answer_history(user_id,resume_id,question_key,recorded_at,event,snapshot_json) VALUES(?,?,?,?,?,?)",
+        (row["user_id"],row["resume_id"],row["question_key"],now(),event,
+         json.dumps(dict(row),ensure_ascii=False,default=str)))
+
+
+def _answer_profile_version(db,resume_id):
+    parts=[str(resume_id or "")]
+    row=db.execute("SELECT updated_at FROM candidate_verifications WHERE resume_id=?",(resume_id,)).fetchone()
+    if row:parts.append(str(row["updated_at"] or ""))
+    exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='career_preferences'").fetchone()
+    if exists:
+        try:
+            preference=db.execute("SELECT preference_version,preferences_fingerprint FROM career_preferences WHERE user_id=?",(USER,)).fetchone()
+            if preference:parts.extend((str(preference["preference_version"] or ""),str(preference["preferences_fingerprint"] or "")))
+        except sqlite3.OperationalError:pass
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _active(db):
@@ -436,10 +525,13 @@ def canonical_verified_candidate_facts(profile):
         major=str(row.get("major") or row.get("field") or "").strip()
         raw_date=str(row.get("graduation_date") or "").strip()
         date=raw_date if re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])",raw_date) else ""
+        gpa=str(row.get("gpa") or "").strip()
+        gpa_scale=str(row.get("gpa_scale") or "").strip()
         # A year-only extracted suggestion is not a confirmed graduation date.
-        if degree or major or date:
+        if degree or major or date or gpa:
             education.append({"degree":degree,"degree_normalized":normalize_degree(degree),
                 "major":major,"major_normalized":normalize_major(major),"graduation_date":date,
+                "gpa":gpa,"gpa_scale":gpa_scale,
                 "currently_enrolled":(bool(row["currently_enrolled"]) if row.get("currently_enrolled") is not None else None)})
     if education:facts["education"]=education
 
@@ -623,6 +715,8 @@ class AnswerUpdate(BaseModel):
     answer_type: str = "factual"
     jurisdiction: str = Field(default="",max_length=120)
     auto_reuse: bool = False
+    reuse_scope: str = ""
+    scope_job_key: str = Field(default="",max_length=300)
 
 
 def _validate_profile_url(value,label):
@@ -698,48 +792,106 @@ def _entry_is_confirmable(key, entry):
 
 @router.put("/api/application-answers/{question_key}")
 def save_application_answer(question_key: str, payload: AnswerUpdate):
-    import re
     if not re.fullmatch(r"[a-zA-Z0-9_-]{2,80}", question_key):
         raise HTTPException(400, "Answer key must contain letters, digits, hyphens, or underscores.")
     if payload.answer_type not in {"factual","preference","generated","sensitive","source"}:
         raise HTTPException(400,"Unknown answer type.")
     if payload.sensitive and payload.answer_type not in {"sensitive","factual"}:
         raise HTTPException(400,"Sensitive answers must use the sensitive or factual answer type.")
+    reuse_scope=payload.reuse_scope or ("matching_jobs" if payload.auto_reuse else "none")
+    if reuse_scope not in {"none","matching_jobs","general_preference","job_specific"}:
+        raise HTTPException(400,"Choose no reuse, matching jobs, or a specific job.")
     stamp = now()
     with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         resume = _active(db)
-        is_sensitive=bool(payload.sensitive)
         answer=payload.answer.strip()
+        category,context,question_sensitive=canonical_answer_identity(payload.question)
+        is_sensitive=bool(payload.sensitive or question_sensitive)
+        if is_sensitive and reuse_scope in {"matching_jobs","general_preference"}:
+            raise HTTPException(422,"Sensitive, legal, and human-verification answers cannot be reused across jobs.")
+        if not payload.confirmed or not answer:reuse_scope="none"
+        if reuse_scope=="job_specific":
+            if not payload.scope_job_key:raise HTTPException(422,"Choose the saved job that may use this answer.")
+            try:exists=db.execute("SELECT 1 FROM applications WHERE user_id=? AND job_key=? AND resume_id=? LIMIT 1",
+                                  (USER,payload.scope_job_key,resume["id"])).fetchone()
+            except sqlite3.OperationalError:exists=None
+            if not exists:raise HTTPException(404,"The selected job application is not available for this answer.")
+        scope_job_key=payload.scope_job_key if reuse_scope=="job_specific" else ""
+        storage_key="custom:"+question_key
+        if reuse_scope!="none":
+            duplicate=db.execute("""SELECT * FROM application_answers WHERE user_id=? AND resume_id=? AND question_category=?
+                AND question_context=? AND reuse_scope=? AND scope_job_key=? AND confirmed=1 AND revoked_at IS NULL
+                AND question_key<>? ORDER BY updated_at DESC LIMIT 1""",
+                (USER,resume["id"],category,context,reuse_scope,scope_job_key,storage_key)).fetchone()
+            if duplicate:
+                old_answer=_answer_plaintext(duplicate,db)
+                if old_answer!=answer or bool(duplicate["sensitive"])!=is_sensitive:
+                    raise HTTPException(409,"A different confirmed answer already exists for this question and reuse scope. Edit or revoke it before saving another.")
+                storage_key=duplicate["question_key"]
         try:cipher=encrypt_text(answer) if is_sensitive and answer else ""
         except EncryptionUnavailable as error:raise HTTPException(503,str(error)) from error
+        old=db.execute("SELECT * FROM application_answers WHERE user_id=? AND resume_id=? AND question_key=?",
+                       (USER,resume["id"],storage_key)).fetchone()
+        answer_changed=bool(old and any(old[name]!=value for name,value in {
+            "question_text":payload.question.strip(),"answer":"" if is_sensitive else answer,
+            "answer_encrypted":cipher,"sensitive":int(is_sensitive),"confirmed":int(payload.confirmed and bool(answer)),
+            "reuse_scope":reuse_scope,"scope_job_key":scope_job_key,"question_category":category,"question_context":context,
+        }.items() if name in old.keys()))
+        if answer_changed:
+            _archive_application_answer(db,old,"answer_updated")
         db.execute("""INSERT INTO application_answers
-            (user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at,revoked_at,answer_type,jurisdiction,auto_reuse,source,answer_encrypted,confirmation_at,sensitivity_classification)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,resume_id,question_key) DO UPDATE SET
+            (user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at,revoked_at,answer_type,jurisdiction,auto_reuse,source,answer_encrypted,confirmation_at,sensitivity_classification,question_category,reuse_scope,scope_job_key,question_context,profile_version)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,resume_id,question_key) DO UPDATE SET
             question_text=excluded.question_text,answer=excluded.answer,sensitive=excluded.sensitive,
             confirmed=excluded.confirmed,updated_at=excluded.updated_at,revoked_at=excluded.revoked_at,
             answer_type=excluded.answer_type,jurisdiction=excluded.jurisdiction,auto_reuse=excluded.auto_reuse,source=excluded.source,
             answer_encrypted=excluded.answer_encrypted,confirmation_at=excluded.confirmation_at,
-            sensitivity_classification=excluded.sensitivity_classification""",
-                   (USER, resume["id"], "custom:" + question_key, payload.question.strip(), "" if is_sensitive else answer,
+            sensitivity_classification=excluded.sensitivity_classification,question_category=excluded.question_category,
+            reuse_scope=excluded.reuse_scope,scope_job_key=excluded.scope_job_key,question_context=excluded.question_context,
+            profile_version=excluded.profile_version""",
+                   (USER, resume["id"], storage_key, payload.question.strip(), "" if is_sensitive else answer,
                     int(is_sensitive), int(payload.confirmed and bool(answer)), stamp, stamp,
                     None if payload.confirmed and answer else stamp,payload.answer_type,payload.jurisdiction.strip(),
-                    int(payload.auto_reuse and payload.confirmed and bool(answer) and not is_sensitive),"user_confirmed",
-                    cipher,stamp if payload.confirmed and answer else None,"sensitive" if is_sensitive else "ordinary"))
-        if question_key in {"graduation_date","technical_skills","professional_experience","location","availability","employment_type"}:
-            db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND status='completed'",(USER,resume["id"]))
+                    int(reuse_scope!="none" and payload.confirmed and bool(answer) and not is_sensitive),"user_confirmed",
+                    cipher,stamp if payload.confirmed and answer else None,"sensitive" if is_sensitive else "ordinary",
+                    category,reuse_scope,scope_job_key,context,_answer_profile_version(db,resume["id"])))
+        auth_table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_preparation_authorizations'").fetchone()
+        previous_scope=str(old["reuse_scope"] or "none") if old else "none"
+        previous_job=str(old["scope_job_key"] or "") if old else ""
+        global_scope={"matching_jobs","general_preference"}
+        if auth_table and (reuse_scope in global_scope or previous_scope in global_scope):
+            db.execute("UPDATE application_preparation_authorizations SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",(stamp,USER))
+        elif auth_table:
+            for affected_job in {key for key in (scope_job_key if reuse_scope=="job_specific" else "",
+                                                  previous_job if previous_scope=="job_specific" else "") if key}:
+                db.execute("UPDATE application_preparation_authorizations SET revoked_at=? WHERE user_id=? AND job_key=? AND revoked_at IS NULL",
+                           (stamp,USER,affected_job))
+        match_table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
+        affected_categories={category,str(old["question_category"] or "other")} if old else {category}
+        match_columns={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")} if match_table else set()
+        if match_table and "freshness_status" in match_columns and affected_categories & {"work_authorization","sponsorship","relocation","availability","education"}:
+            if reuse_scope in global_scope or previous_scope in global_scope:
+                db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND status='completed'",(USER,resume["id"]))
+            else:
+                for affected_job in {key for key in (scope_job_key if reuse_scope=="job_specific" else "",
+                                                      previous_job if previous_scope=="job_specific" else "") if key}:
+                    db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND job_key=? AND status='completed'",
+                               (USER,resume["id"],affected_job))
     with connect() as db:
         persisted=db.execute("""SELECT question_text,answer,answer_encrypted,sensitive,confirmed,auto_reuse,revoked_at
             FROM application_answers WHERE user_id=? AND resume_id=? AND question_key=?""",
-            (USER,resume["id"],"custom:"+question_key)).fetchone()
+            (USER,resume["id"],storage_key)).fetchone()
         persisted_answer=_answer_plaintext(persisted,db) if persisted else ""
         persisted_verified=bool(persisted and persisted["question_text"]==payload.question.strip()
             and persisted_answer==answer and bool(persisted["sensitive"])==is_sensitive
             and bool(persisted["confirmed"])==bool(payload.confirmed and answer)
-            and bool(persisted["auto_reuse"])==bool(payload.auto_reuse and payload.confirmed and answer and not is_sensitive)
+            and bool(persisted["auto_reuse"])==bool(reuse_scope!="none" and payload.confirmed and answer and not is_sensitive)
             and persisted["revoked_at"] is None)
     return {"saved": True, "persisted_verified":persisted_verified,
             "confirmed": bool(payload.confirmed and payload.answer.strip()),
-            "auto_reuse":bool(payload.auto_reuse and payload.confirmed and payload.answer.strip() and not payload.sensitive)}
+            "auto_reuse":bool(reuse_scope!="none" and payload.confirmed and payload.answer.strip() and not is_sensitive),
+            "reuse_scope":reuse_scope,"canonical_category":category,"key":storage_key}
 
 
 @router.delete("/api/application-answers/{question_key}")
@@ -747,7 +899,26 @@ def revoke_application_answer(question_key: str):
     stamp = now()
     with connect() as db:
         resume = _active(db)
-        db.execute("UPDATE application_answers SET confirmed=0,revoked_at=?,updated_at=? WHERE user_id=? AND resume_id=? AND question_key=?",
+        old=db.execute("SELECT * FROM application_answers WHERE user_id=? AND resume_id=? AND question_key=?",
+                       (USER,resume["id"],"custom:"+question_key)).fetchone()
+        if old:
+            _archive_application_answer(db,old,"answer_revoked")
+            scope=str(old["reuse_scope"] or "none");job_key=str(old["scope_job_key"] or "")
+            if scope in {"matching_jobs","general_preference"}:
+                table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_preparation_authorizations'").fetchone()
+                if table:db.execute("UPDATE application_preparation_authorizations SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",(stamp,USER))
+            elif scope=="job_specific" and job_key:
+                table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_preparation_authorizations'").fetchone()
+                if table:db.execute("UPDATE application_preparation_authorizations SET revoked_at=? WHERE user_id=? AND job_key=? AND revoked_at IS NULL",(stamp,USER,job_key))
+            if old["question_category"] in {"work_authorization","sponsorship","relocation","availability","education"}:
+                match=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
+                columns={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")} if match else set()
+                if "freshness_status" in columns:
+                    if scope in {"matching_jobs","general_preference"}:
+                        db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND status='completed'",(USER,resume["id"]))
+                    elif scope=="job_specific" and job_key:
+                        db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND job_key=? AND status='completed'",(USER,resume["id"],job_key))
+        db.execute("UPDATE application_answers SET confirmed=0,revoked_at=?,updated_at=?,auto_reuse=0,reuse_scope='none' WHERE user_id=? AND resume_id=? AND question_key=?",
                    (stamp, stamp, USER, resume["id"], "custom:" + question_key))
     return {"revoked": True}
 
@@ -764,7 +935,7 @@ def update_verification(payload: VerificationUpdate):
         if kind == "objects":
             if not isinstance(value,list) or len(value)>100 or any(not isinstance(item,dict) for item in value):
                 raise HTTPException(400,f"{key} must be a list of structured entries.")
-            allowed={"education_entries":{"institution","degree","major","graduation_date","graduation_year_suggestion","gpa","currently_enrolled"},
+            allowed={"education_entries":{"institution","degree","major","graduation_date","graduation_year_suggestion","gpa","gpa_scale","currently_enrolled"},
                      "experience_entries":{"job_title","employer","location","employment_type","start_date","end_date","start_year_suggestion","end_year_suggestion","currently_working","responsibilities","technologies"},
                      "internship_entries":{"job_title","employer","location","employment_type","start_date","end_date","start_year_suggestion","end_year_suggestion","currently_working","responsibilities","technologies"},
                      "project_entries":{"name","description","technologies","github_url","demo_url","start_date","end_date","start_year_suggestion","end_year_suggestion","accomplishments"},
@@ -959,7 +1130,7 @@ def profile_completeness():
 def list_answers():
     with connect() as db:
         resume = _active(db)
-        rows = db.execute("SELECT id,question_key,question_text,answer,answer_encrypted,sensitive,confirmed,updated_at,answer_type,jurisdiction,auto_reuse,source,question_category,sensitivity_classification,confirmation_at FROM application_answers WHERE user_id=? AND resume_id=? AND revoked_at IS NULL ORDER BY question_key", (USER, resume["id"])).fetchall()
+        rows = db.execute("SELECT id,question_key,question_text,answer,answer_encrypted,sensitive,confirmed,updated_at,answer_type,jurisdiction,auto_reuse,source,question_category,sensitivity_classification,confirmation_at,reuse_scope,scope_job_key,question_context,profile_version FROM application_answers WHERE user_id=? AND resume_id=? AND revoked_at IS NULL ORDER BY question_key", (USER, resume["id"])).fetchall()
         # Decrypt/lazily migrate while this connection is still open. Never
         # echo sensitive content in the normal answer-bank list response.
         output=[]
@@ -970,7 +1141,9 @@ def list_answers():
                 "answer":answer if row["confirmed"] and not row["sensitive"] else "","updated_at":row["updated_at"],
                 "answer_type":row["answer_type"],"jurisdiction":row["jurisdiction"],"auto_reuse":bool(row["auto_reuse"]),
                 "source":row["source"],"category":row["question_category"],
-                "sensitivity_classification":row["sensitivity_classification"],"confirmed_at":row["confirmation_at"]})
+                "sensitivity_classification":row["sensitivity_classification"],"confirmed_at":row["confirmation_at"],
+                "reuse_scope":row["reuse_scope"],"scope_job_key":row["scope_job_key"],
+                "question_context":row["question_context"],"profile_version":row["profile_version"]})
     return output
 
 
@@ -990,7 +1163,7 @@ PROFILE_PAGE = r'''<!doctype html>
 <section class="section"><h2>Reusable application answers</h2><p class="muted">Answers are tied to this resume version. Sensitive or legal answers require explicit confirmation.</p><button type="button" onclick="addAnswer()">Add an answer</button><div id="answer-list"></div></section><div id="status" class="status" role="status" aria-live="polite"></div></main>
 <script>
 let fields=[],latestCompleteness=null;const hiddenLegacy=new Set(['graduation_month','graduation_year','graduation_date','university','degree','major','work_experience','internships','projects','technical_skills']);
-const schemas={education_entries:[['institution','Institution','text'],['degree','Degree','text'],['major','Major / field','text'],['graduation_date','Graduation month and year','month'],['gpa','GPA (optional)','text'],['currently_enrolled','Currently enrolled','bool']],experience_entries:[['job_title','Job title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],internship_entries:[['job_title','Internship title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],project_entries:[['name','Project name','text'],['description','Description','textarea'],['technologies','Technologies','list'],['github_url','GitHub URL','url'],['demo_url','Live demo URL','url'],['start_date','Start month (optional)','month'],['end_date','End month (optional)','month'],['accomplishments','Key accomplishments','list']]};
+const schemas={education_entries:[['institution','Institution','text'],['degree','Degree','text'],['major','Major / field','text'],['graduation_date','Graduation month and year','month'],['gpa','GPA (optional)','text'],['gpa_scale','GPA scale (for example, 4.0)','text'],['currently_enrolled','Currently enrolled','bool']],experience_entries:[['job_title','Job title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],internship_entries:[['job_title','Internship title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],project_entries:[['name','Project name','text'],['description','Description','textarea'],['technologies','Technologies','list'],['github_url','GitHub URL','url'],['demo_url','Live demo URL','url'],['start_date','Start month (optional)','month'],['end_date','End month (optional)','month'],['accomplishments','Key accomplishments','list']]};
 async function jsonReq(url,options={}){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok){const detail=d.detail;const message=Array.isArray(detail)?detail.map(x=>(Array.isArray(x.loc)?x.loc.filter(y=>y!=='body').join(' → ')+': ':'')+(x.msg||'Invalid value')).join('; '):typeof detail==='string'?detail:'Request failed. Check the highlighted field and try again.';const error=Error(message);error.detail=detail;throw error}return d}function formatMonth(value){if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(value||''))return '';const [y,m]=value.split('-').map(Number);return new Intl.DateTimeFormat(undefined,{month:'long',year:'numeric',timeZone:'UTC'}).format(new Date(Date.UTC(y,m-1,1)))}
 function badge(source){const x=document.createElement('span');x.className='badge '+(source==='user_confirmed'?'confirmed':source==='resume_suggestion'?'suggestion':'');x.textContent=source==='user_confirmed'?'Confirmed':source==='resume_suggestion'?'Resume / AI suggestion':'Missing';return x}
 function confirmControl(key,checked,text='I reviewed and confirm'){const label=document.createElement('label');label.className='checkrow';const box=document.createElement('input');box.type='checkbox';box.dataset.confirm=key;box.checked=!!checked;label.append(box,document.createTextNode(text));return label}

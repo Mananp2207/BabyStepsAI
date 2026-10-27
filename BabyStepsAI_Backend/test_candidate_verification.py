@@ -402,6 +402,92 @@ class CandidateVerificationTests(unittest.TestCase):
         for text in ("Use My Current Location","Enter Location Manually","Not Now","navigator.geolocation.getCurrentPosition","babysteps-location-denied","Coordinates were not saved","residence or mailing address"):
             self.assertIn(text,page)
 
+    def test_answer_identity_normalizes_equivalent_questions_and_keeps_destination_context(self):
+        self.assertEqual(profile.canonical_answer_identity("Are you willing to relocate?")[:2],
+                         profile.canonical_answer_identity("Would you relocate for this position?")[:2])
+        first=profile.canonical_answer_identity("Are you open to moving to New York?")
+        second=profile.canonical_answer_identity("Would you relocate to San Francisco for this job?")
+        self.assertEqual(first[0],"relocation"); self.assertNotEqual(first[1],second[1])
+        self.assertEqual(profile.canonical_answer_identity("When can you start?")[:2],
+                         profile.canonical_answer_identity("What is your earliest available start date?")[:2])
+        self.assertNotEqual(profile.canonical_answer_identity("When can you start?")[:2],
+                            profile.canonical_answer_identity("How much notice do you need?")[:2])
+        self.assertNotEqual(profile.canonical_answer_identity("What is your GPA?")[:2],
+                            profile.canonical_answer_identity("What degree are you pursuing?")[:2])
+
+    def test_reusable_answer_scope_is_confirmed_and_revocation_is_audited(self):
+        from fastapi import HTTPException
+        key="notice-period"
+        saved=profile.save_application_answer(key,profile.AnswerUpdate(question="How much notice do you need?",answer="Two weeks",confirmed=True,reuse_scope="general_preference"))
+        self.assertTrue(saved["persisted_verified"]); self.assertEqual(saved["reuse_scope"],"general_preference")
+        with profile.connect() as db:
+            row=db.execute("SELECT reuse_scope,auto_reuse,confirmed,profile_version FROM application_answers WHERE question_key=?",("custom:"+key,)).fetchone()
+        self.assertEqual(tuple(row[:3]),("general_preference",1,1)); self.assertTrue(row["profile_version"])
+        profile.revoke_application_answer(key)
+        with profile.connect() as db:
+            row=db.execute("SELECT reuse_scope,auto_reuse,confirmed,revoked_at FROM application_answers WHERE question_key=?",("custom:"+key,)).fetchone()
+            history=db.execute("SELECT event FROM application_answer_history WHERE question_key=?",("custom:"+key,)).fetchall()
+        self.assertEqual(tuple(row[:3]),("none",0,0)); self.assertIsNotNone(row["revoked_at"])
+        self.assertIn("answer_revoked",[item[0] for item in history])
+
+    def test_sensitive_answers_are_encrypted_and_reuse_is_rejected(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
+            profile.save_application_answer("work-auth",profile.AnswerUpdate(question="Are you legally authorized to work in the United States?",answer="Yes",confirmed=True,reuse_scope="matching_jobs"))
+        saved=profile.save_application_answer("work-auth",profile.AnswerUpdate(question="Are you legally authorized to work in the United States?",answer="Yes",confirmed=True,sensitive=True,reuse_scope="none"))
+        self.assertTrue(saved["persisted_verified"])
+        with profile.connect() as db:
+            row=db.execute("SELECT answer,answer_encrypted,auto_reuse,sensitivity_classification FROM application_answers WHERE question_key='custom:work-auth'").fetchone()
+        self.assertEqual(row["answer"],""); self.assertTrue(row["answer_encrypted"]); self.assertEqual(row["auto_reuse"],0)
+
+    def test_legacy_sensitive_plaintext_is_migrated_to_ciphertext(self):
+        with profile.connect() as db:
+            db.execute("INSERT INTO application_answers(user_id,resume_id,question_key,question_text,answer,sensitive,confirmed,created_at,updated_at) VALUES(?,?,?,?,?,1,1,'now','now')",
+                       (USER,"r1","legacy-sensitive","Work authorization","private synthetic answer"))
+        profile.initialize()
+        with profile.connect() as db:
+            row=db.execute("SELECT answer,answer_encrypted FROM application_answers WHERE question_key='legacy-sensitive'").fetchone()
+        self.assertEqual(row["answer"],""); self.assertTrue(row["answer_encrypted"])
+        self.assertNotIn("private synthetic answer",row["answer_encrypted"])
+
+    def test_conflicting_confirmed_answers_for_same_reuse_scope_are_not_silently_overwritten(self):
+        from fastapi import HTTPException
+        profile.save_application_answer("availability-a",profile.AnswerUpdate(question="When can you start?",answer="June 1",confirmed=True,reuse_scope="matching_jobs"))
+        with self.assertRaises(HTTPException) as error:
+            profile.save_application_answer("availability-b",profile.AnswerUpdate(question="What is your earliest available start date?",answer="July 1",confirmed=True,reuse_scope="matching_jobs"))
+        self.assertEqual(error.exception.status_code,409)
+
+    def test_job_specific_answer_requires_a_saved_application_on_active_resume(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as error:
+            profile.save_application_answer("job-answer",profile.AnswerUpdate(question="What notice period do you need?",answer="Two weeks",confirmed=True,reuse_scope="job_specific",scope_job_key="missing-job"))
+        self.assertEqual(error.exception.status_code,404)
+
+    def test_job_specific_eligibility_answer_invalidates_only_its_job(self):
+        with profile.connect() as db:
+            db.execute("CREATE TABLE applications(id TEXT,user_id TEXT,job_key TEXT,resume_id TEXT)")
+            db.execute("INSERT INTO applications VALUES('a1',?,?,?)",(USER,"job-one","r1"))
+            db.execute("CREATE TABLE job_match_results(user_id TEXT,resume_id TEXT,job_key TEXT,status TEXT,freshness_status TEXT)")
+            db.executemany("INSERT INTO job_match_results VALUES(?,? ,?,'completed','current')",[(USER,"r1","job-one"),(USER,"r1","job-two")])
+            db.execute("CREATE TABLE application_preparation_authorizations(user_id TEXT,job_key TEXT,revoked_at TEXT)")
+            db.executemany("INSERT INTO application_preparation_authorizations VALUES(?,?,NULL)",[(USER,"job-one"),(USER,"job-two")])
+        profile.save_application_answer("relocate-boston",profile.AnswerUpdate(
+            question="Would you relocate to Boston?",answer="Yes",confirmed=True,reuse_scope="job_specific",scope_job_key="job-one"))
+        with profile.connect() as db:
+            freshness={row["job_key"]:row["freshness_status"] for row in db.execute("SELECT job_key,freshness_status FROM job_match_results")}
+            auth={row["job_key"]:row["revoked_at"] for row in db.execute("SELECT job_key,revoked_at FROM application_preparation_authorizations")}
+        self.assertEqual(freshness,{"job-one":"stale","job-two":"current"})
+        self.assertIsNotNone(auth["job-one"]); self.assertIsNone(auth["job-two"])
+        with profile.connect() as db:
+            db.execute("UPDATE job_match_results SET freshness_status='current'")
+            db.execute("UPDATE application_preparation_authorizations SET revoked_at=NULL")
+        profile.revoke_application_answer("relocate-boston")
+        with profile.connect() as db:
+            freshness={row["job_key"]:row["freshness_status"] for row in db.execute("SELECT job_key,freshness_status FROM job_match_results")}
+            auth={row["job_key"]:row["revoked_at"] for row in db.execute("SELECT job_key,revoked_at FROM application_preparation_authorizations")}
+        self.assertEqual(freshness,{"job-one":"stale","job-two":"current"})
+        self.assertIsNotNone(auth["job-one"]); self.assertIsNone(auth["job-two"])
+
 
 if __name__ == "__main__":
     unittest.main()
