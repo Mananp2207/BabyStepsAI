@@ -386,7 +386,9 @@ def _confirmed_candidate_skills():
         resume = db.execute("SELECT id FROM resumes WHERE user_id=? AND active=1 ORDER BY created_at DESC LIMIT 1", (USER,)).fetchone() if resume_table else None
         verification = db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE user_id=? AND resume_id=?", (USER,resume["id"])).fetchone() if resume and verification_table else None
         answer_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_answers'").fetchone()
-        answers = db.execute("""SELECT answer FROM application_answers WHERE user_id=? AND resume_id=?
+        answer_columns={column[1] for column in db.execute("PRAGMA table_info(application_answers)")} if answer_table else set()
+        question_select="question_text" if "question_text" in answer_columns else "'' AS question_text"
+        answers = db.execute(f"""SELECT {question_select},answer FROM application_answers WHERE user_id=? AND resume_id=?
             AND question_key='technical_skills' AND confirmed=1 AND sensitive=0 AND revoked_at IS NULL""", (USER,resume["id"])).fetchall() if resume and answer_table else []
     skills = []
     if verification:
@@ -401,7 +403,11 @@ def _confirmed_candidate_skills():
         except (TypeError, ValueError, RuntimeError, json.JSONDecodeError):
             pass
     for row in answers:
-        skills.extend(re.split(r"[,;\n]", str(row["answer"] or "")))
+        try:
+            from candidate_verification import validate_application_answer
+            value=validate_application_answer(row["question_text"] or "Technical skills",row["answer"])
+        except (ImportError,ValueError):continue
+        skills.extend(re.split(r"[,;\n]",str(value or "")))
     return list(dict.fromkeys(value.strip() for value in skills if isinstance(value, str) and value.strip()))
 
 
@@ -1719,7 +1725,7 @@ def employer_discovery_run_status(run_id: str, request: Request):
 @router.get("/employers", response_class=HTMLResponse)
 def employer_sources_page(request: Request):
     _require_local_admin(request)
-    return HTMLResponse(EMPLOYER_PAGE)
+    return HTMLResponse(apply_ui_theme(EMPLOYER_PAGE))
 
 
 def register_employer_sources(payload: EmployerImportRequest):

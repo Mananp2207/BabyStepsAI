@@ -1,4 +1,5 @@
 import json
+import inspect
 import os
 import sqlite3
 import sys
@@ -6,6 +7,7 @@ import concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -233,6 +235,53 @@ class ApplicationAgentTests(unittest.TestCase):
         if path=="/api/applications": return app_agent.list_applications()
         if path=="/api/applications/progress": return app_agent.application_progress()
         if path=="/api/applications/saved-jobs": return app_agent.list_saved_application_jobs()
+
+    def _save_evidence_review_fixture(self, description, *, years=0):
+        key="review-authentic-"+str(time.time_ns())
+        with app_agent.connect() as db:
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source,description) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (USER,key,"Authentic","New Grad Software Engineer","New York, New York, United States",
+                 "https://job-boards.greenhouse.io/authenticinsurance/jobs/4114318009","2026-02-16","","eligible","","",
+                 "Official company posting",description))
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+        profile_data={"education":[{"degree":"B.S.","major":"Computer Science","graduation_date":"2026-12"}],
+            "graduation_date":"2026-12","technical_skills":["Python"],
+            "projects":[{"name":"Verified web application","description":"Built a web application with a React frontend and implemented backend API services."}],
+            "dated_software_experience_months":years}
+        prefs={"roles":["Software Engineer"],"levels":["New Graduate"],"employment_types":["Full-time"],
+            "location":"","relocation_preference":"anywhere","work_arrangement":"Any"}
+        result=matcher.MatchResult.model_validate({
+            "classification":"needs_review","match_score":70,"explanation":"Candidate facts need review.",
+            "strengths":[],"gaps":[],"missing_information":["Employment type is not provided in Greenhouse metadata."],
+            "required_skills":[],
+            "preferred_skills":[],"required_experience":[],"preferred_experience":[],
+            "education_requirements":[],"preferred_education_requirements":[],
+            "education_assessment":"Degree evidence is available.","gpa_assessment":"No GPA stated.","graduation_assessment":"Graduation evidence is available.",
+            "experience_assessment":"No years threshold stated.","experience_level_assessment":"New graduate role.",
+            "location_assessment":"New York is compatible.",
+            "employment_type_assessment":"The posting does not specify employment type; the saved full-time preference remains unverified.",
+            "evidence_consistency":["Bachelors degree in Computer Science, graduation date 2026-12",
+                "Experience in software engineering through projects and team project"]})
+        stamp=matcher.now()
+        with app_agent.connect() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS job_match_result_history(history_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT,job_key TEXT,resume_id TEXT,archived_at TEXT,reason TEXT,snapshot_json TEXT)")
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',70,?,NULL,?,?,?,?,?,?,'current')""",
+                (USER,key,"r1",result.model_dump_json(),stamp,stamp,matcher.profile_fingerprint(profile_data,"r1"),
+                 matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
+        return key,profile_data,prefs
+
+    def _evidence_review_request(self,key,profile_data,prefs,**changes):
+        with app_agent.connect() as db:
+            row=db.execute("SELECT * FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id='r1'",(USER,key)).fetchone()
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+        request={"match_updated_at":row["updated_at"],"profile_fingerprint":matcher.profile_fingerprint(profile_data,"r1"),
+            "preferences_fingerprint":matcher.stable_fingerprint(prefs),"job_fingerprint":matcher.job_fingerprint(opening),
+            "matching_engine_version":matcher.MATCHING_ENGINE_VERSION,"accept_unspecified_employment_type":True,
+            "acknowledge_ai_diagnostics":True}
+        request.update(changes)
+        return app_agent.TargetedEligibilityReviewRequest(**request)
 
     def test_end_to_end_local_simple_mock_dry_run_fills_uploads_and_never_submits(self):
         response=self.post("/api/applications/dry-run",json={"job":{"job_key":"mock-simple","company":"Test Co","title":"Software Developer","application_url":"http://127.0.0.1:8000/mock-apps/simple"}})
@@ -623,6 +672,63 @@ class ApplicationAgentTests(unittest.TestCase):
         finally:
             server.shutdown();server.server_close();thread.join(timeout=2);app_agent.ARTIFACTS=old_artifacts
 
+    @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")=="1","Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to launch installed Chromium.")
+    def test_real_chromium_manual_outcome_ui_uses_synthetic_api_and_never_submits(self):
+        synthetic={"id":"synthetic-app-1","job_key":"synthetic:employer:job-1","resume_id":"synthetic-resume",
+            "company":"Synthetic Employer","title":"Synthetic New Grad Engineer","application_url":"https://example.invalid/apply",
+            "source_url":"https://example.invalid/jobs/1","state":"needs_user_input","mode":"dry_run","diagnostic":{"submission_performed":False},
+            "error":None,"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z",
+            "last_updated_at":"2026-10-01T00:00:00Z","last_attempt_at":"2026-10-01T00:00:00Z","attempt_number":1,"attempt_count":1,
+            "action_required_count":0,"action_required_groups":[],"readiness":{"status_label":"Needs Your Input","progress_percent":50,
+                "eligibility":{"status":"Current","reason":"Synthetic only"},"authorization":{"status":"Current","reason":"Synthetic only"},
+                "questions":{"remaining":0,"reason":"No required questions remain."},"documents":{"needed":[],"status":"Resume ready"},
+                "human_actions":{"required":[],"count":0},"browser_compatibility":"Supported","last_checkpoint":"Synthetic checkpoint",
+                "resume_allowed":False,"resume_reason":"Not resumable","retry_allowed":False,"retry_reason":"No retry required",
+                "retry_creates_new_attempt":False,"manual_submission_outcome":"","manual_completion_reported":False}}
+        state={"posts":[],"submission_enabled":False,"requests":[]};errors=[];browser=None
+        self.patch_playwright.stop()
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser=p.chromium.launch(headless=True);page=browser.new_page(viewport={"width":390,"height":844})
+                page.on("pageerror",lambda error:errors.append(str(error)))
+                page.on("request",lambda req:state["requests"].append(req.url))
+                def route_api(route):
+                    path=route.request.url.split("?",1)[0]
+                    if path.endswith("/api/applications"):
+                        body=[synthetic]
+                    elif path.endswith("/api/applications/progress"):
+                        body={"counts":{"needs_user_input":1},"paused":False,"submission_enabled":False,"processing_state":"idle","submission_quota":{"remaining":0}}
+                    elif path.endswith("/api/application-questions/attention"):
+                        body={"groups":[],"technical_groups":[]}
+                    elif path.endswith("/api/applications/saved-jobs"):
+                        body={"results":[]}
+                    elif path.endswith("/manual-outcome"):
+                        payload=json.loads(route.request.post_data or "{}")
+                        state["posts"].append(payload);synthetic["readiness"]["manual_submission_outcome"]=payload.get("outcome","")
+                        body={"saved":True,"verified_by_readback":True,"state":"needs_user_input","submitted_at":None,"submission_enabled":False}
+                    else:body={}
+                    route.fulfill(status=200,content_type="application/json",body=json.dumps(body))
+                page.route("**/api/**",route_api)
+                page.goto("http://127.0.0.1:8000/applications",wait_until="domcontentloaded")
+                card=page.locator(".application-card");card.wait_for()
+                self.assertIn("Synthetic New Grad Engineer",card.inner_text())
+                page.get_by_text("Record a manual application outcome").click()
+                page.get_by_label("Manual application outcome").select_option("submitted_manually")
+                page.get_by_role("checkbox",name="I confirm this report is accurate.").check()
+                page.get_by_role("button",name="Save manual outcome").click()
+                page.get_by_text("Saved and verified.").wait_for()
+                self.assertEqual(state["posts"],[{"outcome":"submitted_manually","confirmed":True,"event_id":state["posts"][0]["event_id"]}])
+                self.assertFalse(state["submission_enabled"])
+                self.assertEqual(synthetic["state"],"needs_user_input")
+                self.assertFalse(any("example.invalid" in url for url in state["requests"]))
+                self.assertEqual(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),True)
+                self.assertFalse(errors,errors)
+        finally:
+            if browser is not None:
+                try:browser.close()
+                except Exception:pass  # The Playwright context manager already closed it on a failed assertion.
+
     def test_imported_official_job_can_reach_existing_mock_dry_run(self):
         import job_search_agent as jobs
         import career_preferences
@@ -770,6 +876,22 @@ class ApplicationAgentTests(unittest.TestCase):
         progress=app_agent.application_progress()
         self.assertEqual(progress["daily_submission_limit"],7)
         self.assertEqual(app_agent.rolling_submission_quota()["limit"],7)
+
+    def test_progress_poll_does_not_rewrite_unchanged_control_timestamp(self):
+        with app_agent.connect() as db:
+            before=db.execute("SELECT paused,daily_limit,submission_enabled,updated_at FROM application_controls WHERE user_id=?",(USER,)).fetchone()
+        app_agent.application_progress()
+        with app_agent.connect() as db:
+            after=db.execute("SELECT paused,daily_limit,submission_enabled,updated_at FROM application_controls WHERE user_id=?",(USER,)).fetchone()
+        self.assertEqual(tuple(after),tuple(before))
+
+    def test_initialize_does_not_rewrite_unchanged_application_control_timestamp(self):
+        with app_agent.connect() as db:
+            before=db.execute("SELECT paused,daily_limit,submission_enabled,updated_at FROM application_controls WHERE user_id=?",(USER,)).fetchone()
+        app_agent.initialize()
+        with app_agent.connect() as db:
+            after=db.execute("SELECT paused,daily_limit,submission_enabled,updated_at FROM application_controls WHERE user_id=?",(USER,)).fetchone()
+        self.assertEqual(tuple(after),tuple(before))
 
     def test_rolling_quota_is_atomic_and_uses_confirmed_successes_only(self):
         with app_agent.connect() as db:
@@ -1010,6 +1132,168 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertIn("relevant technical project",written)
         self.assertIn('maxlength="600"',written)
 
+    def test_phase134_dashboard_has_readiness_recovery_and_stable_grouped_question_ui(self):
+        page=app_agent.applications_page().body.decode("utf-8")
+        for text in ("Eligibility freshness","Authorization freshness","Required questions","Documents","Human action",
+                     "Browser compatibility","Resume Dry Run","Retry Dry Run","retry_allowed","resume_allowed",
+                     "application-readiness","max-width:420px","phase134RefreshInFlight","phase134AppSignatures",
+                     "phase134QuestionSignature","Saving and verifying answer and reuse scope",
+                     "persisted.existing_answers","No dry run was resumed","phase134QuestionDirty",
+                     "if(!force&&phase134QuestionDirty)return","setTimeout(()=>refresh(),0);setInterval(()=>refresh(),15000)",
+                     "answer:answer.value.trim()","dataset.saving==='true'","manual_employer_action",
+                     "question-job","job-select-list","This acknowledgment or verification is specific to the employer",
+                     "entered form values are not carried over","Open official employer form","Save manual outcome"):
+            self.assertIn(text,page)
+        self.assertIn("details[open]",page)
+        self.assertIn("document.activeElement?.closest('#question-attention')",page)
+        self.assertIn("Historical submission record",page)
+        self.assertNotIn("submitted:'Submitted'",page)
+        self.assertIn("Review recovery in Application history",page)
+        self.assertNotIn("retryButton=node('button','primary','Retry dry run')",page)
+
+    def test_manual_outcome_is_confirmed_read_back_and_never_changes_submission_state(self):
+        resume,_,_=app_agent._candidate()
+        job={"job_key":"local-mock:manual-outcome","company":"Synthetic Employer","title":"Synthetic Engineer",
+             "application_url":"http://127.0.0.1:8000/mock-apps/simple"}
+        app_id,_,_=app_agent._create(job,resume)
+        app_agent._update(app_id,"failed",{"message":"Synthetic failure","submission_performed":False})
+        before=next(item for item in app_agent.list_applications() if item["id"]==app_id)
+        with self.assertRaises(HTTPException) as missing_confirmation:
+            app_agent.record_manual_submission_outcome(app_id,app_agent.ManualSubmissionOutcomeRequest(
+                outcome="submitted_manually",confirmed=False,event_id="event-1"))
+        self.assertEqual(missing_confirmation.exception.status_code,422)
+        result=app_agent.record_manual_submission_outcome(app_id,app_agent.ManualSubmissionOutcomeRequest(
+            outcome="submitted_manually",confirmed=True,event_id="event-1"))
+        self.assertTrue(result["verified_by_readback"])
+        self.assertFalse(result["submission_enabled"])
+        repeated=app_agent.record_manual_submission_outcome(app_id,app_agent.ManualSubmissionOutcomeRequest(
+            outcome="submitted_manually",confirmed=True,event_id="event-1"))
+        self.assertTrue(repeated["verified_by_readback"])
+        with self.assertRaises(HTTPException) as conflicting_event:
+            app_agent.record_manual_submission_outcome(app_id,app_agent.ManualSubmissionOutcomeRequest(
+                outcome="not_submitted",confirmed=True,event_id="event-1"))
+        self.assertEqual(conflicting_event.exception.status_code,409)
+        with app_agent.connect() as db:
+            stored=db.execute("SELECT state,submitted_at,diagnostic_json FROM applications WHERE id=?",(app_id,)).fetchone()
+            attempt=db.execute("SELECT diagnostic_json FROM application_attempts WHERE application_id=?",(app_id,)).fetchone()
+            event=db.execute("SELECT outcome,confirmed_by_applicant,attempt_number FROM manual_submission_events WHERE event_id='event-1'").fetchone()
+        self.assertEqual(stored["state"],before["state"])
+        self.assertEqual(stored["submitted_at"],before.get("submitted_at"))
+        self.assertFalse(json.loads(stored["diagnostic_json"])["submission_performed"])
+        self.assertEqual(event["outcome"],"submitted_manually")
+        self.assertTrue(event["confirmed_by_applicant"])
+        self.assertEqual(event["attempt_number"],1)
+        readiness=app_agent._readiness_for_application({**before,"diagnostic":json.loads(stored["diagnostic_json"])},app_agent._candidate())
+        self.assertTrue(readiness["manual_completion_reported"])
+        self.assertFalse(readiness["retry_allowed"])
+
+    def test_manual_outcome_survives_dry_run_diagnostic_updates(self):
+        resume,_,_=app_agent._candidate()
+        job={"job_key":"local-mock:manual-preserved","company":"Synthetic Employer","title":"Synthetic Engineer",
+             "application_url":"http://127.0.0.1:8000/mock-apps/simple"}
+        app_id,_,_=app_agent._create(job,resume)
+        app_agent.record_manual_submission_outcome(app_id,app_agent.ManualSubmissionOutcomeRequest(
+            outcome="needs_follow_up",confirmed=True,event_id="event-preserve"))
+        app_agent._update(app_id,"opening",{"phase":"navigation","submission_performed":False})
+        item=next(item for item in app_agent.list_applications() if item["id"]==app_id)
+        self.assertEqual(item["diagnostic"]["manual_submission_outcome"],"needs_follow_up")
+        self.assertEqual(len(item["manual_submission_history"]),1)
+
+    def test_manual_outcome_history_survives_a_new_retry_attempt(self):
+        resume,_,_=app_agent._candidate()
+        job={"job_key":"local-mock:manual-retry","company":"Synthetic Employer","title":"Synthetic Engineer",
+             "application_url":"http://127.0.0.1:8000/mock-apps/simple"}
+        app_id,_,_=app_agent._create(job,resume)
+        app_agent._update(app_id,"failed",{"message":"Synthetic prior failure","submission_performed":False})
+        app_agent.record_manual_submission_outcome(app_id,app_agent.ManualSubmissionOutcomeRequest(
+            outcome="needs_follow_up",confirmed=True,event_id="event-retry"))
+        retried=app_agent.retry_one(app_id)
+        self.assertTrue(retried["new_attempt_created"])
+        item=next(item for item in app_agent.list_applications() if item["id"]==app_id)
+        self.assertEqual(item["diagnostic"]["manual_submission_outcome"],"needs_follow_up")
+        attempts=app_agent.list_application_attempts(app_id)
+        self.assertEqual(len(attempts),2)
+        self.assertTrue(any(event["event_id"]=="event-retry" for event in attempts[1]["manual_outcomes"]))
+
+    def test_safe_resume_reuses_existing_attempt_and_never_calls_retry(self):
+        resume,_,_=app_agent._candidate()
+        job={"job_key":"local-mock:safe-resume","company":"BabyStepsAI local test","title":"Synthetic Engineer",
+             "application_url":"http://127.0.0.1:8000/mock-apps/simple"}
+        app_id,_,_=app_agent._create(job,resume)
+        app_agent._update(app_id,"paused",{})
+        before=len(app_agent.list_application_attempts(app_id))
+        result=app_agent.resume_one(app_id)
+        self.assertTrue(result["resumed_existing_attempt"])
+        self.assertFalse(result["new_attempt_created"])
+        self.assertEqual(len(app_agent.list_application_attempts(app_id)),before)
+        self.assertEqual(result["status"],"queued")
+
+    def test_application_api_readiness_is_derived_from_saved_attempt(self):
+        resume,_,_=app_agent._candidate()
+        job={"job_key":"local-mock:readiness","company":"BabyStepsAI local test","title":"Synthetic Engineer",
+             "application_url":"http://127.0.0.1:8000/mock-apps/simple"}
+        app_id,_,_=app_agent._create(job,resume)
+        app_agent._update(app_id,"needs_user_input",{"unanswered_fields":["When can you start?"]})
+        item=next(row for row in app_agent.list_applications() if row["id"]==app_id)
+        self.assertEqual(item["status_label"],"Needs Your Input")
+        self.assertEqual(item["readiness"]["questions"]["remaining"],1)
+        self.assertFalse(item["readiness"]["resume_allowed"])
+        self.assertFalse(item["readiness"]["retry_allowed"])
+        self.assertIn("Resolve",item["readiness"]["retry_reason"])
+
+    def test_application_recovery_readiness_distinguishes_resume_retry_and_human_actions(self):
+        resume,candidate,answers=app_agent._candidate()
+        local_url="http://127.0.0.1:8000/mock-apps/simple"
+        common={"id":"recovery-test","job_key":"local-mock:recovery-test","resume_id":resume["id"],
+            "application_url":local_url,"diagnostic":{}}
+        paused=app_agent._readiness_for_application({**common,"state":"paused"},(resume,candidate,answers))
+        self.assertTrue(paused["resume_allowed"]);self.assertFalse(paused["retry_allowed"])
+        progressed=app_agent._readiness_for_application({**common,"state":"paused","diagnostic":{"phase":"form_filling","steps":1,"filled_fields":[{"field":"Email"}]}},(resume,candidate,answers))
+        self.assertFalse(progressed["resume_allowed"]);self.assertTrue(progressed["retry_allowed"])
+        self.assertIn("new attempt",progressed["resume_reason"])
+        interrupted=app_agent._readiness_for_application({**common,"state":"paused","diagnostic":{"interrupted":True}},(resume,candidate,answers))
+        self.assertFalse(interrupted["resume_allowed"]);self.assertTrue(interrupted["retry_allowed"])
+        unresolved=app_agent._readiness_for_application({**common,"state":"needs_user_input","diagnostic":{"unanswered_fields":["Country is required."]}},(resume,candidate,answers))
+        self.assertFalse(unresolved["resume_allowed"]);self.assertFalse(unresolved["retry_allowed"])
+        unsupported=app_agent._readiness_for_application({**common,"state":"unsupported"},(resume,candidate,answers))
+        self.assertFalse(unsupported["retry_allowed"])
+
+    def test_unsupported_application_cannot_be_retried_without_new_compatibility_evidence(self):
+        resume,_,_=app_agent._candidate()
+        app_id,_,_=app_agent._create({"job_key":"unsupported-no-retry","company":"Test","title":"Role",
+            "application_url":"http://127.0.0.1:8000/mock-apps/simple"},resume)
+        app_agent._update(app_id,"unsupported",{"message":"Unsupported control"})
+        with self.assertRaises(HTTPException) as blocked:app_agent.retry_one(app_id)
+        self.assertEqual(blocked.exception.status_code,409)
+        self.assertEqual(len(app_agent.list_application_attempts(app_id)),1)
+
+    def test_dashboard_exposes_targeted_evidence_review_and_no_ai_reassessment(self):
+        page=app_agent.APPLICATIONS_PAGE
+        self.assertIn("Resolve eligibility evidence review",page)
+        self.assertIn("employment type remains unknown",page)
+        self.assertIn("AI-authored diagnostics (not posting evidence)",page)
+        self.assertIn("Reassess saved evidence without AI",page)
+        self.assertIn("/resolve-evidence-review",page)
+        self.assertIn("/deterministic-reassessment",page)
+        self.assertIn("phase133HasActiveInteraction",page)
+        self.assertIn("phase133SavedJobsSignature",page)
+        self.assertIn("phase133SavedJobsEpoch",page)
+        self.assertIn("phase133RestoreSavedJobState",page)
+        self.assertIn("if(phase133SavedJobsRendering)return",page)
+        self.assertGreaterEqual(page.count("epoch!==phase133SavedJobsEpoch"),2)
+        self.assertIn("signature===phase133SavedJobsSignature",page)
+        self.assertIn("function readableApiError",page)
+        self.assertIn("details[open]",page)
+        self.assertIn("Confirm review",page)
+        self.assertIn("targetedReviewRequired",page)
+        self.assertIn("persisted_verified",page)
+        self.assertNotIn("setInterval(refresh,3000)",page)
+
+    def test_dashboard_backend_exposes_stale_review_blocker_and_saved_review_status(self):
+        source=inspect.getsource(app_agent.list_saved_application_jobs)
+        self.assertIn("The saved assessment is stale. Reassess saved evidence without AI before continuing.",source)
+        self.assertIn('"targeted_evidence_review"',source)
+
     def test_prepare_rejects_invalid_saved_url_before_browser(self):
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as caught:
@@ -1061,7 +1345,9 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code,409)
         queue=app_agent.enqueue_saved_jobs(app_agent.ApplicationQueueRequest(job_keys=["saved-review","saved-unmatched"]))
         self.assertEqual(queue["queued"],0)
-        self.assertTrue(app_agent.review_saved_job_eligibility("saved-review",app_agent.EligibilityReviewRequest(reviewed=True))["reviewed"])
+        saved_review=app_agent.review_saved_job_eligibility("saved-review",app_agent.EligibilityReviewRequest(reviewed=True))
+        self.assertTrue(saved_review["reviewed"])
+        self.assertTrue(saved_review["persisted_verified"])
         with app_agent.connect() as db: db.execute("UPDATE job_match_results SET updated_at='2099-10-18T12:00:00+00:00' WHERE user_id=? AND job_key='saved-review'",(USER,))
         self.assertFalse(next(x for x in app_agent.list_saved_application_jobs()["results"] if x["job_key"]=="saved-review")["preparation_allowed"])
         app_agent.review_saved_job_eligibility("saved-review",app_agent.EligibilityReviewRequest(reviewed=True))
@@ -1074,6 +1360,170 @@ class ApplicationAgentTests(unittest.TestCase):
         app_agent.review_saved_job_eligibility("saved-review",app_agent.EligibilityReviewRequest(reviewed=True))
         with app_agent.connect() as db:
             self.assertEqual(app_agent._eligibility_gate(db,"saved-review","r1")[0],"needs_review")
+
+    def test_targeted_evidence_review_resolves_only_acknowledged_non_mandatory_uncertainty(self):
+        description=("Requirements: B.S. or M.S. in Computer Science or a related field (recently graduated or graduating "
+            "Fall 2026/Spring 2027). Experience building web applications through personal projects, coursework, or internships. "
+            "Ability to work on-site in our New York office. Nice to Haves: Prior internship experience in fast-paced environments. "
+            "Our (FTE) benefits include health coverage and 401(k).")
+        key,profile_data,prefs=self._save_evidence_review_fixture(description)
+        request=self._evidence_review_request(key,profile_data,prefs)
+        with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",profile_data)), \
+             patch.object(matcher,"preferences",return_value=prefs), \
+             patch.object(matcher,"assess_job",return_value=(True,"",["Employment type is not provided in Greenhouse metadata."])), \
+             patch.object(matcher,"analyze_with_ollama",side_effect=AssertionError("review must not call Ollama")):
+            with self.assertRaises(HTTPException) as missing:
+                app_agent.resolve_saved_job_evidence_review(key,app_agent.TargetedEligibilityReviewRequest(**{
+                    **request.model_dump(),"accept_unspecified_employment_type":False}))
+            self.assertEqual(missing.exception.status_code,422)
+            self.assertIn("employment type remains unknown",missing.exception.detail)
+            resolved=app_agent.resolve_saved_job_evidence_review(key,request)
+            with app_agent.connect() as db:
+                gate=app_agent._eligibility_gate(db,key,"r1")
+            listed=next(item for item in app_agent.list_saved_application_jobs(q="Authentic")["results"] if item["job_key"]==key)
+            self.assertEqual(gate[0],"potential_match")
+            self.assertTrue(listed["targeted_evidence_review"]["recorded"])
+            self.assertFalse(listed["preparation_allowed"])
+            changed_profile={**profile_data,"graduation_date":"2025-06"}
+            with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",changed_profile)):
+                with app_agent.connect() as db: stale_gate=app_agent._eligibility_gate(db,key,"r1")
+            self.assertEqual(stale_gate[0],"not_analyzed")
+        self.assertEqual(resolved["classification"],"potential_match")
+        self.assertEqual(resolved["employment_type"],"unknown")
+        self.assertFalse(resolved["application_preparation_authorized"])
+        self.assertTrue(resolved["persisted_verified"])
+        with app_agent.connect() as db:
+            saved=db.execute("SELECT classification,result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id='r1'",(USER,key)).fetchone()
+            event=db.execute("SELECT decision,profile_fingerprint,preferences_fingerprint,job_fingerprint,matching_engine_version,details_json FROM eligibility_evidence_reviews WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
+            apps=db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0]
+            history=db.execute("SELECT COUNT(*) FROM job_match_result_history WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0]
+        data=json.loads(saved["result_json"])
+        self.assertEqual(saved["classification"],"potential_match")
+        self.assertIn("does not specify employment type",data["employment_type_assessment"])
+        self.assertTrue(data["ai_evidence_diagnostics"])
+        self.assertEqual(event["decision"],"accepted_non_mandatory_uncertainty")
+        self.assertEqual(event["matching_engine_version"],matcher.MATCHING_ENGINE_VERSION)
+        self.assertEqual(apps,0)
+        self.assertEqual(history,1)
+
+    def test_targeted_review_rejects_stale_fingerprints(self):
+        key,profile_data,prefs=self._save_evidence_review_fixture("Requirements: a relevant degree.")
+        request=self._evidence_review_request(key,profile_data,prefs,profile_fingerprint="f"*64)
+        with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",profile_data)), \
+             patch.object(matcher,"preferences",return_value=prefs):
+            with self.assertRaises(HTTPException) as caught:
+                app_agent.resolve_saved_job_evidence_review(key,request)
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("stale",caught.exception.detail)
+
+    def test_targeted_review_cannot_resolve_unmapped_mandatory_posting_items(self):
+        description=("<p><strong>Requirements</strong></p><ul>"
+            "<li>B.S. or M.S. in Computer Science or a related field (recently graduated or graduating Fall 2026/Spring 2027)</li>"
+            "<li>Experience building web applications (personal projects, coursework, or internships)</li>"
+            "<li>Comfort working across the stack; curious about frontend and backend</li>"
+            "<li>Strong fundamentals in data structures, algorithms, and software design</li>"
+            "<li>Ability to work on-site in our New York office</li></ul>")
+        key,profile_data,prefs=self._save_evidence_review_fixture(description)
+        request=self._evidence_review_request(key,profile_data,prefs)
+        with app_agent.connect() as db:
+            result=json.loads(db.execute(
+                "SELECT result_json FROM job_match_results WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0])
+        unmapped=app_agent._unmapped_required_posting_items(description,result)
+        self.assertEqual(len(unmapped),4)
+        self.assertTrue(any("web applications" in item for item in unmapped))
+        with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",profile_data)), \
+             patch.object(matcher,"preferences",return_value=prefs):
+            with self.assertRaises(HTTPException) as caught:
+                app_agent.resolve_saved_job_evidence_review(key,request)
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("mandatory fact remains unresolved",caught.exception.detail)
+        with app_agent.connect() as db:
+            saved=db.execute("SELECT classification FROM job_match_results WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
+            review_count=db.execute("SELECT COUNT(*) FROM eligibility_evidence_reviews WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0]
+            application_count=db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0]
+        self.assertEqual(saved["classification"],"needs_review")
+        self.assertEqual(review_count,0)
+        self.assertEqual(application_count,0)
+
+    def test_technical_evidence_answer_requires_specific_confirmation_and_reassesses_without_ai(self):
+        key,profile_data,prefs=self._save_evidence_review_fixture(
+            "Requirements: Strong fundamentals in data structures, algorithms, and software design.")
+        question=("Technical evidence: Have you completed coursework or implemented projects covering data structures, "
+                  "algorithms, and software design? Name the courses or describe the specific work.")
+        with app_agent.connect() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+            result=json.loads(db.execute("SELECT result_json FROM job_match_results WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0])
+            result["technical_qualifications"]=[{"requirement":"Strong fundamentals in data structures, algorithms, and software design",
+                "category":"data_structures_algorithms_design","requiredness":"required","status":"needs_review",
+                "missing_question":question,"candidate_evidence":[],"posting_evidence":["Strong fundamentals in data structures, algorithms, and software design"]}]
+            result["missing_information"]=[question]
+            db.execute("UPDATE discovered_openings SET description=? WHERE user_id=? AND job_key=?",
+                ("Requirements: Strong fundamentals in data structures, algorithms, and software design.",USER,key))
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+            db.execute("UPDATE job_match_results SET result_json=?,job_fingerprint=? WHERE user_id=? AND job_key=?",
+                (json.dumps(result),matcher.job_fingerprint(opening),USER,key))
+        request=app_agent.TechnicalEvidenceAnswerRequest(question=question,
+            answer="In coursework I implemented graph traversal algorithms and documented their design tradeoffs.",
+            job_keys=[key],job_key=key,reuse_scope="this_job",confirmed=False)
+        with patch.object(app_agent,"_candidate",return_value=({"id":"r1"},profile_data,{})):
+            with self.assertRaises(HTTPException) as unconfirmed:
+                app_agent.save_technical_evidence_answer(request)
+            self.assertEqual(unconfirmed.exception.status_code,422)
+            with self.assertRaises(HTTPException) as yes_no:
+                app_agent.save_technical_evidence_answer(request.model_copy(update={"answer":"Yes, I have completed these requirements."*2,"confirmed":True}))
+            self.assertEqual(yes_no.exception.status_code,422)
+            with patch.object(matcher,"reassess_saved_match_result",return_value={"classification":"needs_review",
+                    "match":{"technical_qualifications":[{"candidate_evidence":[{"source_ref":"application_answers:custom:technical_dsa"}]}]}}) as reassess:
+                saved=app_agent.save_technical_evidence_answer(request.model_copy(update={"confirmed":True}))
+        self.assertTrue(saved["persisted_verified"])
+        self.assertEqual(saved["reuse_scope"],"job_specific")
+        self.assertFalse(saved["reassessed"][0]["ai_provider_called"])
+        self.assertEqual(reassess.call_count,1)
+        with app_agent.connect() as db:
+            answer=db.execute("SELECT answer,confirmed,reuse_scope,scope_job_key FROM application_answers WHERE question_category='technical_qualification'").fetchone()
+            app_count=db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0]
+            auth_count=db.execute("SELECT COUNT(*) FROM application_preparation_authorizations WHERE user_id=? AND job_key=? AND revoked_at IS NULL",(USER,key)).fetchone()[0]
+        self.assertEqual(answer["answer"],"In coursework I implemented graph traversal algorithms and documented their design tradeoffs.")
+        self.assertEqual((answer["confirmed"],answer["reuse_scope"],answer["scope_job_key"]),(1,"job_specific",key))
+        self.assertEqual(app_count,0);self.assertEqual(auth_count,0)
+
+    def test_targeted_review_cannot_override_missing_gpa_or_confirmed_degree_mismatch(self):
+        base=("Requirements: B.S. or M.S. in Computer Science or related field (graduating Fall 2026/Spring 2027). "
+              "Ability to work on-site in New York. ")
+        for suffix,expected in (("Minimum GPA 3.7/4.0 required.","unresolved"),
+                                ("Basic Qualifications: Master's degree in Computer Science required.","mismatch")):
+            with self.subTest(kind=expected):
+                key,profile_data,prefs=self._save_evidence_review_fixture(base+suffix+" Nice to Haves: Prior internship experience.")
+                request=self._evidence_review_request(key,profile_data,prefs)
+                with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",profile_data)), \
+                     patch.object(matcher,"preferences",return_value=prefs), \
+                     patch.object(matcher,"assess_job",return_value=(True,"",["Employment type is not provided in Greenhouse metadata."])):
+                    with self.assertRaises(HTTPException) as caught:
+                        app_agent.resolve_saved_job_evidence_review(key,request)
+                self.assertEqual(caught.exception.status_code,409)
+                if expected=="mismatch":self.assertIn("mandatory mismatch",caught.exception.detail)
+                else:self.assertIn("mandatory fact remains unresolved",caught.exception.detail)
+
+    def test_generic_eligibility_review_cannot_bypass_targeted_unknown_type_review(self):
+        key,profile_data,prefs=self._save_evidence_review_fixture("Requirements: a relevant degree.")
+        with app_agent.connect() as db:
+            db.execute("UPDATE job_match_results SET result_json=? WHERE user_id=? AND job_key=?",(json.dumps({"ai_evidence_diagnostics":["Model statement"]}),USER,key))
+        with self.assertRaises(HTTPException) as caught:
+            app_agent.review_saved_job_eligibility(key,app_agent.EligibilityReviewRequest(reviewed=True))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("targeted evidence review",caught.exception.detail)
+
+    def test_deterministic_reassessment_endpoint_never_calls_ai(self):
+        key,_,_=self._save_evidence_review_fixture("Requirements: a relevant degree.")
+        with app_agent.connect() as db:
+            stamp=db.execute("SELECT updated_at FROM job_match_results WHERE user_id=? AND job_key=?",(USER,key)).fetchone()["updated_at"]
+        result={"classification":"needs_review","matching_model_version":matcher.MATCHING_ENGINE_VERSION}
+        with patch.object(matcher,"reassess_saved_match_result",return_value=result) as reassess, \
+             patch.object(matcher,"analyze_with_ollama",side_effect=AssertionError("must not call Ollama")):
+            response=app_agent.deterministic_reassess_saved_job(key,app_agent.DeterministicReassessmentRequest(match_updated_at=stamp))
+        reassess.assert_called_once_with(key)
+        self.assertFalse(response["ai_provider_called"])
+        self.assertEqual(response["classification"],"needs_review")
 
     def test_potential_match_with_unresolved_mandatory_evidence_requires_review(self):
         from fastapi import HTTPException
@@ -1330,7 +1780,10 @@ class ApplicationAgentTests(unittest.TestCase):
         with app_agent.connect() as db:
             db.execute("UPDATE applications SET state='failed' WHERE id=?",(app_id,))
             db.execute("UPDATE application_attempts SET state='failed' WHERE application_id=?",(app_id,))
-        app_agent.resume_one(app_id)
+        with self.assertRaises(HTTPException) as wrong_action:
+            app_agent.resume_one(app_id)
+        self.assertEqual(wrong_action.exception.status_code,409)
+        app_agent.retry_one(app_id)
         attempts=app_agent.list_application_attempts(app_id)
         self.assertEqual(len(attempts),2)
         original=next(x for x in attempts if x["attempt_number"]==1)
@@ -1410,7 +1863,7 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(grouped["job_count"],2)
         self.assertEqual(len(grouped["groups"]),1)
         saved=app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(
-            question="When can you start?",answer="June 1",application_ids=["a1","a2"],
+            question="When can you start?",answer="  June 1  \n",application_ids=["a1","a2"],
             reuse_scope="general_preference",confirmed=True))
         self.assertTrue(saved["persisted_verified"])
         self.assertEqual(saved["reuse_scope"],"general_preference")
@@ -1419,6 +1872,76 @@ class ApplicationAgentTests(unittest.TestCase):
             answer=db.execute("SELECT reuse_scope,answer,auto_reuse FROM application_answers WHERE question_category='availability'").fetchone()
         self.assertEqual(states,["needs_user_input","needs_user_input"])
         self.assertEqual(tuple(answer),("general_preference","June 1",1))
+        refreshed=app_agent.grouped_application_questions()["groups"][0]
+        self.assertEqual(refreshed["existing_answer"],"June 1")
+        self.assertEqual(refreshed["existing_answer_scope"],"general_preference")
+
+    def test_grouped_answer_typed_validation_covers_location_contact_date_url_and_boolean(self):
+        invalid=[
+            ("Location (City)","yes"),("Country of residence","no"),
+            ("What is your start date?","sometime soon"),("LinkedIn URL","javascript:alert(1)"),
+            ("Email address","not-an-email"),("Phone number","123"),
+            ("Are you willing to work onsite?","sometimes"),
+        ]
+        for question,value in invalid:
+            with self.subTest(question=question,value=value),self.assertRaises(HTTPException) as caught:
+                app_agent._validate_grouped_answer(question,value)
+            self.assertEqual(caught.exception.status_code,422)
+        valid=[
+            ("Location (City)","San Francisco"),("Country of residence","United States"),
+            ("What is your start date?","2026-06-15"),("LinkedIn URL","https://linkedin.com/in/candidate"),
+            ("Email address","person@example.com"),("Phone number","+1 (415) 555-0199"),
+            ("Are you willing to work onsite?","No"),
+        ]
+        for question,value in valid:
+            with self.subTest(question=question,value=value):
+                self.assertEqual(app_agent._validate_grouped_answer(question,value),value)
+        city_identity=app_agent.canonical_answer_identity("Location (City)")
+        country_identity=app_agent.canonical_answer_identity("Location (Country)")
+        self.assertNotEqual(city_identity[:2],country_identity[:2])
+
+    def test_invalid_historical_city_answer_is_never_reused_by_browser_filler(self):
+        answers={"custom:old-city":{"question":"Location (City)*","answer":"yes","confirmed":True,
+            "auto_reuse":True,"sensitive":False,"category":"location","context":"city",
+            "reuse_scope":"matching_jobs","scope_job_key":""}}
+        value,source=app_agent._answer({"label":"Location (City)*"},{},answers)
+        self.assertIsNone(value);self.assertIsNone(source)
+
+    def test_grouped_dashboard_marks_invalid_legacy_answer_for_correction(self):
+        profile.save_application_answer("legacy-city",profile.AnswerUpdate(question="Location (City)*",
+            answer="San Francisco",confirmed=True,reuse_scope="matching_jobs"))
+        with app_agent.connect() as db:
+            db.execute("UPDATE application_answers SET answer='yes' WHERE question_key='custom:legacy-city'")
+            db.execute("INSERT INTO applications(id,user_id,resume_id,job_key,company,title,application_url,state,diagnostic_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'needs_user_input',?,?,?)",
+                ("legacy-city-app",USER,"r1","saved-simple","Example Co","Engineer","https://example.test/apply",
+                 json.dumps({"unanswered_fields":["Location (City)*"]}),"2026-10-29","2026-10-29"))
+        _,_,candidate_answers=app_agent._candidate()
+        self.assertFalse(candidate_answers["custom:legacy-city"]["answer_valid"])
+        self.assertFalse(candidate_answers["custom:legacy-city"]["auto_reuse"])
+        group=next(item for item in app_agent.grouped_application_questions()["groups"] if item["canonical_category"]=="location")
+        self.assertTrue(group["requires_correction"])
+        self.assertTrue(group["answer_conflict"])
+        self.assertEqual(group["existing_answers"],[])
+        self.assertEqual(group["existing_answer"],"")
+        self.assertIn("not a yes/no response",group["invalid_saved_answers"][0]["validation_issue"])
+
+    def test_employer_acknowledgments_are_manual_and_never_saved_as_reusable_answers(self):
+        question="Please acknowledge that all information provided is accurate."
+        with app_agent.connect() as db:
+            db.execute("INSERT INTO applications(id,user_id,resume_id,job_key,company,title,application_url,state,diagnostic_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'needs_user_input',?,?,?)",
+                       ("ack-1",USER,"r1","ack-job","Employer","Engineer","https://example.test/apply",json.dumps({"unanswered_fields":[question]}),"2026-01-01","2026-01-01"))
+        group=app_agent.grouped_application_questions()["groups"][0]
+        self.assertEqual(group["canonical_category"],"employer_confirmation")
+        self.assertTrue(group["manual_employer_action"])
+        self.assertIn("employer form",group["sensitivity_label"])
+        with self.assertRaises(HTTPException) as rejected:
+            app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(
+                question=question,answer="I acknowledge",application_ids=["ack-1"],
+                reuse_scope="this_job",job_key="ack-job",confirmed=True))
+        self.assertEqual(rejected.exception.status_code,422)
+        with app_agent.connect() as db:
+            count=db.execute("SELECT COUNT(*) FROM application_answers WHERE question_category='employer_confirmation'").fetchone()[0]
+        self.assertEqual(count,0)
 
     def test_grouped_answer_rejects_sensitive_global_reuse_and_conflicting_questions(self):
         from fastapi import HTTPException
@@ -1437,6 +1960,9 @@ class ApplicationAgentTests(unittest.TestCase):
             sensitive_row=db.execute("SELECT answer,answer_encrypted,reuse_scope,scope_job_key,auto_reuse FROM application_answers WHERE sensitive=1 AND question_category='work_authorization'").fetchone()
         self.assertEqual(sensitive_row["answer"],""); self.assertTrue(sensitive_row["answer_encrypted"])
         self.assertEqual((sensitive_row["reuse_scope"],sensitive_row["scope_job_key"],sensitive_row["auto_reuse"]),("job_specific","saved-simple",0))
+        sensitive_group=next(g for g in app_agent.grouped_application_questions()["groups"] if g["canonical_category"]=="work_authorization")
+        self.assertTrue(sensitive_group["sensitive"]); self.assertEqual(sensitive_group["existing_answer"],"")
+        self.assertTrue(sensitive_group["existing_answer_sensitive"])
         with self.assertRaises(HTTPException) as conflict:
             app_agent.save_grouped_application_answer(app_agent.GroupedAnswerRequest(question="When can you start?",answer="June 1",application_ids=["a1","a2"],reuse_scope="matching_jobs",confirmed=True))
         self.assertEqual(conflict.exception.status_code,409)

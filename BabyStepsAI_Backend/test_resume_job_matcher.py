@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import job_search_agent as jobs
 import resume_job_matcher as matcher
+from job_relevance import extract_technical_qualification_requirements
 
 
 def valid_result(**changes):
@@ -79,6 +80,111 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(status, "user_reviewed")
         self.assertEqual(profile["technical_skills"], ["Python"])
 
+    def test_technical_requirements_respect_required_and_preferred_sections(self):
+        extracted=extract_technical_qualification_requirements("""<p><strong>Requirements</strong></p><ul>
+        <li>Experience building web applications</li><li>Comfort working across the stack, frontend and backend</li>
+        <li>Strong fundamentals in data structures, algorithms, and software design</li></ul>
+        <p><strong>Nice to Haves</strong></p><ul><li>Experience with cloud platforms</li></ul>""")
+        self.assertEqual([item["requiredness"] for item in extracted],["required"]*3+["preferred"])
+        self.assertEqual(extracted[0]["category"],"web_application_experience")
+        self.assertEqual(extracted[1]["category"],"frontend_backend")
+        self.assertEqual(extracted[2]["category"],"data_structures_algorithms_design")
+        self.assertEqual(extracted[3]["category"],"cloud_infrastructure")
+
+    def test_verified_projects_support_web_app_and_frontend_backend_across_projects(self):
+        description=("Requirements: Experience building web applications. "
+            "Comfort working across the stack; curious about both frontend and backend.")
+        profile={"projects":[{"description":"Developed a web application and implemented its frontend user interface."},
+                              {"description":"Built backend API services and server-side request handling."}]}
+        assessments=matcher._technical_qualification_assessments(description,profile)
+        self.assertEqual([item["status"] for item in assessments],["met","met"])
+        self.assertTrue(all(item["candidate_evidence"] for item in assessments))
+        self.assertTrue(all(item["candidate_evidence"][0]["confirmation_status"]=="confirmed" for item in assessments))
+
+    def test_technology_list_without_project_narrative_is_not_implementation_evidence(self):
+        assessment=matcher._technical_qualification_assessments(
+            "Requirements: Comfort working across the stack, frontend and backend.",
+            {"projects":[{"description":"Completed a software project.","technologies":["React","Python","FastAPI"]}]})
+        self.assertEqual(assessment[0]["status"],"needs_review")
+        self.assertEqual(assessment[0]["candidate_evidence"],[])
+
+    def test_multi_option_preferred_stack_is_not_mislabeled_as_database_requirement(self):
+        extracted=extract_technical_qualification_requirements(
+            "Nice to Haves: Experience with React, Python, FastAPI, or PostgreSQL.")
+        self.assertEqual(extracted[0]["category"],"technical_stack")
+        self.assertEqual(extracted[0]["requiredness"],"preferred")
+        assessment=matcher._technical_qualification_assessments(
+            "Nice to Haves: Experience with React, Python, FastAPI, or PostgreSQL.",
+            {"projects":[{"description":"Built a service for a personal project.","technologies":["Python","FastAPI"]}]})
+        self.assertEqual(assessment[0]["status"],"not_applicable")
+        self.assertEqual(assessment[0]["candidate_evidence"],[])
+
+    def test_frontend_only_or_backend_only_does_not_satisfy_both(self):
+        description="Requirements: Comfort working across the stack, frontend and backend."
+        for project in ({"description":"Developed the frontend user interface using React."},
+                        {"description":"Implemented backend API services using Python."}):
+            with self.subTest(project=bool("frontend" in project["description"])):
+                assessment=matcher._technical_qualification_assessments(description,{"projects":[project]})
+                self.assertEqual(assessment[0]["status"],"needs_review")
+
+    def test_verified_api_implementation_supports_api_requirement(self):
+        assessment=matcher._technical_qualification_assessments("Requirements: Implement APIs and services.",
+            {"projects":[{"description":"Implemented REST API endpoints and service tests."}]})
+        self.assertEqual(assessment[0]["category"],"api_services")
+        self.assertEqual(assessment[0]["status"],"met")
+
+    def test_confirmed_coursework_can_support_dsa_and_software_design_fundamentals(self):
+        from candidate_verification import canonical_verified_candidate_facts
+        facts=canonical_verified_candidate_facts({"education":[{"degree":"B.S.","coursework":["Data Structures and Algorithms","Software Design"]}]})
+        assessment=matcher._technical_qualification_assessments(
+            "Requirements: Strong fundamentals in data structures, algorithms, and software design.",facts)
+        self.assertEqual(facts["education"][0]["coursework"],["Data Structures and Algorithms","Software Design"])
+        self.assertEqual(assessment[0]["status"],"met")
+        self.assertEqual({ev["source_type"] for ev in assessment[0]["candidate_evidence"]},{"verified_coursework"})
+
+    def test_partial_algorithm_project_does_not_claim_all_fundamentals(self):
+        assessment=matcher._technical_qualification_assessments(
+            "Requirements: Strong fundamentals in data structures, algorithms, and software design.",
+            {"projects":[{"description":"Implemented graph algorithms and evaluated their time complexity."}]})
+        self.assertEqual(assessment[0]["status"],"needs_review")
+        self.assertTrue(assessment[0]["candidate_evidence"])
+        self.assertIn("data structures",assessment[0]["explanation"])
+
+    def test_preferred_technical_gap_never_blocks(self):
+        result=matcher.apply_safety_rules(valid_result(),{"technical_skills":["Python"],"projects":[]},"user_reviewed",
+            {"roles":["Software Engineer"],"location":"United States","relocation_preference":"anywhere","employment_types":["Full-time"]},
+            {"title":"Software Engineer","location":"San Francisco, United States","employment_type":"Full-time",
+             "content":"Nice to Haves: Experience with cloud infrastructure."})
+        self.assertNotEqual(result.classification,"not_eligible")
+        self.assertTrue(result.technical_qualifications)
+        self.assertEqual(result.technical_qualifications[0].requiredness,"preferred")
+        self.assertEqual(result.technical_qualifications[0].status,"not_applicable")
+        self.assertFalse(any("cloud infrastructure" in value.casefold() for value in result.gaps+result.missing_information))
+
+    def test_missing_required_technical_evidence_is_review_not_mismatch(self):
+        result=matcher.apply_safety_rules(valid_result(),{"projects":[]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Requirements: Experience building web applications."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.technical_qualifications[0].status,"needs_review")
+        self.assertNotEqual(result.technical_qualifications[0].status,"confirmed_mismatch")
+        self.assertTrue(any("web application" in question.casefold() for question in result.missing_information))
+
+    def test_current_engine_result_is_not_repeatedly_staled_on_initialize(self):
+        stamp="2026-10-27T00:00:00+00:00"
+        with jobs.database() as db:
+            for key,version in (("current-v13",matcher.MATCHING_ENGINE_VERSION),
+                                ("old-v12","ollama:qwen2.5:3b/job-match-v12-relocation-preferences")):
+                db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,
+                    result_json,created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,
+                    matching_model_version,freshness_status) VALUES(?,?,?,'completed','needs_review',70,'{}',?,?,?,?,?,?, 'current')""",
+                    (jobs.USER,key,"resume-v1",stamp,stamp,"a"*64,"b"*64,"c"*64,version))
+        matcher.initialize()
+        with jobs.database() as db:
+            current=db.execute("SELECT freshness_status FROM job_match_results WHERE job_key='current-v13'").fetchone()[0]
+            old=db.execute("SELECT freshness_status FROM job_match_results WHERE job_key='old-v12'").fetchone()[0]
+        self.assertEqual(current,"current")
+        self.assertEqual(old,"stale")
+
     def test_matching_uses_confirmed_ordinary_answer_bank_facts_only(self):
         with jobs.database() as db:
             db.executemany("INSERT INTO application_answers VALUES(?,?,?,?,?,?,?,?)",[
@@ -86,13 +192,15 @@ class ResumeJobMatcherTests(unittest.TestCase):
                 (jobs.USER,"resume-v1","custom:technical_skills","Python, Rust",0,1,None,1),
                 (jobs.USER,"resume-v1","custom:professional_experience","Built verified production APIs",0,1,None,1),
                 (jobs.USER,"resume-v1","custom:work_authorization","Sensitive answer",1,1,None,0),
-                (jobs.USER,"resume-v1","custom:location","Old answer",0,0,None,1)])
+                (jobs.USER,"resume-v1","custom:location","Old answer",0,0,None,1),
+                (jobs.USER,"resume-v1","custom:location","yes",0,1,None,1)])
         _,_,profile=matcher.active_candidate()
         self.assertEqual(profile["graduation_year"],"2026")
         self.assertIn("Rust",profile["technical_skills"])
         self.assertEqual(profile["work_experience"][-1]["responsibilities"],["Built verified production APIs"])
         self.assertNotIn("work_authorization",profile)
         self.assertNotIn("Old answer",str(profile))
+        self.assertNotIn("yes",str(profile))
 
     def test_match_freshness_detects_engine_profile_preference_and_job_changes(self):
         resume_id,status,profile=matcher.active_candidate()
@@ -397,7 +505,26 @@ class ResumeJobMatcherTests(unittest.TestCase):
             row=db.execute("SELECT freshness_status,result_json FROM job_match_results WHERE job_key=? AND resume_id=?",(key,resume_id)).fetchone()
         self.assertEqual(row["freshness_status"],"stale")
         self.assertIsNotNone(row["result_json"])
-        self.assertIn("job-match-v12-relocation-preferences",matcher.matching_engine_version("ollama","test-model"))
+        self.assertIn("job-match-v15-technical-stack-classification",matcher.matching_engine_version("ollama","test-model"))
+
+    def test_affirmative_ai_consistency_statements_remain_diagnostics_not_review_blockers(self):
+        statements=["Bachelors degree in Computer Science, graduation date 2026-12",
+                    "Experience in software engineering through projects and team project"]
+        with patch.object(matcher,"assess_job",return_value=(True,"",[])):
+            result=matcher.apply_safety_rules(valid_result(evidence_consistency=statements),
+            {"technical_skills":["Python"]},"user_reviewed",{},
+            {"title":"Software Engineer","location":"New York, United States","employment_type":"Full-time","content":"Python required."})
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(result.evidence_consistency,[])
+        self.assertEqual(result.ai_evidence_diagnostics,statements)
+
+    def test_ai_diagnostics_do_not_override_a_deterministic_mandatory_conflict(self):
+        result=matcher.apply_safety_rules(valid_result(evidence_consistency=["Candidate is qualified."]),
+            {"education":[{"degree":"Bachelor's","major":"Computer Science"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Basic Qualifications: Master's degree in Computer Science required."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertTrue(result.ai_evidence_diagnostics)
+        self.assertTrue(any(item.status=="confirmed_mismatch" for item in result.education_requirements))
 
     def test_fall_graduation_window_includes_confirmed_december_term(self):
         self.assertTrue(matcher._graduation_window_matches({"season":"fall","season_year":2026,

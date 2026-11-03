@@ -82,6 +82,10 @@ def canonical_answer_identity(question):
     """Return a conservative answer category and destination qualifier."""
     text=re.sub(r"\s+"," ",str(question or "").casefold()).strip()
     categories=(
+        ("technical_qualification",r"technical evidence|technical qualification|data structures?.{0,80}algorithms?|software design fundamentals|front(?:end|[ -]?end).{0,80}back(?:end|[ -]?end)|web application project"),
+        ("job_conditions",r"(?:(?:full[ -]?time|part[ -]?time|contract|internship).{0,100}(?:remote|hybrid|on[ -]?site|in[ -]?person)|(?:remote|hybrid|on[ -]?site|in[ -]?person).{0,100}(?:full[ -]?time|part[ -]?time|contract|internship))"),
+        ("preferred_work_location",r"preferred (?:work |job )?location|desired (?:work |job )?location|where would you like to work|location preference"),
+        ("employer_confirmation",r"\backnowledge\b|\bconfirm(?:ation)?\b"),
         ("human_verification",r"captcha|verification code|human verification|sign in|login"),
         ("work_authorization",r"work authorization|work authori[sz]ed|legally authori[sz]ed|right to work"),
         ("sponsorship",r"sponsor|visa"),
@@ -98,7 +102,11 @@ def canonical_answer_identity(question):
     )
     category=next((name for name,pattern in categories if re.search(pattern,text)),"other")
     context=""
-    if category=="relocation":
+    if category=="technical_qualification":
+        if re.search(r"data structures?.{0,80}algorithms?|software design fundamentals",text):context="data_structures_algorithms_design"
+        elif re.search(r"front(?:end|[ -]?end).{0,80}back(?:end|[ -]?end)|full[ -]?stack",text):context="frontend_backend"
+        else:context="web_application_experience"
+    elif category=="relocation":
         match=re.search(r"\b(?:relocat(?:e|ion|ing)|move|moving)\s+to\s+([^?.!,;]{2,100})",str(question or ""),re.I)
         if match:
             context=re.sub(r"\s+(?:for|in)\s+(?:this|the|a)\s+(?:position|job|role)\b.*$","",match.group(1),flags=re.I)
@@ -111,12 +119,144 @@ def canonical_answer_identity(question):
         elif re.search(r"degree|major|field of study",text):context="degree"
         elif re.search(r"university|college|school",text):context="institution"
         else:context="education_details"
+    elif category in {"legal_attestation","employer_confirmation","human_verification"}:
+        # These prompts are employer-specific declarations or controls. Keep
+        # distinct wording separate instead of grouping by a broad label.
+        context=re.sub(r"[^a-z0-9 ]+"," ",text).strip()[:180]
     elif category=="sponsorship":
-        context="future" if re.search(r"future|in the future|later",text) else "current"
+        scope="future" if re.search(r"future|in the future|later",text) else "current"
+        jurisdiction=re.search(r"\b(?:in|for)\s+(?:the\s+)?(united states|u\.?s\.?|canada|united kingdom|u\.?k\.?|australia|new zealand|germany|france|india|japan|singapore)\b",str(question or ""),re.I)
+        context=scope+(":"+re.sub(r"[^a-z0-9]+"," ",jurisdiction.group(1).casefold()).strip() if jurisdiction else "")
     elif category=="other":
         context=re.sub(r"[^a-z0-9 ]+"," ",text).strip()[:180]
-    sensitive=category in {"work_authorization","sponsorship","demographic","legal_attestation","human_verification"}
+    elif category=="location":
+        if re.search(r"\bcity\b",text):context="city"
+        elif re.search(r"\bcountry\b",text):context="country"
+        elif re.search(r"\b(?:state|province)\b",text):context="state_province"
+        elif re.search(r"\b(?:postal|zip)\b",text):context="postal_code"
+        elif re.search(r"\baddress\b",text):context="street_address"
+        else:context="location_unspecified"
+    elif category=="preferred_work_location":
+        context="city" if re.search(r"\bcity\b",text) else "country" if re.search(r"\bcountry\b",text) else "region" if re.search(r"\b(?:state|province|region)\b",text) else "location"
+    elif category in {"other","job_conditions"}:
+        context=re.sub(r"[^a-z0-9 ]+"," ",text).strip()[:180]
+    elif category=="work_authorization":
+        jurisdiction=re.search(r"\b(?:in|for)\s+(?:the\s+)?(united states|u\.?s\.?|canada|united kingdom|u\.?k\.?|australia|new zealand|germany|france|india|japan|singapore)\b",str(question or ""),re.I)
+        context=re.sub(r"[^a-z0-9]+"," ",jurisdiction.group(1).casefold()).strip() if jurisdiction else "jurisdiction_unspecified"
+    sensitive=category in {"work_authorization","sponsorship","demographic","legal_attestation","human_verification","employer_confirmation"}
     return category,context,sensitive
+
+
+def application_answer_value_kind(question):
+    """Infer a conservative value type from a question without merging its scope."""
+    text=re.sub(r"\s+"," ",str(question or "").casefold()).strip()
+    category,context,_=canonical_answer_identity(question)
+    if re.search(r"\be[ -]?mail\b",text):return "email"
+    if re.search(r"\b(?:phone|telephone|mobile number)\b",text):return "phone"
+    if re.search(r"\b(?:url|website|portfolio|linkedin|github|link)\b",text):return "url"
+    if re.search(r"technical skills|programming languages|tools and technologies|technology stack",text):return "skills"
+    if category=="location":
+        return {"city":"city","country":"country","state_province":"region","postal_code":"postal_code"}.get(context,"location")
+    if category=="preferred_work_location":
+        return {"city":"city","country":"country","region":"region"}.get(context,"location")
+    if category=="education":
+        return "gpa" if context=="gpa" else "graduation_month_year" if context=="graduation" else "education_text"
+    if category in {"internship","professional_experience"}:
+        if re.search(r"how many (?:years?|months?)|years? of experience|months? of experience",text):return "experience_duration"
+        if re.match(r"^(?:are|is|do|does|did|have|has|were|was|will|would|can|could)\b",text):return "boolean"
+        return "experience_text"
+    if category=="work_authorization" and re.search(r"which country|what country|country (?:are|do) you",text):return "country"
+    if re.search(r"\b(?:postal|zip code|postcode)\b",text):return "postal_code"
+    if re.search(r"\b(?:state|province|region)\b",text):return "region"
+    if re.search(r"\b(?:date|mm\s*/\s*dd|dd\s*/\s*mm)\b",text):return "date"
+    if category=="technical_qualification":return "technical_evidence"
+    if category=="job_conditions":return "compound_job_conditions"
+    if category=="relocation":return "boolean"
+    if category=="availability":return "availability"
+    if re.match(r"^(?:are|is|am|do|does|did|have|has|will|would|can|could|should|must)\b",text):return "boolean"
+    if category=="employment_type":return "employment_type"
+    if category=="work_arrangement":return "work_arrangement"
+    return "text"
+
+
+def validate_application_answer(question,answer):
+    """Central validation used on writes, historical reads, and answer reuse."""
+    value=re.sub(r"\s+"," ",str(answer or "")).strip()
+    kind=application_answer_value_kind(question)
+    if not value:raise ValueError("Enter a confirmed answer before saving.")
+    if len(value)>4000:raise ValueError("The answer exceeds the 4,000 character limit.")
+    boolean_values={"yes","no","y","n","true","false","i do","i do not","i don't","i am","i am not","i will","i will not"}
+    lowered=value.casefold()
+    if kind in {"city","country","region","location"}:
+        label={"city":"city","country":"country","region":"state or province","location":"location"}[kind]
+        if lowered in boolean_values or not any(char.isalpha() for char in value):
+            raise ValueError(f"Enter a {label} name, not a yes/no response.")
+        if len(value)>100 or re.search(r"https?://|@|\d",value):
+            raise ValueError(f"Enter a plain {label} name without a URL, email, or numeric identifier.")
+        if not re.fullmatch(r"[\w\s.'’(),-]+",value,re.UNICODE):
+            raise ValueError(f"Use a readable {label} name.")
+    elif kind=="postal_code":
+        if lowered in boolean_values or not re.fullmatch(r"(?=.*\d)[A-Za-z0-9][A-Za-z0-9 -]{1,11}",value):
+            raise ValueError("Enter a valid postal or ZIP code; a yes/no answer is not a location code.")
+    elif kind=="email":
+        if len(value)>320 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",value):
+            raise ValueError("Enter a valid email address.")
+    elif kind=="phone":
+        digits=re.sub(r"\D","",value)
+        if not 7<=len(digits)<=15 or re.search(r"[A-Za-z]",value):
+            raise ValueError("Enter a phone number with 7 to 15 digits.")
+    elif kind=="url":
+        try:_validate_profile_url(value,"This professional link")
+        except HTTPException as error:raise ValueError(error.detail) from error
+    elif kind=="date":
+        valid=False
+        parse_value=value
+        if re.fullmatch(r"[A-Za-z]+ \d{1,2}",value):parse_value=value+", 2000"
+        for fmt in ("%Y-%m-%d","%m/%d/%Y","%m/%d/%y","%d/%m/%Y","%B %d, %Y","%b %d, %Y","%B %Y","%b %Y"):
+            try:datetime.strptime(parse_value,fmt);valid=True;break
+            except ValueError:pass
+        if not valid:raise ValueError("Enter a valid date, such as 2026-06-15 or June 15, 2026.")
+    elif kind=="availability":
+        date_like=bool(re.search(r"\b(?:immediately|as soon as possible|flexible|negotiable|after graduation|in \d+ (?:days?|weeks?|months?)|\d+ (?:days?|weeks?|months?)(?: notice)?|(?:in )?(?:one|two|three|four) weeks?)\b",value,re.I))
+        date_like=date_like or bool(re.fullmatch(r"(?:\d{4}-\d{2}-\d{2}|\d{4}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|[A-Za-z]+ \d{1,2}(?:,? \d{4})?|[A-Za-z]+ \d{4})",value))
+        if not date_like:raise ValueError("Enter a specific start date or clear availability period, such as June 15, 2026 or two weeks’ notice.")
+    elif kind=="boolean" and lowered not in boolean_values:
+        raise ValueError("This is a yes/no question. Enter Yes or No based on your confirmed answer.")
+    elif kind=="employment_type":
+        if not re.search(r"\b(?:full[ -]?time|part[ -]?time|intern(?:ship)?|contract|temporary|permanent|seasonal|casual)\b",value,re.I):
+            raise ValueError("Choose or enter a recognized employment type, such as full-time, part-time, internship, or contract.")
+    elif kind=="work_arrangement":
+        if not re.search(r"\b(?:remote|hybrid|on[ -]?site|in[ -]?person|office|flexible)\b",value,re.I):
+            raise ValueError("Enter a work arrangement such as remote, hybrid, or on-site.")
+    elif kind=="compound_job_conditions":
+        employment=bool(re.search(r"\b(?:full[ -]?time|part[ -]?time|intern(?:ship)?|contract|temporary|permanent|seasonal|casual)\b",value,re.I))
+        arrangement=bool(re.search(r"\b(?:remote|hybrid|on[ -]?site|in[ -]?person|office|flexible)\b",value,re.I))
+        if not employment or not arrangement:
+            raise ValueError("This question asks about both employment type and work arrangement; provide both parts of your confirmed preference.")
+    elif kind=="technical_evidence":
+        if len(value)<30 or not re.search(r"\b(?:project|coursework|course|class|implemented|built|developed|designed|created|algorithm|data structures?|software design|frontend|backend|web application|api|service)\b",value,re.I):
+            raise ValueError("Add a specific project, course, or implementation detail so the qualification can be assessed as evidence.")
+    elif kind=="skills":
+        if lowered in boolean_values or re.match(r"^(?:yes|no|true|false)\b",lowered) or not re.search(r"[A-Za-z]",value):
+            raise ValueError("List confirmed technical skills or programming languages; a yes/no response is not a skill list.")
+    elif kind=="gpa":
+        if not re.fullmatch(r"\d{1,2}(?:\.\d{1,3})?(?:\s*(?:/|out of|on\s+(?:a\s+)?)\s*\d{1,2}(?:\.\d{1,3})?(?:\s*(?:scale|maximum))?)?",value,re.I):
+            raise ValueError("Enter a confirmed numeric GPA and its scale when known; BabyStepsAI will not infer or convert the scale.")
+    elif kind=="graduation_month_year":
+        if not (re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])",value) or re.fullmatch(r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}",value,re.I)):
+            raise ValueError("Enter a confirmed graduation month and year, such as 2026-12 or December 2026.")
+    elif kind=="education_text":
+        if lowered in boolean_values or len(value)<3 or not re.search(r"[A-Za-z]",value):
+            raise ValueError("Enter the confirmed degree, school, graduation, or education details requested.")
+    elif kind=="experience_duration":
+        if lowered in boolean_values or not re.search(r"\b\d+(?:\.\d+)?\s*(?:years?|months?)\b",value,re.I):
+            raise ValueError("Enter a confirmed duration, such as 6 months or 2 years.")
+    elif kind=="experience_text":
+        if lowered in boolean_values or len(value)<10:
+            raise ValueError("Provide a specific confirmed internship or professional experience detail.")
+    elif lowered in boolean_values and kind not in {"boolean"}:
+        raise ValueError("A yes/no response does not answer this location or descriptive question.")
+    return value
 
 
 def stable_answer_key(category,context="",scope="matching_jobs",job_key=""):
@@ -308,7 +448,8 @@ def _suggestions(profile):
         result["education_entries"] = [{"institution": str(x.get("institution") or x.get("university") or x.get("school") or ""),
              "degree": str(x.get("degree") or ""), "major": str(x.get("major") or x.get("field") or ""),
              "graduation_date": date_value(x,"graduation"), "graduation_year_suggestion": str(x.get("graduation_year") or x.get("end_year") or ""),
-             "gpa": str(x.get("gpa") or ""), "currently_enrolled": bool(x.get("currently_enrolled") or x.get("current_student"))} for x in education if isinstance(x,dict)]
+             "gpa": str(x.get("gpa") or ""), "coursework":_text_list(x.get("coursework") or x.get("courses")),
+             "currently_enrolled": bool(x.get("currently_enrolled") or x.get("current_student"))} for x in education if isinstance(x,dict)]
     work = profile.get("work_experience")
     internships = profile.get("internships") if isinstance(profile.get("internships"), list) else []
     if isinstance(work, list):
@@ -528,10 +669,13 @@ def canonical_verified_candidate_facts(profile):
         gpa=str(row.get("gpa") or "").strip()
         gpa_scale=str(row.get("gpa_scale") or "").strip()
         # A year-only extracted suggestion is not a confirmed graduation date.
-        if degree or major or date or gpa:
+        coursework=row.get("coursework") if isinstance(row.get("coursework"),list) else []
+        coursework=[re.sub(r"\s+"," ",str(x or "")).strip()[:300] for x in coursework if str(x or "").strip()]
+        if degree or major or date or gpa or coursework:
             education.append({"degree":degree,"degree_normalized":normalize_degree(degree),
                 "major":major,"major_normalized":normalize_major(major),"graduation_date":date,
                 "gpa":gpa,"gpa_scale":gpa_scale,
+                "coursework":coursework,
                 "currently_enrolled":(bool(row["currently_enrolled"]) if row.get("currently_enrolled") is not None else None)})
     if education:facts["education"]=education
 
@@ -564,6 +708,7 @@ def canonical_verified_candidate_facts(profile):
                 technologies=row.get("technologies") or row.get("skills") or []
                 normalized_projects.append({"name":str(row.get("name") or row.get("title") or ""),
                     "description":str(row.get("description") or ""),
+                    "accomplishments":_text_list(row.get("accomplishments") or row.get("outcomes")),
                     "technologies":[str(x) for x in technologies if str(x).strip()] if isinstance(technologies,list) else []})
         if normalized_projects:facts["projects"]=normalized_projects
     if facts.get("work_experience"):
@@ -801,11 +946,15 @@ def save_application_answer(question_key: str, payload: AnswerUpdate):
     reuse_scope=payload.reuse_scope or ("matching_jobs" if payload.auto_reuse else "none")
     if reuse_scope not in {"none","matching_jobs","general_preference","job_specific"}:
         raise HTTPException(400,"Choose no reuse, matching jobs, or a specific job.")
+    if payload.confirmed and payload.answer.strip():
+        try:validated_answer=validate_application_answer(payload.question,payload.answer)
+        except ValueError as error:raise HTTPException(422,str(error)) from error
+    else:validated_answer=str(payload.answer or "").strip()
     stamp = now()
     with connect() as db:
         db.execute("BEGIN IMMEDIATE")
         resume = _active(db)
-        answer=payload.answer.strip()
+        answer=validated_answer
         category,context,question_sensitive=canonical_answer_identity(payload.question)
         is_sensitive=bool(payload.sensitive or question_sensitive)
         if is_sensitive and reuse_scope in {"matching_jobs","general_preference"}:
@@ -813,8 +962,13 @@ def save_application_answer(question_key: str, payload: AnswerUpdate):
         if not payload.confirmed or not answer:reuse_scope="none"
         if reuse_scope=="job_specific":
             if not payload.scope_job_key:raise HTTPException(422,"Choose the saved job that may use this answer.")
-            try:exists=db.execute("SELECT 1 FROM applications WHERE user_id=? AND job_key=? AND resume_id=? LIMIT 1",
-                                  (USER,payload.scope_job_key,resume["id"])).fetchone()
+            try:
+                if category=="technical_qualification":
+                    exists=db.execute("SELECT 1 FROM discovered_openings WHERE user_id=? AND job_key=? AND active=1 LIMIT 1",
+                                      (USER,payload.scope_job_key)).fetchone()
+                else:
+                    exists=db.execute("SELECT 1 FROM applications WHERE user_id=? AND job_key=? AND resume_id=? LIMIT 1",
+                                      (USER,payload.scope_job_key,resume["id"])).fetchone()
             except sqlite3.OperationalError:exists=None
             if not exists:raise HTTPException(404,"The selected job application is not available for this answer.")
         scope_job_key=payload.scope_job_key if reuse_scope=="job_specific" else ""
@@ -870,7 +1024,7 @@ def save_application_answer(question_key: str, payload: AnswerUpdate):
         match_table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
         affected_categories={category,str(old["question_category"] or "other")} if old else {category}
         match_columns={row[1] for row in db.execute("PRAGMA table_info(job_match_results)")} if match_table else set()
-        if match_table and "freshness_status" in match_columns and affected_categories & {"work_authorization","sponsorship","relocation","availability","education"}:
+        if match_table and "freshness_status" in match_columns and affected_categories & {"work_authorization","sponsorship","relocation","availability","education","technical_qualification"}:
             if reuse_scope in global_scope or previous_scope in global_scope:
                 db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND resume_id=? AND status='completed'",(USER,resume["id"]))
             else:
@@ -935,7 +1089,7 @@ def update_verification(payload: VerificationUpdate):
         if kind == "objects":
             if not isinstance(value,list) or len(value)>100 or any(not isinstance(item,dict) for item in value):
                 raise HTTPException(400,f"{key} must be a list of structured entries.")
-            allowed={"education_entries":{"institution","degree","major","graduation_date","graduation_year_suggestion","gpa","gpa_scale","currently_enrolled"},
+            allowed={"education_entries":{"institution","degree","major","graduation_date","graduation_year_suggestion","gpa","gpa_scale","coursework","currently_enrolled"},
                      "experience_entries":{"job_title","employer","location","employment_type","start_date","end_date","start_year_suggestion","end_year_suggestion","currently_working","responsibilities","technologies"},
                      "internship_entries":{"job_title","employer","location","employment_type","start_date","end_date","start_year_suggestion","end_year_suggestion","currently_working","responsibilities","technologies"},
                      "project_entries":{"name","description","technologies","github_url","demo_url","start_date","end_date","start_year_suggestion","end_year_suggestion","accomplishments"},
@@ -948,7 +1102,7 @@ def update_verification(payload: VerificationUpdate):
                     if field in {"currently_enrolled","currently_working"}:
                         if not isinstance(part,bool): raise HTTPException(400,f"{field} must be true or false.")
                         entry[field]=part
-                    elif field in {"responsibilities","technologies","accomplishments"}:
+                    elif field in {"responsibilities","technologies","accomplishments","coursework"}:
                         if not isinstance(part,list) or any(not isinstance(x,str) or len(x)>2000 for x in part): raise HTTPException(400,f"{field} must be a list of text values.")
                         entry[field]=[x.strip() for x in part if x.strip()]
                     else:
@@ -986,6 +1140,9 @@ def update_verification(payload: VerificationUpdate):
             _validate_profile_url(values[key],FIELDS[key][1])
         if key == "email" and values.get(key) and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", values[key]):
             raise HTTPException(400,"Email address must use a valid format, such as name@example.com.")
+        if key in {"city","country","state_province","postal_code"} and values.get(key):
+            try:values[key]=validate_application_answer(FIELDS[key][1],values[key])
+            except ValueError as error:raise HTTPException(400,str(error)) from error
         if key in {"other_professional_links"}:
             for link in values.get(key,[]):_validate_profile_url(link,FIELDS[key][1])
     for token in entry_tokens:
@@ -1136,10 +1293,16 @@ def list_answers():
         output=[]
         for row in rows:
             answer=_answer_plaintext(row,db)
+            answer_valid=True;validation_issue=""
+            if row["confirmed"]:
+                try:validate_application_answer(row["question_text"],answer)
+                except ValueError as error:answer_valid=False;validation_issue=str(error)
             output.append({"key":row["question_key"],"question":row["question_text"],
                 "sensitive":bool(row["sensitive"]),"confirmed":bool(row["confirmed"]),
+                "answer_valid":answer_valid,"answer_status":("needs_correction" if row["confirmed"] and not answer_valid else "confirmed" if row["confirmed"] else "unconfirmed"),
+                "validation_issue":validation_issue,
                 "answer":answer if row["confirmed"] and not row["sensitive"] else "","updated_at":row["updated_at"],
-                "answer_type":row["answer_type"],"jurisdiction":row["jurisdiction"],"auto_reuse":bool(row["auto_reuse"]),
+                "answer_type":row["answer_type"],"jurisdiction":row["jurisdiction"],"auto_reuse":bool(row["auto_reuse"] and answer_valid),
                 "source":row["source"],"category":row["question_category"],
                 "sensitivity_classification":row["sensitivity_classification"],"confirmed_at":row["confirmation_at"],
                 "reuse_scope":row["reuse_scope"],"scope_job_key":row["scope_job_key"],
@@ -1163,7 +1326,7 @@ PROFILE_PAGE = r'''<!doctype html>
 <section class="section"><h2>Reusable application answers</h2><p class="muted">Answers are tied to this resume version. Sensitive or legal answers require explicit confirmation.</p><button type="button" onclick="addAnswer()">Add an answer</button><div id="answer-list"></div></section><div id="status" class="status" role="status" aria-live="polite"></div></main>
 <script>
 let fields=[],latestCompleteness=null;const hiddenLegacy=new Set(['graduation_month','graduation_year','graduation_date','university','degree','major','work_experience','internships','projects','technical_skills']);
-const schemas={education_entries:[['institution','Institution','text'],['degree','Degree','text'],['major','Major / field','text'],['graduation_date','Graduation month and year','month'],['gpa','GPA (optional)','text'],['gpa_scale','GPA scale (for example, 4.0)','text'],['currently_enrolled','Currently enrolled','bool']],experience_entries:[['job_title','Job title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],internship_entries:[['job_title','Internship title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],project_entries:[['name','Project name','text'],['description','Description','textarea'],['technologies','Technologies','list'],['github_url','GitHub URL','url'],['demo_url','Live demo URL','url'],['start_date','Start month (optional)','month'],['end_date','End month (optional)','month'],['accomplishments','Key accomplishments','list']]};
+const schemas={education_entries:[['institution','Institution','text'],['degree','Degree','text'],['major','Major / field','text'],['graduation_date','Graduation month and year','month'],['coursework','Relevant coursework (optional)','list'],['gpa','GPA (optional)','text'],['gpa_scale','GPA scale (for example, 4.0)','text'],['currently_enrolled','Currently enrolled','bool']],experience_entries:[['job_title','Job title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],internship_entries:[['job_title','Internship title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],project_entries:[['name','Project name','text'],['description','Description','textarea'],['technologies','Technologies','list'],['github_url','GitHub URL','url'],['demo_url','Live demo URL','url'],['start_date','Start month (optional)','month'],['end_date','End month (optional)','month'],['accomplishments','Key accomplishments','list']]};
 async function jsonReq(url,options={}){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok){const detail=d.detail;const message=Array.isArray(detail)?detail.map(x=>(Array.isArray(x.loc)?x.loc.filter(y=>y!=='body').join(' → ')+': ':'')+(x.msg||'Invalid value')).join('; '):typeof detail==='string'?detail:'Request failed. Check the highlighted field and try again.';const error=Error(message);error.detail=detail;throw error}return d}function formatMonth(value){if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(value||''))return '';const [y,m]=value.split('-').map(Number);return new Intl.DateTimeFormat(undefined,{month:'long',year:'numeric',timeZone:'UTC'}).format(new Date(Date.UTC(y,m-1,1)))}
 function badge(source){const x=document.createElement('span');x.className='badge '+(source==='user_confirmed'?'confirmed':source==='resume_suggestion'?'suggestion':'');x.textContent=source==='user_confirmed'?'Confirmed':source==='resume_suggestion'?'Resume / AI suggestion':'Missing';return x}
 function confirmControl(key,checked,text='I reviewed and confirm'){const label=document.createElement('label');label.className='checkrow';const box=document.createElement('input');box.type='checkbox';box.dataset.confirm=key;box.checked=!!checked;label.append(box,document.createTextNode(text));return label}
@@ -1178,13 +1341,13 @@ function paintField(row,f,input,checkbox){const value=input.value.trim(),[text,d
 function render(){const form=document.querySelector('#profile');form.replaceChildren();const groups={};for(const f of fields){if(hiddenLegacy.has(f.key))continue;let section=groups[f.section];if(!section){section=document.createElement('section');section.className='section';section.append(Object.assign(document.createElement('h2'),{textContent:f.section}));groups[f.section]=section;form.append(section)}if(f.kind==='objects'){objectSection(f,section);continue}if(f.kind==='chips'){renderSkills(f,section);continue}const row=document.createElement('div');row.className='profile-field-row';const wrap=fieldControl(f.key,f.label,Array.isArray(f.value)?f.value.join('\n'):f.value,f.kind==='list'?'textarea':f.kind,f.suggestion?'Resume / AI suggestion: graduation year '+f.suggestion+'.':'');row.append(wrap,statusIndicator(f));if(f.sensitive)row.append(Object.assign(document.createElement('p'),{className:'source sensitive-note',textContent:'Sensitive/legal information is used only after explicit confirmation.'}));const input=wrap.querySelector('[data-key]');let checkbox=null;if(valuePresent(input.value)&&!valueInvalid(f.key,input.value)){const control=confirmControl(f.key,f.confirmed);row.append(control);checkbox=control.querySelector('input')}input.addEventListener('input',()=>{if(checkbox)checkbox.checked=false;paintField(row,f,input,checkbox)});input.addEventListener('change',()=>{if(checkbox)checkbox.checked=false;paintField(row,f,input,checkbox)});if(checkbox)checkbox.onchange=()=>paintField(row,f,input,checkbox);paintField(row,f,input,checkbox);section.append(row)}}
 function normalizedSkill(value){return String(value||'').trim().replace(/\s+/g,' ').toLocaleLowerCase()}
 function renderSkills(f,section){const wrap=document.createElement('div');wrap.className='field skill-field';const heading=document.createElement('label');heading.textContent=f.label;const tag=document.createElement('span');tag.className='optional-tag';tag.textContent=' · Optional';heading.append(tag);wrap.append(heading);const chips=document.createElement('div');chips.className='skill-chips';chips.dataset.skillChips='1';for(const skill of f.value||[])if(normalizedSkill(skill)&&![...chips.children].some(x=>normalizedSkill(x.dataset.value)===normalizedSkill(skill)))chips.append(skillChip(skill));const input=document.createElement('input');input.type='search';input.className='skill-entry';input.placeholder='Search or enter any skill';input.setAttribute('aria-label','Search or enter a custom technical skill');input.addEventListener('input',()=>{for(const chip of chips.children)chip.hidden=!!input.value&&!chip.dataset.value.toLocaleLowerCase().includes(input.value.toLocaleLowerCase())});const add=document.createElement('button');add.type='button';add.textContent='Add skill';const notice=document.createElement('span');notice.className='field-status state-review';notice.setAttribute('aria-live','polite');add.onclick=()=>{const value=input.value.trim().replace(/\s+/g,' ');if(value&&!Array.from(chips.children).some(x=>normalizedSkill(x.dataset.value)===normalizedSkill(value))){chips.append(skillChip(value));notice.textContent='Skill added. Review and confirm the skill list before saving.'}else if(value){notice.textContent='That skill is already in the list.'}input.value='';for(const chip of chips.children)chip.hidden=false;const checkbox=wrap.querySelector('[data-confirm="skills"]');if(checkbox)checkbox.checked=false};input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();add.click()}});wrap.append(chips,input,add,statusIndicator(f),notice);if(chips.children.length)wrap.append(confirmControl(f.key,f.confirmed));section.append(wrap)}function skillChip(value){const chip=document.createElement('span');chip.className='chip';chip.dataset.value=value;chip.append(document.createTextNode(value));const b=document.createElement('button');b.type='button';b.setAttribute('aria-label','Remove '+value);b.textContent='Remove';b.onclick=()=>{const wrap=chip.closest('.field');const checkbox=wrap?.querySelector('[data-confirm="skills"]');if(checkbox)checkbox.checked=false;chip.remove();if(checkbox)checkbox.dispatchEvent(new Event('change',{bubbles:true}))};chip.append(b);return chip}
-function collect(){const values={},confirmed=[];for(const f of fields){if(hiddenLegacy.has(f.key))continue;if(f.kind==='objects'){const cards=[...document.querySelectorAll('[data-entry="'+f.key+'"]')];values[f.key]=cards.map(card=>{const item=Object.assign({},card._entry||{});for(const control of card.querySelectorAll('[data-prop]')){const key=control.dataset.prop;item[key]=control.type==='checkbox'?control.checked:control.value.split('\n').map(x=>x.trim()).filter(Boolean);if(control.type!=='checkbox'&&!['responsibilities','technologies','accomplishments'].includes(key))item[key]=control.value.trim()}if(item.currently_working)item.end_date='';return item});cards.forEach((card,i)=>{if(card.querySelector('[data-confirm="'+f.key+':'+i+'"]')?.checked)confirmed.push(f.key+':'+i)});continue}if(f.kind==='chips'){values[f.key]=[...document.querySelectorAll('[data-skill-chips] .chip')].map(x=>x.dataset.value);if(document.querySelector('[data-confirm="'+f.key+'"]')?.checked)confirmed.push(f.key);continue}const control=document.querySelector('[data-key="'+f.key+'"]');values[f.key]=f.kind==='list'?control.value.split('\n').map(x=>x.trim()).filter(Boolean):control.value;if(document.querySelector('[data-confirm="'+f.key+'"]')?.checked)confirmed.push(f.key)}const verifiedEducation=(values.education_entries||[]).find((_,i)=>confirmed.includes('education_entries:'+i));values.university=verifiedEducation?.institution||'';values.degree=verifiedEducation?.degree||'';values.major=verifiedEducation?.major||'';values.graduation_date=verifiedEducation?.graduation_date||'';values.graduation_month=values.graduation_date?values.graduation_date.slice(5,7):'';values.graduation_year=values.graduation_date?values.graduation_date.slice(0,4):'';if(verifiedEducation){for(const key of ['university','degree','major'])if(values[key])confirmed.push(key);if(values.graduation_date)confirmed.push('graduation_date','graduation_month','graduation_year')}values.work_experience=(values.experience_entries||[]).map(x=>JSON.stringify(x));values.internships=(values.internship_entries||[]).map(x=>JSON.stringify(x));values.projects=(values.project_entries||[]).map(x=>JSON.stringify(x));values.technical_skills=values.skills||[];if(confirmed.includes('skills'))confirmed.push('technical_skills');for(const f of fields){if(Object.prototype.hasOwnProperty.call(values,f.key)){f.value=values[f.key];if(f.kind==='objects')f.entry_confirmed=values[f.key].map((_,i)=>confirmed.includes(f.key+':'+i));else if(f.kind==='chips'||f.kind!=='list')f.confirmed=confirmed.includes(f.key)}}return {values,confirmed_fields:confirmed}}
+function collect(){const values={},confirmed=[];for(const f of fields){if(hiddenLegacy.has(f.key))continue;if(f.kind==='objects'){const cards=[...document.querySelectorAll('[data-entry="'+f.key+'"]')];values[f.key]=cards.map(card=>{const item=Object.assign({},card._entry||{});for(const control of card.querySelectorAll('[data-prop]')){const key=control.dataset.prop;item[key]=control.type==='checkbox'?control.checked:control.value.split('\n').map(x=>x.trim()).filter(Boolean);if(control.type!=='checkbox'&&!['responsibilities','technologies','accomplishments','coursework'].includes(key))item[key]=control.value.trim()}if(item.currently_working)item.end_date='';return item});cards.forEach((card,i)=>{if(card.querySelector('[data-confirm="'+f.key+':'+i+'"]')?.checked)confirmed.push(f.key+':'+i)});continue}if(f.kind==='chips'){values[f.key]=[...document.querySelectorAll('[data-skill-chips] .chip')].map(x=>x.dataset.value);if(document.querySelector('[data-confirm="'+f.key+'"]')?.checked)confirmed.push(f.key);continue}const control=document.querySelector('[data-key="'+f.key+'"]');values[f.key]=f.kind==='list'?control.value.split('\n').map(x=>x.trim()).filter(Boolean):control.value;if(document.querySelector('[data-confirm="'+f.key+'"]')?.checked)confirmed.push(f.key)}const verifiedEducation=(values.education_entries||[]).find((_,i)=>confirmed.includes('education_entries:'+i));values.university=verifiedEducation?.institution||'';values.degree=verifiedEducation?.degree||'';values.major=verifiedEducation?.major||'';values.graduation_date=verifiedEducation?.graduation_date||'';values.graduation_month=values.graduation_date?values.graduation_date.slice(5,7):'';values.graduation_year=values.graduation_date?values.graduation_date.slice(0,4):'';if(verifiedEducation){for(const key of ['university','degree','major'])if(values[key])confirmed.push(key);if(values.graduation_date)confirmed.push('graduation_date','graduation_month','graduation_year')}values.work_experience=(values.experience_entries||[]).map(x=>JSON.stringify(x));values.internships=(values.internship_entries||[]).map(x=>JSON.stringify(x));values.projects=(values.project_entries||[]).map(x=>JSON.stringify(x));values.technical_skills=values.skills||[];if(confirmed.includes('skills'))confirmed.push('technical_skills');for(const f of fields){if(Object.prototype.hasOwnProperty.call(values,f.key)){f.value=values[f.key];if(f.kind==='objects')f.entry_confirmed=values[f.key].map((_,i)=>confirmed.includes(f.key+':'+i));else if(f.kind==='chips'||f.kind!=='list')f.confirmed=confirmed.includes(f.key)}}return {values,confirmed_fields:confirmed}}
 function canonical(v){if(Array.isArray(v))return '['+v.map(canonical).join(',')+']';if(v&&typeof v==='object')return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}';return JSON.stringify(v)}
 function renderCompletion(completion){latestCompleteness=completion;const box=document.querySelector('#completeness');box.replaceChildren();for(const [name,count] of [['Confirmed',completion.counts.confirmed],['Missing',completion.counts.missing],['Needs Review',completion.counts.needs_review]]){const tile=document.createElement('div');tile.className='tile';tile.append(Object.assign(document.createElement('strong'),{textContent:String(count)}),Object.assign(document.createElement('small'),{textContent:name}));box.append(tile)}document.querySelector('#readiness').textContent=completion.message;document.querySelector('#readiness').className=completion.ready_for_dry_runs?'ready':'review';const jobs=document.querySelector('#job-specific');jobs.replaceChildren();if(completion.job_specific.length){jobs.append(Object.assign(document.createElement('h3'),{textContent:'Job-specific requirements (not general profile requirements)'}));const ul=document.createElement('ul');for(const item of completion.job_specific){const li=document.createElement('li');li.textContent=item.company+' — '+item.title+': '+item.reason;ul.append(li)}jobs.append(ul)}}
 async function load(){const [data,completion]=await Promise.all([jsonReq('/api/candidate-profile/verification'),jsonReq('/api/candidate-profile/completeness')]);fields=data.fields;document.querySelector('#resume').textContent='Active resume: '+data.resume_name+' · Resume analysis: '+data.resume_status;render();renderCompletion(completion);await loadAnswers()}
 document.querySelector('#review-missing').onclick=()=>{const item=latestCompleteness?.attention_items?.[0];const key=(item?.key||'full_name').split(':')[0];if(key==='active_resume'){location.assign('/');return}const target=[...document.querySelectorAll('[data-key]')].find(x=>x.dataset.key===key)||document.querySelector('[data-confirm]')||document.querySelector('#save');target?.scrollIntoView({behavior:'smooth',block:'center'});target?.focus();document.querySelector('#readiness').textContent=item?'Review '+item.label+': '+item.reason:'Review fields marked Missing or Needs Review, then save. Job-specific requirements are listed separately.'};
 document.querySelector('#save').onclick=async()=>{const save=document.querySelector('#save'),status=document.querySelector('#status');save.disabled=true;save.setAttribute('aria-busy','true');status.replaceChildren();status.className='status';document.querySelectorAll('[aria-invalid="true"]').forEach(x=>{x.removeAttribute('aria-invalid');x.classList.remove('invalid-field')});try{const payload=collect();const saved=await jsonReq('/api/candidate-profile/verification',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});if(!saved.saved)throw Error('The server did not confirm the profile save.');const persisted=await jsonReq('/api/candidate-profile/verification');const byKey=Object.fromEntries(persisted.fields.map(x=>[x.key,x]));for(const [key,value] of Object.entries(payload.values)){if(byKey[key]&&canonical(byKey[key].value)!==canonical(value))throw Error('Could not verify the saved value for '+byKey[key].label+'. Your profile was not marked successful.')}for(const field of persisted.fields){if(!Object.prototype.hasOwnProperty.call(payload.values,field.key))continue;if(field.kind==='objects'){for(let i=0;i<(payload.values[field.key]||[]).length;i++)if(!!field.entry_confirmed?.[i]!==payload.confirmed_fields.includes(field.key+':'+i))throw Error('Could not verify confirmation for '+field.label+' entry '+(i+1)+'.')}else if(!!field.confirmed!==payload.confirmed_fields.includes(field.key))throw Error('Could not verify confirmation for '+field.label+'.')}const completion=await jsonReq('/api/candidate-profile/completeness');fields=persisted.fields;render();renderCompletion(completion);status.className='status success-text';const items=completion.attention_items||[];status.append(document.createTextNode(items.length?'Saved — '+items.length+' items need attention.':'Saved — no required items need attention.'));if(items.length){const list=document.createElement('ul');list.className='attention-list';for(const item of items){const li=document.createElement('li');li.textContent=item.label+': '+item.reason+' ('+item.requiredness+').';list.append(li)}status.append(list)}if(completion.optional.length)status.append(Object.assign(document.createElement('p'),{className:'muted',textContent:completion.optional.length+' optional fields remain blank or unconfirmed; they do not prevent saving.'}));if(completion.job_specific.length)status.append(Object.assign(document.createElement('p'),{className:'muted',textContent:completion.job_specific.length+' job-specific requirements are listed above.'}));await loadAnswers().catch(()=>{})}catch(e){status.className='status error-text';status.textContent='Save failed: '+e.message;const message=String(e.message).toLowerCase();const target=[...document.querySelectorAll('[data-key]')].find(x=>message.includes(x.dataset.key.toLowerCase().replaceAll('_',' '))||message.includes(x.dataset.key.toLowerCase()));if(target){target.setAttribute('aria-invalid','true');target.classList.add('invalid-field');target.focus()}}finally{save.disabled=false;save.removeAttribute('aria-busy')}}
-async function loadAnswers(){const a=await jsonReq('/api/application-answers');const box=document.querySelector('#answer-list');box.replaceChildren();if(!a.length){box.append(Object.assign(document.createElement('p'),{className:'empty',textContent:'No reusable answers yet.'}));return}for(const x of a){const row=document.createElement('details');const summary=document.createElement('summary');summary.textContent=x.question+(x.sensitive?' · sensitive':'');row.append(summary);row.append(Object.assign(document.createElement('p'),{textContent:x.confirmed?x.answer:'Not confirmed'}));if(x.key.startsWith('custom:')){const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>addAnswer(x.key.slice(7),x.question,x.answer,x.sensitive);const revoke=document.createElement('button');revoke.textContent='Revoke';revoke.onclick=async()=>{await jsonReq('/api/application-answers/'+encodeURIComponent(x.key.slice(7)),{method:'DELETE'});await loadAnswers()};row.append(edit,revoke)}box.append(row)}}
+async function loadAnswers(){const a=await jsonReq('/api/application-answers');const box=document.querySelector('#answer-list');box.replaceChildren();if(!a.length){box.append(Object.assign(document.createElement('p'),{className:'empty',textContent:'No reusable answers yet.'}));return}for(const x of a){const row=document.createElement('details');const summary=document.createElement('summary');summary.textContent=x.question+(x.sensitive?' · sensitive':'')+(x.answer_status==='needs_correction'?' · needs correction':'');row.append(summary);if(x.answer_status==='needs_correction'){row.append(Object.assign(document.createElement('p'),{className:'error-text',textContent:'This saved answer does not match the question type and is not eligible for reuse. '+(x.validation_issue||'Edit it with a valid answer.')}));if(!x.sensitive)row.append(Object.assign(document.createElement('p'),{textContent:'Previous answer (not reusable): '+x.answer}))}else row.append(Object.assign(document.createElement('p'),{textContent:x.confirmed?(x.sensitive?'Confirmed · hidden for privacy':x.answer):'Not confirmed'}));if(x.key.startsWith('custom:')){const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>addAnswer(x.key.slice(7),x.question,x.answer,x.sensitive);const revoke=document.createElement('button');revoke.textContent='Revoke';revoke.onclick=async()=>{await jsonReq('/api/application-answers/'+encodeURIComponent(x.key.slice(7)),{method:'DELETE'});await loadAnswers()};row.append(edit,revoke)}box.append(row)}}
 async function addAnswer(key='',question='',answer='',sensitive=false){question=prompt('Application question:',question);if(question===null)return;answer=prompt('Your exact answer:',answer);if(answer===null)return;key=key||prompt('Short key (letters, numbers, hyphens):','custom-answer');if(!key)return;const confirmed=confirm('Confirm that this exact answer is accurate?');const markedSensitive=sensitive||confirm('Is this answer sensitive or legally significant?');try{const saved=await jsonReq('/api/application-answers/'+encodeURIComponent(key),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,answer,sensitive:markedSensitive,confirmed})});if(!saved.saved||!saved.persisted_verified)throw Error('The saved answer could not be verified. No success confirmation was shown.');await loadAnswers();document.querySelector('#status').textContent='Answer saved and verified.'}catch(e){document.querySelector('#status').textContent='Save failed: '+e.message}}
 schemas.country_work_authorizations=[['country','Country / jurisdiction','text'],['status','Authorization status','text']];schemas.sponsorship_by_country=[['country','Country / jurisdiction','text'],['requires_sponsorship','Will sponsorship be required?','text']];
 load().catch(e=>document.querySelector('#status').textContent=e.message);

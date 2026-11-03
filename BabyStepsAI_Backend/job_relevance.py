@@ -5,6 +5,73 @@ import re
 from datetime import datetime, timezone
 
 
+def extract_technical_qualification_requirements(description):
+    """Extract technical criteria from explicit qualification sections only.
+
+    Responsibilities and general company copy are excluded. The returned
+    requirement text remains anchored to the original posting and is classified
+    by section boundaries, so a preferred item cannot become mandatory.
+    """
+    source=html.unescape(str(description or ""))
+    source=re.sub(r"<\s*li\b[^>]*>","\n__ITEM__ ",source,flags=re.I)
+    source=re.sub(r"</\s*(?:li|p|div|ul|ol|h[1-6])\s*>","\n",source,flags=re.I)
+    source=re.sub(r"<[^>]+>"," ",source)
+    required={"requirements","required qualifications","minimum qualifications","basic qualifications"}
+    preferred={"nice to have","nice to haves","preferred qualifications","preferred experience","bonus points"}
+    headings=required|preferred|{"responsibilities","duties","what you'll do","what you’ll do","about the role","about the job",
+        "about authentic","about us","our benefits","our fte benefits","benefits","who we are"}
+    categories=(
+        ("frontend_backend",r"\bfull[ -]?stack\b|\bacross the stack\b|\bboth.{0,50}\bfront(?:end|[ -]?end).{0,60}\bback(?:end|[ -]?end)\b|\bfront(?:end|[ -]?end).{0,60}\bback(?:end|[ -]?end)\b"),
+        ("web_application_experience",r"\bweb\s+(?:app(?:lication)?s?)\b|\bwebsite(?:s)?\b"),
+        ("frontend_development",r"\bfront(?:end|[ -]?end)\b|\buser interface\b"),
+        ("backend_development",r"\bback(?:end|[ -]?end)\b|\bserver[ -]?side\b"),
+        ("api_services",r"\bapis?\b|\bweb services?\b|\bservices? and endpoints\b"),
+        ("technical_stack",r"\breact\b|\bfastapi\b"),
+        ("databases",r"\bdatabases?\b|\bsql\b|\bpostgres(?:ql)?\b|\bmysql\b|\bmongodb\b"),
+        ("cloud_infrastructure",r"\bcloud\b|\binfrastructure\b|\baws\b|\bgcp\b|\bazure\b"),
+        ("testing_debugging",r"\btest(?:ing)?\b|\bdebug(?:ging)?\b"),
+        ("data_structures_algorithms_design",r"\bdata structures?\b|\balgorithms?\b|\bsoftware design\b|\bsoftware fundamentals\b"),
+        ("object_oriented_programming",r"\bobject[ -]?oriented\b|\boop\b"),
+        ("software_design",r"\bsoftware design\b|\bdesign patterns?\b|\bsoftware architecture\b"),
+        ("version_control",r"\bversion control\b|\bgit\b"),
+        ("team_collaboration",r"\bcollaborat(?:e|ion)\b|\bteamwork\b|\bcross[ -]?functional\b"),
+        ("deployment_production",r"\bdeploy(?:ment|ed)?\b|\bproduction\b|\bshipp(?:ed|ing)\b"),
+    )
+    found=[];section=""
+    heading_alt="|".join(re.escape(value) for value in sorted(headings,key=len,reverse=True))
+    source=re.sub(rf"(?i)\b({heading_alt})\s*:",r"\n\1:\n",source)
+    for raw in source.splitlines():
+        line=re.sub(r"\s+"," ",raw).strip(" \t\r\n•-*:")
+        if not line:continue
+        is_item=line.startswith("__ITEM__")
+        line=line.removeprefix("__ITEM__").strip()
+        heading_match=re.match(r"(?i)^(.+?)\s*:\s*(.*)$",line)
+        if not is_item and heading_match and heading_match.group(1).casefold() in headings:
+            section=heading_match.group(1).casefold()
+            line=heading_match.group(2).strip()
+            if not line:continue
+            is_item=True
+        heading=re.sub(r"[^a-z'’ ]+"," ",line.casefold()).strip()
+        heading=re.sub(r"\s+"," ",heading)
+        if not is_item and heading in headings:
+            section=heading
+            if section not in required|preferred:section=""
+            continue
+        if section not in required|preferred:continue
+        statements=[value.strip(" .;•-*:") for value in re.split(r"(?<=[.!?])\s+",line) if value.strip(" .;•-*")]
+        for statement in statements or [line]:
+            stack_mentions={token.casefold() for token in re.findall(r"\b(?:react|python|fastapi|postgres(?:ql)?)\b",statement,re.I)}
+            generic_stack=bool(len(stack_mentions)>=2 and re.search(r"\b(?:experience|familiarity|knowledge|proficiency|skills?)\b",statement,re.I))
+            category="technical_stack" if generic_stack else next((name for name,pattern in categories if re.search(pattern,statement,re.I)),"")
+            if not category:continue
+            status="preferred" if section in preferred else "required"
+            item={"requirement":statement[:500],"category":category,"requiredness":status}
+            identity=(re.sub(r"\W+"," ",statement.casefold()).strip(),category,status)
+            if identity not in {(re.sub(r"\W+"," ",x["requirement"].casefold()).strip(),x["category"],x["requiredness"]) for x in found}:
+                found.append(item)
+    return found[:40]
+
+
 ROLE_FAMILIES = {
     "software development": (
         "software engineer", "software developer", "software development engineer", "software engineering", "swe",

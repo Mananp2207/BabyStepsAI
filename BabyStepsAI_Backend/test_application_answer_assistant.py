@@ -83,6 +83,14 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
                 assistant.draft_application_answer(assistant.DraftRequest(question=question))
             self.assertEqual(caught.exception.status_code,422)
 
+    def test_invalid_historical_answer_is_excluded_from_ai_reusable_context(self):
+        saved=profile.save_application_answer("saved-city",profile.AnswerUpdate(question="Location (City)*",
+            answer="San Francisco",confirmed=True,reuse_scope="matching_jobs"))
+        with profile.connect() as db:
+            db.execute("UPDATE application_answers SET answer='yes' WHERE question_key=?",(saved["key"],))
+        _,_,reusable=assistant._verified_context()
+        self.assertFalse(any(item["question"]=="Location (City)*" for item in reusable))
+
     def test_cover_letter_text_field_is_ordinary_but_sensitive_questions_stay_blocked(self):
         self.assertTrue(assistant.ORDINARY_PROMPT.search("Please provide a cover letter (maximum 400 words)."))
         self.assertFalse(assistant.SENSITIVE_PROMPT.search("Please provide a cover letter."))

@@ -13,8 +13,36 @@ class UIThemeTests(unittest.TestCase):
             self.assertIn(text,page)
         self.assertIn('data-bsa-theme="dark"',page)
         self.assertIn('aria-pressed',page)
-        self.assertIn('localStorage.setItem(key,next)',page)
+        self.assertIn("localStorage.setItem(key,root.dataset.bsaTheme)",page)
         self.assertIn('focus-visible',page)
+        self.assertIn('aria-controls="bsa-sidebar"',page)
+        self.assertIn('data-open="true"',page)
+        self.assertIn('<body><aside class="bsa-sidebar"',page)
+        self.assertIn('sidebar.inert=mobile&&!open',page)
+        self.assertIn("addEventListener('hashchange',syncActive)",page)
+
+    def test_every_major_page_can_use_shared_responsive_shell(self):
+        from main import home
+        import career_preferences, workflow_orchestrator, application_answer_assistant
+        from onboarding import ONBOARDING_PAGE
+        pages = {
+            "Dashboard": home(),
+            "Resume": home(),
+            "Candidate Profile": candidate_verification.PROFILE_PAGE,
+            "Career Preferences": career_preferences.PAGE,
+            "Find Jobs": PAGE,
+            "Job Search Workflow": workflow_orchestrator.WORKFLOW_PAGE,
+            "Applications": application_agent.APPLICATIONS_PAGE,
+            "Onboarding": ONBOARDING_PAGE,
+            "Settings": application_answer_assistant.SETTINGS_PAGE,
+        }
+        for name, source in pages.items():
+            with self.subTest(page=name):
+                rendered = apply_ui_theme(source if isinstance(source, str) else source.body.decode())
+                self.assertIn('class="bsa-sidebar"', rendered)
+                self.assertIn('class="bsa-mobile-bar"', rendered)
+                self.assertIn('data-bsa-theme="dark"', rendered)
+                self.assertIn('aria-current="page"', rendered)
 
     def test_theme_injection_is_idempotent(self):
         once=apply_ui_theme('<html><head></head><body></body></html>')
@@ -53,6 +81,12 @@ class UIThemeTests(unittest.TestCase):
         self.assertIn('border-color:var(--bsa-line)',page)
         self.assertIn('html[data-bsa-theme="dark"] input',page)
         self.assertIn('Official employer job URL',page)
+
+    def test_long_source_diagnostics_wrap_without_overflowing_narrow_layouts(self):
+        page=apply_ui_theme('<html><head></head><body><main><p class="diagnostic">https://example.test/' + ('very-long-employer-diagnostic-' * 12) + '</p><pre>' + ('unbroken-token-' * 12) + '</pre></main></body></html>')
+        self.assertIn('body p,body small,body li,body code,body pre,body .muted,body .source,body .diagnostic{overflow-wrap:anywhere}',page)
+        self.assertIn('body pre{white-space:pre-wrap}',page)
+        self.assertIn('a{overflow-wrap:anywhere}',page)
 
 
 if __name__=='__main__': unittest.main()

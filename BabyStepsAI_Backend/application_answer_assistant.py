@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from candidate_verification import verified_profile_facts
+from candidate_verification import verified_profile_facts, validate_application_answer
 from job_search_agent import DB, USER, fetch_board
 from ollama_runtime import OLLAMA_LOCK
 from ui_theme import apply_ui_theme
@@ -132,8 +132,10 @@ def update_authorization(payload: AuthorizationUpdate):
         db.execute("INSERT INTO application_authorization_history(user_id,version,settings_json,updated_at) VALUES(?,?,?,?)",
                    (USER, version, encoded, stamp))
         try:
-            db.execute("UPDATE application_controls SET daily_limit=?,submission_enabled=0,updated_at=? WHERE user_id=?",
-                       (settings["max_applications_per_24_hours"], stamp, USER))
+            db.execute("""UPDATE application_controls SET daily_limit=?,submission_enabled=0,updated_at=?
+                WHERE user_id=? AND (daily_limit<>? OR submission_enabled<>0)""",
+                       (settings["max_applications_per_24_hours"], stamp, USER,
+                        settings["max_applications_per_24_hours"]))
         except sqlite3.OperationalError:
             pass
     public_settings=dict(settings)
@@ -188,7 +190,11 @@ def _verified_context():
     # Ordinary personal-response drafting does not need contact, demographic,
     # legal, immigration, salary, or other sensitive fields.
     facts=draft_safe_profile(facts)
-    reusable = [{"question": x["question_text"], "answer": x["answer"], "type": x["answer_type"]} for x in verified_answers]
+    reusable=[]
+    for item in verified_answers:
+        try:answer=validate_application_answer(item["question_text"],item["answer"])
+        except ValueError:continue
+        reusable.append({"question":item["question_text"],"answer":answer,"type":item["answer_type"]})
     return facts, preferences, reusable
 
 

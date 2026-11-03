@@ -22,9 +22,10 @@ from job_search_agent import (
     BOARDS, USER, assess_job, database, fetch_board, preferences, search_terms, initialize as initialize_job_sources,
 )
 from candidate_verification import (canonical_verified_candidate_facts, normalize_degree, normalize_major,
-                                    verified_profile_facts, verified_values_from_json)
+                                    verified_profile_facts, verified_values_from_json,validate_application_answer)
 from ollama_runtime import OLLAMA_LOCK
 from job_relevance import (evaluate_location, evaluate_relocation_preference, extract_education_requirements, extract_experience_requirements,
+                           extract_technical_qualification_requirements,
                            extract_gpa_requirements, extract_graduation_windows, extract_internship_requirements,
                            infer_prompt_preferences, normalize_job_record,
                            relevance_for_job)
@@ -33,7 +34,7 @@ from matching_versions import fingerprint as stable_fingerprint, profile_fingerp
 
 router = APIRouter()
 MODEL = "qwen2.5:3b"
-MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v12-relocation-preferences"
+MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v15-technical-stack-classification"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 OLLAMA_TIMEOUT = (5, 120)
 OLLAMA_ATTEMPTS = 3
@@ -68,6 +69,16 @@ class SkillEvidence(BaseModel):
     status: Literal["met", "gap", "unclear", "preferred", "confirmed_mismatch"]
     candidate_evidence: list[str] = Field(default_factory=list, max_length=12)
 
+class TechnicalQualificationEvidence(BaseModel):
+    requirement: str = Field(max_length=500)
+    category: str = Field(max_length=80)
+    requiredness: Literal["required","preferred"]
+    status: Literal["met","confirmed_mismatch","needs_review","not_applicable"]
+    posting_evidence: list[str] = Field(default_factory=list,max_length=4)
+    candidate_evidence: list[dict] = Field(default_factory=list,max_length=20)
+    explanation: str = Field(default="",max_length=1000)
+    missing_question: str = Field(default="",max_length=500)
+
 
 class MatchResult(BaseModel):
     classification: Literal["potential_match", "needs_review", "not_eligible"]
@@ -90,6 +101,11 @@ class MatchResult(BaseModel):
     location_assessment: str = Field(max_length=1000)
     employment_type_assessment: str = Field(max_length=1000)
     evidence_consistency: list[str] = Field(default_factory=list, max_length=20)
+    ai_evidence_diagnostics: list[str] = Field(default_factory=list, max_length=20)
+    applicant_review_resolutions: list[str] = Field(default_factory=list, max_length=20)
+    technical_qualifications: list[TechnicalQualificationEvidence] = Field(default_factory=list,max_length=40)
+    technical_qualification_assessed_at: str = Field(default="",max_length=100)
+    technical_qualification_snapshot: dict = Field(default_factory=dict)
 
 
 def now():
@@ -154,12 +170,11 @@ def initialize():
         db.execute("""CREATE TABLE IF NOT EXISTS job_match_result_history (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL,job_key TEXT NOT NULL,
             resume_id TEXT NOT NULL,archived_at TEXT NOT NULL,reason TEXT NOT NULL,snapshot_json TEXT NOT NULL)""")
-        # Degree alternatives and section-grounded qualification evidence changed in v11.
-        # Preserve every historical result, but prevent old decisions from
-        # being reused for application preparation.
+        # Technical evidence semantics changed: prior results remain archived
+        # in place and are considered stale until reassessed by the current engine.
         db.execute("""UPDATE job_match_results SET freshness_status='stale'
-            WHERE status='completed' AND matching_model_version NOT LIKE '%/job-match-v11-grounded-degree-alternatives'
-            AND freshness_status<>'stale'""")
+            WHERE status='completed' AND matching_model_version NOT LIKE ? AND freshness_status<>'stale'""",
+            ("%/job-match-v15-technical-stack-classification",))
         db.execute("""CREATE TABLE IF NOT EXISTS job_match_sessions (
             session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, resume_id TEXT NOT NULL,
             status TEXT NOT NULL, job_keys_json TEXT NOT NULL, batch_size INTEGER NOT NULL,
@@ -273,11 +288,17 @@ def active_candidate():
     fact_fields={"graduation_date","technical_skills","professional_experience","location"}
     try:
         with database() as db:
-            facts=db.execute("SELECT question_key,answer FROM application_answers WHERE user_id=? AND resume_id=? AND confirmed=1 AND revoked_at IS NULL AND sensitive=0",(USER,row["resume_id"])).fetchall()
+            answer_columns={column[1] for column in db.execute("PRAGMA table_info(application_answers)")}
+            question_select="question_text" if "question_text" in answer_columns else "'' AS question_text"
+            facts=db.execute(f"SELECT question_key,{question_select},answer FROM application_answers WHERE user_id=? AND resume_id=? AND confirmed=1 AND revoked_at IS NULL AND sensitive=0",(USER,row["resume_id"])).fetchall()
         for fact in facts:
             key=str(fact["question_key"] or "").removeprefix("custom:")
             if key not in fact_fields or not str(fact["answer"] or "").strip():continue
             value=str(fact["answer"]).strip()
+            legacy_questions={"graduation_date":"Graduation date","technical_skills":"Technical skills",
+                              "professional_experience":"Professional experience","location":"Current location"}
+            try:value=validate_application_answer(fact["question_text"] or legacy_questions.get(key,key),value)
+            except ValueError:continue
             if key=="technical_skills":
                 skills=[part.strip() for part in re.split(r"[,;\n]",value) if part.strip()]
                 prior_skills=profile.get("technical_skills") if isinstance(profile.get("technical_skills"),list) else []
@@ -600,10 +621,133 @@ def _normalized_ai_evidence(result, profile, job, description):
     return data,notes,exp_requirements,edu_requirements,gpa_requirements
 
 
+def _technical_qualification_assessments(description,profile,job_key=""):
+    """Compare explicit technical requirements only with confirmed narrative evidence.
+
+    A technology list is retained as a hint, but does not establish that a
+    candidate implemented a system or used a concept in practice.
+    """
+    requirements=extract_technical_qualification_requirements(description)
+    sources=[]
+    for key,label in (("projects","project"),("work_experience","employment"),("internships","internship")):
+        rows=profile.get(key,[]) if isinstance(profile.get(key),list) else []
+        for index,row in enumerate(rows):
+            if not isinstance(row,dict):continue
+            narrative=" ".join(str(value or "") for field in ("description","responsibilities","accomplishments")
+                              for value in (row.get(field,[]) if isinstance(row.get(field),list) else [row.get(field,"_")]))
+            technologies=row.get("technologies",[]) if isinstance(row.get("technologies"),list) else []
+            sources.append({"source_type":label,"source_ref":f"{key}:{index}","narrative":narrative.casefold(),
+                "technologies":" ".join(map(str,technologies)).casefold()})
+    education=profile.get("education",[]) if isinstance(profile.get("education"),list) else []
+    for index,row in enumerate(education):
+        if not isinstance(row,dict):continue
+        courses=row.get("coursework",[]) if isinstance(row.get("coursework"),list) else []
+        for course_index,course in enumerate(courses):
+            sources.append({"source_type":"verified_coursework","source_ref":f"education:{index}:coursework:{course_index}",
+                "narrative":str(course).casefold(),"technologies":""})
+    try:
+        with database() as db:
+            answers=db.execute("""SELECT question_key,question_text,answer,reuse_scope,scope_job_key,question_context
+                FROM application_answers WHERE user_id=? AND resume_id=? AND question_category='technical_qualification'
+                AND confirmed=1 AND revoked_at IS NULL AND sensitive=0 AND
+                (reuse_scope IN ('matching_jobs','general_preference') OR (reuse_scope='job_specific' AND scope_job_key=?))""",
+                (USER,active_candidate()[0],job_key)).fetchall()
+        for answer in answers:
+            try:validated_answer=validate_application_answer(answer["question_text"],answer["answer"])
+            except ValueError:continue
+            sources.append({"source_type":"confirmed_answer","source_ref":"application_answers:"+str(answer["question_key"]),
+                "narrative":validated_answer.casefold(),"technologies":"",
+                "question":str(answer["question_text"] or ""),"reuse_scope":answer["reuse_scope"],
+                "answer_context":answer["question_context"]})
+    except (sqlite3.OperationalError,HTTPException):
+        pass
+    action=re.compile(r"\b(?:build|built|develop|developed|implement|implemented|create|created|design|designed|deploy|deployed|maintain|maintained|contribute|contributed|program|programmed|write|wrote|integrat|integrated)\b",re.I)
+    patterns={
+        "web_application_experience":re.compile(r"\bweb\s+(?:app(?:lication)?s?)\b|\bwebsite(?:s)?\b",re.I),
+        "frontend_backend":None,
+        "frontend_development":re.compile(r"\bfront(?:end|[ -]?end)\b|\buser interface\b|\bclient[ -]?side\b",re.I),
+        "backend_development":re.compile(r"\bback(?:end|[ -]?end)\b|\bserver[ -]?side\b|\bserver\b|\bapis?\b|\bservices?\b|\bendpoints?\b",re.I),
+        "api_services":re.compile(r"\bapis?\b|\bweb services?\b|\bendpoints?\b",re.I),
+        "technical_stack":re.compile(r"\breact\b|\bpython\b|\bfastapi\b|\bpostgres(?:ql)?\b",re.I),
+        "databases":re.compile(r"\bdatabase\b|\bsql\b|\bpostgres(?:ql)?\b|\bmysql\b|\bmongodb\b",re.I),
+        "cloud_infrastructure":re.compile(r"\bcloud\b|\binfrastructure\b|\baws\b|\bgcp\b|\bazure\b",re.I),
+        "testing_debugging":re.compile(r"\btest(?:ing)?\b|\bdebug(?:ging)?\b",re.I),
+        "object_oriented_programming":re.compile(r"\bobject[ -]?oriented\b|\boop\b",re.I),
+        "software_design":re.compile(r"\bsoftware design\b|\bdesign patterns?\b|\bsoftware architecture\b|\bmodular design\b",re.I),
+        "version_control":re.compile(r"\bversion control\b|\bgit\b",re.I),
+        "team_collaboration":re.compile(r"\bcollaborat(?:e|ion)\b|\bteamwork\b|\bcross[ -]?functional\b",re.I),
+        "deployment_production":re.compile(r"\bdeploy(?:ment|ed)?\b|\bproduction\b|\bshipp(?:ed|ing)\b",re.I),
+    }
+    questions={
+        "web_application_experience":"Technical evidence: Which confirmed project or role demonstrates a web application you built? Briefly describe what you implemented.",
+        "frontend_backend":"Technical evidence: Which confirmed project(s) show your frontend and backend contributions? Describe what you implemented in each.",
+        "data_structures_algorithms_design":"Technical evidence: Have you completed coursework or implemented projects covering data structures, algorithms, and software design? Name the courses or describe the specific work.",
+    }
+    output=[]
+    for item in requirements:
+        category=item["category"];requiredness=item["requiredness"];supports=[]
+        if category=="frontend_backend":
+            front=[];back=[]
+            for source in sources:
+                if source["source_type"]=="confirmed_answer" and source.get("answer_context")!="frontend_backend":continue
+                text=source["narrative"]
+                if action.search(text) and patterns["frontend_development"].search(text):front.append(source)
+                if action.search(text) and patterns["backend_development"].search(text):back.append(source)
+                if source["source_type"]=="confirmed_answer" and action.search(text) and patterns["frontend_development"].search(text) and patterns["backend_development"].search(text):
+                    front.append(source);back.append(source)
+            if front and back:supports=front+back
+        elif category=="data_structures_algorithms_design":
+            facets={"data_structures":re.compile(r"\bdata structures?\b",re.I),
+                    "algorithms":re.compile(r"\balgorithms?\b|\bsorting\b|\bdynamic programming\b|\bgraph traversal\b",re.I),
+                    "software_design":patterns["software_design"]}
+            covered=set()
+            for source in sources:
+                if source["source_type"]=="confirmed_answer" and source.get("answer_context")!="data_structures_algorithms_design":continue
+                text=source["narrative"]
+                matched={name for name,pattern in facets.items() if pattern.search(text)}
+                if matched and (source["source_type"]=="verified_coursework" or action.search(text)):
+                    covered.update(matched);supports.append((source,matched))
+            status="met" if set(facets)<=covered else "needs_review"
+        else:
+            pattern=patterns.get(category)
+            for source in sources:
+                if source["source_type"]=="confirmed_answer" and source.get("answer_context")!=category:continue
+                narrative=source["narrative"]
+                if pattern and pattern.search(narrative) and (source["source_type"]=="verified_coursework" or action.search(narrative)):
+                    supports.append(source)
+        if category!="data_structures_algorithms_design":status="met" if supports else ("not_applicable" if requiredness=="preferred" else "needs_review")
+        if requiredness=="preferred" and not supports:status="not_applicable"
+        evidence=[]
+        if category=="data_structures_algorithms_design":
+            for source,facets in supports:
+                evidence.append({"source_type":source["source_type"],"source_ref":source["source_ref"],
+                    "confirmation_status":"confirmed","supports":sorted(facets),"reuse_scope":source.get("reuse_scope","profile")})
+        else:
+            for source in supports:
+                evidence.append({"source_type":source["source_type"],"source_ref":source["source_ref"],
+                    "confirmation_status":"confirmed","supports":[category],"reuse_scope":source.get("reuse_scope","profile")})
+        explanation=("Confirmed project or experience descriptions support this requirement." if status=="met" else
+            "No matching confirmed implementation evidence was found; technologies listed without a narrative of work are not sufficient." if status=="needs_review" else
+            "This preferred qualification is not supported by confirmed evidence and does not block eligibility.")
+        if category=="frontend_backend" and status=="needs_review":
+            explanation="Confirmed work does not yet establish contributions to both frontend and backend; a technology list alone is insufficient."
+        if category=="data_structures_algorithms_design" and status=="needs_review":
+            covered={facet for entry in evidence for facet in entry["supports"]}
+            explanation="Confirmed evidence covers some concepts, but not all of data structures, algorithms, and software design."
+            if not covered:explanation="No confirmed coursework or implementation evidence was found for these fundamentals."
+        output.append({"requirement":item["requirement"],"category":category,"requiredness":requiredness,"status":status,
+            "posting_evidence":[item["requirement"]],"candidate_evidence":evidence,"explanation":explanation,
+            "missing_question":questions.get(category,"") if status=="needs_review" and requiredness=="required" else ""})
+    return output
+
+
 def _evidence_rank_score(data,geo_status,ai_score):
     required=data["required_skills"]+data["required_experience"]+data["education_requirements"]
     met=sum(item["status"]=="met" for item in required)
     unresolved=sum(item["status"] in {"gap","unclear","confirmed_mismatch"} for item in required)
+    technical=[item for item in data.get("technical_qualifications",[]) if item.get("requiredness")=="required"]
+    met+=sum(item.get("status")=="met" for item in technical)
+    unresolved+=sum(item.get("status") in {"needs_review","confirmed_mismatch"} for item in technical)
     preferred=data["preferred_skills"]+data["preferred_experience"]+data["preferred_education_requirements"]
     preferred_met=sum(item["status"]=="met" for item in preferred)
     evidence=max(0,min(100,55+min(24,met*8)-min(36,unresolved*9)+min(9,preferred_met*3)+(8 if geo_status=="eligible" else 0)))
@@ -618,9 +762,21 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
         prefs["_confirmed_current_location"]={key:facts.get(key) for key in ("city","state_province","country") if facts.get(key)}
     description=html.unescape(re.sub(r"<[^>]+>"," ",str(job.get("content") or job.get("description", ""))))
     description=re.sub(r"\s+"," ",description).strip()
-    data,consistency,exp_requirements,edu_requirements,gpa_requirements=_normalized_ai_evidence(result,facts,job,description)
+    data,ai_entry_diagnostics,exp_requirements,edu_requirements,gpa_requirements=_normalized_ai_evidence(result,facts,job,description)
+    technical_posting=html.unescape(str(job.get("content") or job.get("description") or description))
+    data["technical_qualifications"]=_technical_qualification_assessments(technical_posting,facts,job.get("job_key") or "")
+    data["technical_qualification_assessed_at"]=datetime.now(timezone.utc).isoformat()
+    data["technical_qualification_snapshot"]={}
     original=result.model_dump()
-    consistency=list(dict.fromkeys([*consistency,*original.get("evidence_consistency",[])]))
+    # Model-authored consistency entries can be affirmative facts rather than
+    # contradictions. Preserve them for diagnostics, but do not let the model
+    # declare its own evidence a conflict.
+    ai_diagnostics=[str(value).strip()[:500] for value in original.get("evidence_consistency",[])
+                    if isinstance(value,str) and value.strip()][:20]
+    data["ai_evidence_diagnostics"]=list(dict.fromkeys([
+        *data.get("ai_evidence_diagnostics",[]),*ai_entry_diagnostics,*ai_diagnostics]))[:20]
+    data["evidence_consistency"]=[]
+    consistency=[]
     missing=[];gaps=[];strengths=[];hard_conflicts=[]
     profile_verified=_profile_is_verified(profile_status) and _nonempty_profile(facts)
     if not profile_verified:
@@ -674,6 +830,14 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
                 gaps.append(f"Needs evidence: {item['requirement']}")
             elif field in {"required_experience","education_requirements"} and item["status"]=="confirmed_mismatch":
                 hard_conflicts.append(f"Verified candidate evidence does not meet the required qualification: {item['requirement']}")
+    for item in data["technical_qualifications"]:
+        if item["requiredness"]!="required":continue
+        if item["status"]=="needs_review":
+            gaps.append(f"Needs technical evidence: {item['requirement']}")
+            if item.get("missing_question"):
+                missing.append("Technical qualification needs confirmation: "+item["missing_question"])
+        elif item["status"]=="confirmed_mismatch":
+            hard_conflicts.append("Confirmed candidate evidence does not meet the mandatory technical qualification: "+item["requirement"])
     for requirement in gpa_requirements["required"]:
         status,evidence=_gpa_requirement_status(requirement,facts)
         if status=="unclear":
@@ -781,12 +945,13 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
     hard_conflicts=list(dict.fromkeys(hard_conflicts))
     consistency=list(dict.fromkeys(consistency))[:20]
     if consistency:
-        missing.append("The AI assessment conflicted with verified facts or deterministic posting evidence; human review is required.")
+        data["ai_evidence_diagnostics"]=list(dict.fromkeys([
+            *data.get("ai_evidence_diagnostics",[]),*consistency]))[:20]
 
     if hard_conflicts:
         classification="not_eligible"
         gaps.extend(hard_conflicts)
-    elif consistency or missing or gaps or data["classification"]=="not_eligible":
+    elif missing or gaps or data["classification"]=="not_eligible":
         classification="needs_review"
         if data["classification"]=="not_eligible" and not consistency:
             consistency.append("The AI classified this job as ineligible without an independently verified mandatory conflict; it was downgraded to review.")
@@ -820,12 +985,13 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
         data["experience_assessment"]=(f"No required years threshold was extracted from the posting. Verified dated software employment supports {dated_months} observed month(s); graduation year is not used to infer experience.")
     data["location_assessment"]=geo_reason
     data["match_score"]=_evidence_rank_score(data,geo_status,result.match_score)
-    if consistency:
-        data["explanation"]=("This assessment was held for review because the AI output conflicted with verified candidate facts or deterministic posting evidence. "+" ".join(consistency))[:2000]
-    elif hard_conflicts:
+    if hard_conflicts:
         data["explanation"]=("A mandatory conflict is supported by deterministic evidence: "+" ".join(hard_conflicts))[:2000]
     elif missing or gaps:
-        data["explanation"]=("The available evidence does not resolve every mandatory qualification. Missing or uncertain evidence remains for review; it is not treated as a confirmed mismatch.")
+        data["explanation"]=("The available evidence does not resolve every qualification or saved preference. Missing or uncertain evidence remains for review; AI-authored diagnostics are not treated as posting evidence.")
+        if consistency:data["explanation"]+=" Diagnostic observations were retained separately for review."
+    elif consistency:
+        data["explanation"]=("Verified mandatory evidence was assessed deterministically. AI narrative diagnostics were retained for context and did not create an eligibility conflict.")[:2000]
     elif classification == "needs_review":
         data["explanation"]="The posting or candidate evidence remains uncertain. Review the listed requirements before deciding on application preparation."
     return MatchResult.model_validate(data)
@@ -983,7 +1149,7 @@ def current_provider_config():
 
 def matching_engine_version(provider=None,model=None):
     provider,model=(provider,model) if provider and model else current_provider_config()
-    return f"{provider}:{model}/job-match-v12-relocation-preferences"
+    return f"{provider}:{model}/job-match-v15-technical-stack-classification"
 
 
 def _provider_result(profile,profile_status,prefs,job,provider,model):
@@ -1145,11 +1311,17 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
                 stored = db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?", (USER, job_key)).fetchone()
                 pref_row = db.execute("SELECT preferences_json FROM career_preferences WHERE user_id=?", (USER,)).fetchone()
                 pref_data = json.loads(pref_row["preferences_json"]) if pref_row else saved_prefs
-                db.execute("""UPDATE job_match_results SET candidate_fingerprint=?,preferences_fingerprint=?,
+                candidate_fp=profile_fingerprint(profile,resume_id)
+                preferences_fp=stable_fingerprint(pref_data)
+                opening_fp=job_fingerprint(dict(stored) if stored else job)
+                engine_version=matching_engine_version(provider,provider_model)
+                result.technical_qualification_snapshot={"candidate_fingerprint":candidate_fp,
+                    "preferences_fingerprint":preferences_fp,"job_fingerprint":opening_fp,
+                    "matching_engine_version":engine_version,"assessed_at":result.technical_qualification_assessed_at}
+                db.execute("""UPDATE job_match_results SET result_json=?,candidate_fingerprint=?,preferences_fingerprint=?,
                     job_fingerprint=?,matching_model_version=?,freshness_status='current'
                     WHERE user_id=? AND job_key=? AND resume_id=?""",
-                    (profile_fingerprint(profile, resume_id), stable_fingerprint(pref_data),
-                     job_fingerprint(dict(stored) if stored else job), matching_engine_version(provider,provider_model), USER, job_key, resume_id))
+                    (result.model_dump_json(),candidate_fp,preferences_fp,opening_fp,engine_version,USER,job_key,resume_id))
             _finish_session_job(session_id,owner_token,job_key,completed=True)
         except Exception as error:
             # Keep errors useful without logging resume or job description content.
@@ -1656,11 +1828,18 @@ def reassess_saved_match_result(job_key):
         current=db.execute("SELECT * FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
                            (USER,job_key,resume_id)).fetchone()
         _archive_match_result(db,current,"deterministic_engine_reassessment",stamp)
+        candidate_fp=profile_fingerprint(profile,resume_id)
+        preferences_fp=stable_fingerprint(prefs)
+        opening_fp=job_fingerprint(dict(job_row))
+        engine_version=matching_engine_version(provider,model)
+        checked.technical_qualification_snapshot={"candidate_fingerprint":candidate_fp,
+            "preferences_fingerprint":preferences_fp,"job_fingerprint":opening_fp,
+            "matching_engine_version":engine_version,"assessed_at":checked.technical_qualification_assessed_at}
         db.execute("""UPDATE job_match_results SET status='completed',classification=?,match_score=?,result_json=?,
             error=NULL,candidate_fingerprint=?,preferences_fingerprint=?,job_fingerprint=?,matching_model_version=?,
             freshness_status='current',updated_at=? WHERE user_id=? AND job_key=? AND resume_id=?""",
-            (checked.classification,checked.match_score,checked.model_dump_json(),profile_fingerprint(profile,resume_id),
-             stable_fingerprint(prefs),job_fingerprint(dict(job_row)),matching_engine_version(provider,model),stamp,
+            (checked.classification,checked.match_score,checked.model_dump_json(),candidate_fp,
+             preferences_fp,opening_fp,engine_version,stamp,
              USER,job_key,resume_id))
     return {"job_key":job_key,"status":"completed","classification":checked.classification,
             "freshness_status":"current","matching_model_version":matching_engine_version(provider,model),

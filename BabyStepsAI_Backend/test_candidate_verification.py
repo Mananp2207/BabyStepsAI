@@ -7,6 +7,7 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from fastapi import HTTPException
 
 import candidate_verification as profile
 from job_search_agent import USER
@@ -312,6 +313,68 @@ class CandidateVerificationTests(unittest.TestCase):
         self.assertEqual(profile.list_answers()[0]["answer"], "Updated answer.")
         profile.revoke_application_answer("work-sample")
         self.assertEqual(profile.list_answers(), [])
+
+    def test_answer_value_validation_is_typed_and_distinguishes_job_conditions(self):
+        invalid=[("Location (City)*","yes"),("Location (Country)","no"),
+            ("Location (State)","true"),("Postal Code","yes"),("Email address","person"),
+            ("Phone number","555"),("LinkedIn URL","javascript:alert(1)"),
+            ("When can you start?","sometime"),("Employment type","maybe"),
+            ("Work arrangement","whatever"),("Are you willing to relocate?","maybe")]
+        for question,answer in invalid:
+            with self.subTest(question=question),self.assertRaises(ValueError):profile.validate_application_answer(question,answer)
+        valid=[("Location (City)*","San Francisco"),("Location (Country)","United States"),
+            ("Location (State)","California"),("Postal Code","94107"),("Email address","person@example.com"),
+            ("Phone number","+1 (415) 555-0199"),("LinkedIn URL","https://linkedin.com/in/person"),
+            ("When can you start?","In two weeks"),("Employment type","Full-time"),
+            ("Work arrangement","Hybrid"),("Are you willing to relocate?","No")]
+        for question,answer in valid:
+            with self.subTest(question=question):self.assertEqual(profile.validate_application_answer(question,answer),answer)
+        additional_valid=[("What is your GPA?","3.69/4.0"),("What is your degree?","Bachelor of Science in Computer Science"),
+            ("What is your graduation date?","2026-12"),
+            ("How many months of professional experience do you have?","6 months"),
+            ("What country are you authorized to work in?","United States"),("Technical skills","Python, SQL")]
+        for question,answer in additional_valid:
+            with self.subTest(question=question):self.assertEqual(profile.validate_application_answer(question,answer),answer)
+        additional_invalid=[("What is your GPA?","yes"),("What is your degree?","yes"),
+            ("What is your graduation date?","yes"),
+            ("How many months of professional experience do you have?","yes"),
+            ("What country are you authorized to work in?","yes"),("Technical skills","yes, Python")]
+        for question,answer in additional_invalid:
+            with self.subTest(question=question),self.assertRaises(ValueError):profile.validate_application_answer(question,answer)
+        with self.assertRaises(HTTPException) as bad_profile_city:
+            profile.update_verification(profile.VerificationUpdate(values={"city":"yes"},confirmed_fields=["city"]))
+        self.assertEqual(bad_profile_city.exception.status_code,400)
+        self.assertEqual(profile.canonical_answer_identity("Location (City)*")[:2],("location","city"))
+        self.assertNotEqual(profile.canonical_answer_identity("Location (City)*")[:2],
+            profile.canonical_answer_identity("Preferred work location city")[:2])
+        self.assertNotEqual(profile.canonical_answer_identity("Would you accept a full-time on-site role?")[:2],
+            profile.canonical_answer_identity("Would you accept a full-time role?")[:2])
+
+    def test_invalid_historical_answer_is_flagged_but_preserved_and_not_reusable(self):
+        saved=profile.save_application_answer("city-answer",profile.AnswerUpdate(
+            question="Location (City)*",answer="San Francisco",confirmed=True,reuse_scope="matching_jobs"))
+        self.assertTrue(saved["persisted_verified"])
+        with profile.connect() as db:
+            before=db.execute("SELECT COUNT(*) FROM application_answer_history WHERE question_key=?",(saved["key"],)).fetchone()[0]
+            db.execute("UPDATE application_answers SET answer='yes' WHERE question_key=?",(saved["key"],))
+        visible=next(item for item in profile.list_answers() if item["key"]==saved["key"])
+        self.assertEqual(visible["answer_status"],"needs_correction")
+        self.assertFalse(visible["answer_valid"])
+        self.assertFalse(visible["auto_reuse"])
+        self.assertEqual(visible["answer"],"yes")
+        with profile.connect() as db:
+            row=db.execute("SELECT answer,confirmed,auto_reuse,revoked_at FROM application_answers WHERE question_key=?",(saved["key"],)).fetchone()
+            after=db.execute("SELECT COUNT(*) FROM application_answer_history WHERE question_key=?",(saved["key"],)).fetchone()[0]
+        self.assertEqual(tuple(row),("yes",1,1,None))
+        self.assertEqual(before,after)
+
+    def test_new_invalid_answer_is_rejected_before_storage(self):
+        with self.assertRaises(Exception) as caught:
+            profile.save_application_answer("invalid-city",profile.AnswerUpdate(
+                question="Location (City)*",answer="yes",confirmed=True,reuse_scope="matching_jobs"))
+        self.assertEqual(caught.exception.status_code,422)
+        with profile.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM application_answers WHERE question_key='custom:invalid-city'").fetchone()[0],0)
 
     def test_new_resume_version_does_not_inherit_previous_confirmation(self):
         profile.update_verification(profile.VerificationUpdate(values={"full_name": "Confirmed Name"}, confirmed_fields=["full_name"]))

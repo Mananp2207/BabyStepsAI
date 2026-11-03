@@ -565,7 +565,7 @@ def home():
 <meta name="viewport"
       content="width=device-width, initial-scale=1">
 
-<title>BabyStepsAI</title>
+<title>Dashboard · BabyStepsAI</title>
 
 <style>
 body {
@@ -606,14 +606,12 @@ li {
 
 <body>
 
-<h1>BabyStepsAI</h1>
-<p><a href="/candidate-profile">Verify candidate profile</a> · <a href="/applications">Applications dashboard</a> · <a href="/find-jobs">Find jobs</a></p>
-<p class="muted">
-    AI-powered resume management prototype
-</p>
+<h1>Your job search, in one place</h1>
+<p class="muted">Manage your resume, review verified candidate information, and move toward suitable opportunities at your pace.</p>
+<p><a href="/candidate-profile">Review candidate profile</a> · <a href="/find-jobs">Find suitable jobs</a> · <a href="/applications">View applications</a></p>
 
 <div class="panel">
-    <h2>Upload Your Resume</h2>
+    <h2>Resume</h2>
 
     <p class="muted">
         A replacement becomes active while previous resume
@@ -628,7 +626,7 @@ li {
             required
         >
         <button type="submit">
-            Upload & Replace Resume
+            Upload resume
         </button>
     </form>
 
@@ -636,12 +634,12 @@ li {
 </div>
 
 <div class="panel">
-    <h2>My Resume</h2>
+    <h2>Saved resume versions</h2>
     <ul id="resumes"></ul>
 </div>
 
 <div class="panel">
-    <h2>AI Candidate Profile</h2>
+    <h2>AI extracted profile</h2>
 
     <p id="profile-status" role="status" aria-live="polite">
         Upload a resume to get started.
@@ -649,17 +647,17 @@ li {
 
     <textarea
         id="profile-json"
-        rows="20"
+        rows="8"
         spellcheck="false"
     ></textarea>
 
     <p>
         <button id="save" disabled>
-            Save Corrections
+            Save reviewed changes
         </button>
 
         <button id="analyze" disabled>
-            Re-analyze with AI
+            Re-analyze resume
         </button>
     </p>
 
