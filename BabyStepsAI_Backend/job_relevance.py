@@ -129,6 +129,20 @@ CLEARLY_UNRELATED = re.compile(
     r"administrative assistant|cybersecurity analyst|cyber security analyst|security researcher|"
     r"security research|red team|penetration tester)\b", re.I
 )
+NON_TARGET_ROLE_TITLE = re.compile(
+    r"\b(?:marketing(?:\s*&\s*[a-z-]+)?(?:\s+[a-z&/-]+){0,2}|data|business|operations)\s+(?:[a-z&/-]+\s+){0,2}(?:analyst|associate|specialist|coordinator|representative|manager|partner|technician|consultant|advisor)\b|"
+    r"\b(?:operations|support|customer service|customer success|sales|business|product|ux|"
+    r"user experience|people|accounts receivable|collections|business development|finance|financial|accounting|marketing|"
+    r"recruiting|talent acquisition|human resources|"
+    r"legal|administrative|supply chain|procurement|solutions)\s+"
+    r"(?:[a-z-]+\s+){0,2}(?:associate|analyst|specialist|coordinator|representative|manager|partner|"
+    r"technician|consultant|advisor|designer|design|scientist|architect|strategist)\b|"
+    r"\b(?:finance|financial|security operations|security|partner success|customer success|"
+    r"forward[ -]deployed|integration support|solutions|sales|people|research|ml ops|ai automation|mechatronics?|mechanical|electrical|"
+    r"civil|chemical|manufacturing|process|quality|industrial|hardware|embedded|applied machine learning|applied ml|"
+    r"machine learning|data science|analytics|sales|operations)\s+"
+    r"(?:[a-z&/-]+\s+){0,4}(?:engineer|engineering)\b", re.I
+)
 COUNTRY_ALIASES = {
     "united states": ("united states", "usa", "u.s.a.", "u.s."),
     "united kingdom": ("united kingdom", "uk", "u.k.", "england", "scotland", "wales"),
@@ -318,6 +332,13 @@ def relevance_for_job(job, preferences, prompt=""):
                                 if len(normalized) <= 4 else normalized in normalized_title)]
     if exact:
         return True, None, {"basis": "title_alias", "matched_aliases": exact}
+
+    # Long job descriptions often mention software engineers as collaborators.
+    # Do not let that incidental wording turn an operations, support, or other
+    # clearly different role into a software opening. Explicit software titles
+    # above remain eligible even when they describe an operations domain.
+    if NON_TARGET_ROLE_TITLE.search(title):
+        return False, "unrelated_role", {"basis": "non_target_role_title", "matched_aliases": []}
 
     description_norm=normalize_text(description)
     described=[alias for alias,normalized in normalized_aliases if normalized and normalized in description_norm]
@@ -795,7 +816,7 @@ def classify_experience_level(title, description="", employment_type=""):
     reasons = []
     if re.search(r"\b(intern|internship)\b", combined, re.I):
         return "Internship", ["Title or employment metadata identifies an internship."]
-    if re.search(r"\b(senior|staff|principal|lead|director|manager|vp|head of)\b", title_text, re.I):
+    if re.search(r"\b(senior|sr\.?|staff|principal|lead|director|manager|vp|head of)\b", title_text, re.I):
         return "Senior", ["Title identifies a senior or leadership role."]
     if re.search(r"\b(new\s*grad(?:uate)?|university graduate|university recruiting|university hire|campus recruiting|campus hire|graduate program|rotational(?: engineering)? program)\b", combined, re.I):
         reasons.append("Title identifies a new graduate or graduate program.")

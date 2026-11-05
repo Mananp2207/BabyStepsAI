@@ -34,7 +34,7 @@ from matching_versions import fingerprint as stable_fingerprint, profile_fingerp
 
 router = APIRouter()
 MODEL = "qwen2.5:3b"
-MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v15-technical-stack-classification"
+MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v18-target-role-filtering"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 OLLAMA_TIMEOUT = (5, 120)
 OLLAMA_ATTEMPTS = 3
@@ -174,7 +174,7 @@ def initialize():
         # in place and are considered stale until reassessed by the current engine.
         db.execute("""UPDATE job_match_results SET freshness_status='stale'
             WHERE status='completed' AND matching_model_version NOT LIKE ? AND freshness_status<>'stale'""",
-            ("%/job-match-v15-technical-stack-classification",))
+            ("%/job-match-v18-target-role-filtering",))
         db.execute("""CREATE TABLE IF NOT EXISTS job_match_sessions (
             session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, resume_id TEXT NOT NULL,
             status TEXT NOT NULL, job_keys_json TEXT NOT NULL, batch_size INTEGER NOT NULL,
@@ -405,6 +405,10 @@ def _degree_requirement_status(requirement, profile):
         if requested_major and major!=requested_major:continue
         if pursuing and row.get("currently_enrolled") is not True:
             if row.get("currently_enrolled") is False:
+                graduation=str(row.get("graduation_date") or "")
+                current_month=datetime.now(timezone.utc).strftime("%Y-%m")
+                if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])",graduation) and graduation>=current_month:
+                    return "unclear",["The verified education record gives a future graduation date but also says the candidate is not currently enrolled; this contradiction needs applicant confirmation."]
                 return "confirmed_mismatch",["Verified education record confirms the candidate is not currently pursuing the required degree."]
             return "unclear",[]
         return "met",["Verified education evidence meets the stated degree and major requirement."]
@@ -1149,7 +1153,7 @@ def current_provider_config():
 
 def matching_engine_version(provider=None,model=None):
     provider,model=(provider,model) if provider and model else current_provider_config()
-    return f"{provider}:{model}/job-match-v15-technical-stack-classification"
+    return f"{provider}:{model}/job-match-v18-target-role-filtering"
 
 
 def _provider_result(profile,profile_status,prefs,job,provider,model):

@@ -403,6 +403,30 @@ class ApplicationAgentTests(unittest.TestCase):
             app_agent.inspect_saved_application_form(app_agent.FormInspectionRequest(job_key="saved-simple"))
         self.assertEqual(stale.exception.status_code,409)
 
+    def test_current_needs_review_job_allows_read_only_inspection_but_not_preparation(self):
+        key="saved-simple"
+        with app_agent.connect() as db:
+            db.execute("UPDATE job_match_results SET classification='needs_review',result_json=? WHERE user_id=? AND job_key=?",
+                (json.dumps({"classification":"needs_review","match_score":58}),USER,key))
+        report={"application_url":"http://127.0.0.1:8000/mock-apps/simple","inspection_outcome":"partially_compatible",
+            "robots_policy":"verified_allow","form_detected":True,"page_classification":"application_form",
+            "submission_control_status":"not_detected_unresolved","human_actions_required":[],
+            "unsupported_fields":[],"unresolved_controls":[],"fields":[]}
+        with patch.object(app_agent,"inspect_public_application_form",return_value=report) as inspect:
+            saved=app_agent.inspect_saved_application_form(app_agent.FormInspectionRequest(job_key=key))
+        self.assertEqual(inspect.call_count,1)
+        self.assertEqual(inspect.call_args.args[0].split("?",1)[0],"http://127.0.0.1:8000/mock-apps/simple")
+        self.assertEqual(saved["compatibility_status"],"unresolved")
+        self.assertFalse(saved["preparation_preflight"])
+        with app_agent.connect() as db:
+            application_count=db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0]
+            authorization_count=db.execute("SELECT COUNT(*) FROM application_preparation_authorizations WHERE user_id=? AND job_key=? AND revoked_at IS NULL",(USER,key)).fetchone()[0]
+        self.assertEqual(application_count,0)
+        self.assertEqual(authorization_count,0)
+        with self.assertRaises(HTTPException) as blocked:
+            app_agent.preparation_authorization_plan(key)
+        self.assertEqual(blocked.exception.status_code,409)
+
     def test_inspection_browser_path_only_navigates_and_reads_metadata(self):
         from unittest.mock import patch
         calls=[]

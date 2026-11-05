@@ -505,7 +505,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
             row=db.execute("SELECT freshness_status,result_json FROM job_match_results WHERE job_key=? AND resume_id=?",(key,resume_id)).fetchone()
         self.assertEqual(row["freshness_status"],"stale")
         self.assertIsNotNone(row["result_json"])
-        self.assertIn("job-match-v15-technical-stack-classification",matcher.matching_engine_version("ollama","test-model"))
+        self.assertIn("job-match-v18-target-role-filtering",matcher.matching_engine_version("ollama","test-model"))
 
     def test_affirmative_ai_consistency_statements_remain_diagnostics_not_review_blockers(self):
         statements=["Bachelors degree in Computer Science, graduation date 2026-12",
@@ -682,6 +682,20 @@ class ResumeJobMatcherTests(unittest.TestCase):
                           "major_normalized":"computer science","currently_enrolled":True}]})
         self.assertEqual(status,"met")
         self.assertTrue(evidence)
+
+    def test_future_graduation_with_confirmed_not_enrolled_flag_requires_review(self):
+        requirement="Pursuing a bachelor's or master's degree in computer science"
+        status,evidence=matcher._degree_requirement_status(requirement,{
+            "education":[{"degree":"Bachelor's","degree_normalized":"bachelor","major":"Computer Science",
+                          "major_normalized":"computer science","currently_enrolled":False,
+                          "graduation_date":"2099-12"}]})
+        self.assertEqual(status,"unclear")
+        self.assertIn("contradiction needs applicant confirmation",evidence[0])
+        status,_=matcher._degree_requirement_status(requirement,{
+            "education":[{"degree":"Bachelor's","degree_normalized":"bachelor","major":"Computer Science",
+                          "major_normalized":"computer science","currently_enrolled":False,
+                          "graduation_date":"2020-12"}]})
+        self.assertEqual(status,"confirmed_mismatch")
 
     def test_deterministic_reassessment_archives_previous_result_and_updates_engine_summary(self):
         key="greenhouse:cloudflare:42"

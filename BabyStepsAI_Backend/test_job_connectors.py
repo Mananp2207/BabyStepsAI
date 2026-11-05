@@ -59,6 +59,16 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(record["title"], "Software Engineer")
             self.assertTrue(record["job_key"].startswith(kind + ":"))
             self.assertIn("active", record)
+            self.assertEqual(record["availability_status"], "current")
+
+    def test_job_availability_requires_present_active_record_or_explicit_closure(self):
+        source=connectors.EmployerSource("Example","career_page","careers","https://example.org/jobs")
+        active=connectors.normalize_job("career_page",source,{"id":"1","title":"Software Engineer","url":"https://example.org/jobs/1"})
+        closed=connectors.normalize_job("career_page",source,{"id":"2","title":"Software Engineer","url":"https://example.org/jobs/2","status":"closed"})
+        unknown=connectors.normalize_job("career_page",source,{"id":"3","title":"Software Engineer","url":"https://example.org/jobs/3","status":None})
+        self.assertEqual(active["availability_status"],"current")
+        self.assertEqual(closed["availability_status"],"expired")
+        self.assertEqual(unknown["availability_status"],"current")
 
     def test_fetch_adapters_use_documented_read_only_urls_and_payloads(self):
         fixtures = {
@@ -473,6 +483,20 @@ class ConnectorTests(unittest.TestCase):
         self.assertEqual({job["title"] for job in jobs},{"Software Engineer","Data Engineer"})
         self.assertEqual(getter.call_count,4)
 
+    def test_public_html_pagination_handles_boolean_accessibility_attributes(self):
+        robots=Mock(status_code=404,content=b"",text="")
+        first_text='<a href="/jobs/1">Software Engineer</a><a rel="next" aria-label href="/careers?page=2">Next</a>'
+        second_text='<a href="/jobs/2">Backend Engineer</a>'
+        first=Mock(status_code=200,content=first_text.encode(),text=first_text);first.raise_for_status.return_value=None
+        second=Mock(status_code=200,content=second_text.encode(),text=second_text);second.raise_for_status.return_value=None
+        source=connectors.EmployerSource("Example","public_html","", "https://example.org/careers")
+        getter=Mock(side_effect=[robots,first,robots,second])
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            jobs,error=connectors.fetch_public_career_page(source,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual({job["title"] for job in jobs},{"Software Engineer","Backend Engineer"})
+        self.assertEqual(getter.call_count,4)
+
     def test_employer_source_discovery_uses_explicit_ats_links_without_guessing(self):
         robots = Mock(status_code=404, content=b"", text="")
         page_text = '<a href="https://jobs.ashbyhq.com/verified-board">Open roles</a>'
@@ -574,6 +598,10 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("ashby", result["diagnostics"]["source_platforms"])
         self.assertEqual({job["source_platform"] for job in result["results"]}, {"lever", "ashby"})
         self.assertTrue(all(job["description"] for job in result["results"]))
+        with discovery.database() as db:
+            saved=db.execute("SELECT job_key,availability_status,last_verified_at FROM discovered_openings WHERE job_key IN ('lever:demo:l1','ashby:demo:a1') ORDER BY job_key").fetchall()
+        self.assertEqual({row["availability_status"] for row in saved},{"current"})
+        self.assertTrue(all(row["last_verified_at"] for row in saved))
 
     def test_same_canonical_url_is_deduplicated_and_provenance_retained(self):
         self.register_and_activate([

@@ -1023,22 +1023,41 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                 diagnostics["feed_failures"].append({"company": source.name, "source_platform": source.source_type,
                     "stage":"feed_response_validation","reason": "Malformed response: jobs was not a list.","source_key":source_key})
                 continue
-            if not error and source.source_type in {"greenhouse", "lever", "ashby", "career_page"}:
+            if not error and source.source_type in {"greenhouse", "lever", "ashby", "smartrecruiters", "career_page", "public_html", "rss", "sitemap"}:
                 present = {}
                 for raw in board_jobs:
                     if isinstance(raw, dict):
                         try:
                             normalized=normalize_job(source.source_type,source,raw)
-                            present[normalized["job_key"]]=bool(normalized["active"])
+                            present[normalized["job_key"]]=normalized
                         except (TypeError,ValueError):
                             continue
-                prefix=f"{source.source_type}:{source.token}:%"
                 with database() as db:
-                    db.execute("UPDATE discovered_openings SET active=0 WHERE source_platform=? AND job_key LIKE ?",
-                               (source.source_type,prefix))
-                    for known_key,is_active in present.items():
-                        db.execute("UPDATE discovered_openings SET active=? WHERE user_id=? AND source_platform=? AND job_key=?",
-                                   (int(is_active),USER,source.source_type,known_key))
+                    saved_rows=db.execute("SELECT job_key,active,availability_status FROM discovered_openings WHERE user_id=? AND source_platform=?",
+                                          (USER,source.source_type)).fetchall()
+                    has_match_table=bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone())
+                    source_job_prefix=f"{source.source_type}:{source.token}:"
+                    for saved in saved_rows:
+                        if not str(saved["job_key"] or "").startswith(source_job_prefix):
+                            continue
+                        observed=present.get(saved["job_key"])
+                        if observed is None:
+                            # Absence from a successful feed is not proof of expiry.
+                            # Withdraw it from the active set and return availability
+                            # to unknown unless explicit closure evidence was saved.
+                            if saved["active"]:
+                                db.execute("UPDATE discovered_openings SET active=0,availability_status=CASE WHEN availability_status IN ('expired','closed','removed') THEN availability_status ELSE 'unknown' END WHERE user_id=? AND job_key=?",
+                                           (USER,saved["job_key"]))
+                                if has_match_table:
+                                    db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=? AND freshness_status='current'",
+                                               (USER,saved["job_key"]))
+                            continue
+                        state=observed.get("availability_status") or "unknown"
+                        db.execute("UPDATE discovered_openings SET active=?,availability_status=?,last_verified_at=? WHERE user_id=? AND job_key=?",
+                                   (int(bool(observed["active"])),state,observed["last_verified_at"],USER,saved["job_key"]))
+                        if has_match_table and (not observed["active"] or state!="current") and saved["active"]:
+                            db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=? AND freshness_status='current'",
+                                       (USER,saved["job_key"]))
             if not error:
                 stamp = datetime.now(timezone.utc).isoformat()
                 with database() as db:
@@ -1067,11 +1086,11 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                     if prior:
                         changed=bool(prior["content_fingerprint"] and prior["content_fingerprint"]!=record["content_fingerprint"])
                         db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,description=?,
-                            country=?,work_arrangement=?,posting_date=?,last_verified_at=?,active=?,content_fingerprint=?,job_url=?,salary_json=?
+                            country=?,work_arrangement=?,posting_date=?,last_verified_at=?,active=?,availability_status=?,content_fingerprint=?,job_url=?,salary_json=?
                             WHERE user_id=? AND job_key=?""",
                             (source.name,record["title"],record["location"] or "Unspecified",record["application_url"],record["employment_type"],
                              record["description"],record["country"],record["work_arrangement"],record["posting_date"],record["last_verified_at"],
-                             int(record["active"]),record["content_fingerprint"],record["job_url"],json.dumps(record["salary"]) if record["salary"] is not None else None,USER,record["job_key"]))
+                             int(record["active"]),record["availability_status"],record["content_fingerprint"],record["job_url"],json.dumps(record["salary"]) if record["salary"] is not None else None,USER,record["job_key"]))
                         if changed:
                             table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
                             if table:
@@ -1148,6 +1167,7 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                     "country": record["country"], "work_arrangement": record["work_arrangement"],
                     "description": record["description"], "posting_date": record["posting_date"],
                     "last_verified_at": record["last_verified_at"], "active": 1,
+                    "availability_status": record["availability_status"],
                     "content_fingerprint": record["content_fingerprint"], "job_url": record["job_url"],
                     "salary_json":json.dumps(record["salary"]) if record["salary"] is not None else None,
                     "career_category":record["career_category"],"experience_level":record["experience_level"],
@@ -1218,20 +1238,21 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
             db.execute("""INSERT INTO discovered_openings
                 (user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source,
                  source_platform,source_id,country,work_arrangement,description,posting_date,last_verified_at,active,content_fingerprint,job_url,
-                 salary_json,career_category,experience_level,required_qualifications_json,preferred_qualifications_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,job_key) DO UPDATE SET
+                 salary_json,career_category,experience_level,required_qualifications_json,preferred_qualifications_json,availability_status)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,job_key) DO UPDATE SET
                 company=excluded.company,title=excluded.title,location=excluded.location,url=excluded.url,
                 employment_type=excluded.employment_type,location_status=excluded.location_status,location_reason=excluded.location_reason,
                 search_prompt=excluded.search_prompt,discovery_source=excluded.discovery_source,
                 source_platform=excluded.source_platform,source_id=excluded.source_id,country=excluded.country,
                 work_arrangement=excluded.work_arrangement,description=excluded.description,posting_date=excluded.posting_date,
-                last_verified_at=excluded.last_verified_at,active=1,content_fingerprint=excluded.content_fingerprint,job_url=excluded.job_url,
+                last_verified_at=excluded.last_verified_at,active=excluded.active,availability_status=excluded.availability_status,
+                content_fingerprint=excluded.content_fingerprint,job_url=excluded.job_url,
                 salary_json=excluded.salary_json,career_category=excluded.career_category,experience_level=excluded.experience_level,
                 required_qualifications_json=excluded.required_qualifications_json,preferred_qualifications_json=excluded.preferred_qualifications_json""",
                        (USER, item["job_key"], item["company"], item["title"], item["location"], item["url"], timestamp,
                         item["employment_type"], item["location_status"], item["location_reason"], item["search_prompt"],item["discovery_source"],
                         item["source_platform"],item["source_id"],item["country"],item["work_arrangement"],item["description"],item["posting_date"],
-                        item["last_verified_at"],item["active"],item["content_fingerprint"],item["job_url"],item["salary_json"],item["career_category"],item["experience_level"],item["required_qualifications_json"],item["preferred_qualifications_json"]))
+                        item["last_verified_at"],item["active"],item["content_fingerprint"],item["job_url"],item["salary_json"],item["career_category"],item["experience_level"],item["required_qualifications_json"],item["preferred_qualifications_json"],item["availability_status"]))
             canonical = canonicalize_job_url(item["url"])
             db.execute("INSERT INTO job_source_provenance(source_platform,source_job_key,canonical_url,content_fingerprint,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(source_platform,source_job_key) DO UPDATE SET canonical_url=excluded.canonical_url,content_fingerprint=excluded.content_fingerprint,last_seen_at=excluded.last_seen_at",
                        (item["source_platform"],item["job_key"],canonical,item["content_fingerprint"],timestamp,timestamp))
@@ -1311,7 +1332,14 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
 
 @router.get("/find-jobs", response_class=HTMLResponse)
 def find_jobs_page():
-    return apply_ui_theme(PAGE)
+    shortlist_panel='''<main class="panel" aria-labelledby="shortlistHeading"><h2 id="shortlistHeading">Saved opportunities shortlist</h2><p class="note">Ranked by posting verification, early-career evidence, description completeness, saved preferences, and match freshness. Ranking is not an eligibility decision.</p><button id="refreshShortlist" type="button">Refresh shortlist</button> <button id="analyzeShortlist" type="button" disabled>Analyze current shortlist with AI</button><p id="shortlistStatus" role="status" aria-live="polite">Loading saved openings…</p><div id="shortlistCounts" class="diagnostics"></div><div id="shortlistResults"></div></main>'''
+    shortlist_script=r'''const shortlistRoot=document.getElementById('shortlistResults');
+async function loadShortlist(){const status=document.getElementById('shortlistStatus');status.className="";status.textContent='Loading saved openings…';try{const response=await fetch('/api/jobs/shortlist?limit=10');const data=await readApiResponse(response,'Saved opportunities could not be loaded.');const counts=data.freshness_counts||{},mc=data.match_freshness_counts||{};document.getElementById('shortlistCounts').textContent=`Saved ${data.saved_count||0} · Current postings ${counts.currently_verified||0} · Recheck required ${counts.previously_verified_recheck_required||0} · Expired/closed ${counts.expired_or_closed||0} · Source unavailable ${counts.source_unavailable||0} · Unverified ${counts.unverified||0} · Current matches ${mc.current||0} · Stale ${mc.stale||0} · Legacy unknown ${mc.legacy_unknown||0} · Queued in existing session ${mc.queued||0} · Excluded before AI ${mc.excluded_before_ai||0} · Never analyzed ${mc.never_analyzed||0} · Failed ${mc.failed||0}`;shortlistRoot.replaceChildren();for(const job of data.results||[]){const card=document.createElement('article');card.className='job';const h=document.createElement('h3');h.textContent=`${job.title||'Untitled role'} · ${job.company||'Employer unknown'}`;const details=document.createElement('p');details.textContent=`${job.location} · ${job.work_arrangement} · ${job.employment_type}`;const freshness=document.createElement('p');freshness.textContent=`Posting: ${String(job.posting_freshness||'unverified').replaceAll('_',' ')}${job.last_verified_at?' · last verified '+new Date(job.last_verified_at).toLocaleDateString():''} · ${job.experience_level_evidence} · Employer identity ${String(job.employer_identity_status||'needs review').replaceAll('_',' ')} · ${job.source_reliability}`;const match=document.createElement('p');match.textContent=`Match: ${String(job.match_freshness||'never analyzed').replaceAll('_',' ')} · Eligibility: ${job.eligibility_status||'needs review'}${job.match_score===null||job.match_score===undefined?'':` · score ${job.match_score} (ranking aid only)`}`;const next=document.createElement('p');next.textContent=`Next action: ${job.next_action}${job.missing_requirements?.length?' · Missing: '+job.missing_requirements.join('; '):''}`;card.append(h,details,freshness,match,next);if(job.url){const link=document.createElement('a');link.href=job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Open official posting';card.append(link)}shortlistRoot.append(card)}const analyze=document.getElementById('analyzeShortlist');analyze.dataset.jobKeys=(data.ready_job_keys||[]).join(',');analyze.disabled=!data.matching_authorized||!data.ready_count;analyze.title=!data.matching_authorized?'Enable AI matching in Application settings first.':(!data.ready_count?'No currently verified, identity-verified, description-complete jobs need matching.':'Starts a bounded matching run only after you click.');status.className="";status.textContent=data.count?`Showing ${data.count} prioritized openings. No matching or application preparation was started.`:`No saved postings currently meet the relevance and freshness filters. Recheck sources or import another official posting.`}catch(error){shortlistRoot.replaceChildren();status.className='error';status.textContent=error.message}}
+document.getElementById('refreshShortlist').addEventListener('click',loadShortlist);
+document.getElementById('analyzeShortlist').addEventListener('click',async event=>{const button=event.currentTarget,keys=(button.dataset.jobKeys||'').split(',').filter(Boolean);if(!keys.length)return;button.disabled=true;const status=document.getElementById('shortlistStatus');status.textContent=`Starting matching for ${keys.length} selected saved jobs…`;try{const response=await fetch('/api/jobs/analyze-matches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:keys,batch_size:Math.min(5,Math.max(3,keys.length))})});const data=await readApiResponse(response,'Matching could not start.');currentMatchJobKeys=keys;currentMatchSessionId=data.session_id||null;pollingGeneration++;polling=false;matchResults.replaceChildren();matchStatus.textContent='Bounded matching session started for the selected shortlist. No unrelated paused session was resumed.';if(currentMatchSessionId)startPolling(currentMatchSessionId);status.textContent='Matching started. Check the analysis progress below.'}catch(error){status.className='error';status.textContent=error.message}finally{button.disabled=false;loadShortlist()}});
+loadShortlist();'''
+    page=PAGE.replace("<script>\nconst button",shortlist_panel+"\n<script>\n"+shortlist_script+"\nconst button",1)
+    return apply_ui_theme(page)
 
 
 @router.post("/api/jobs/search")
@@ -1382,6 +1410,168 @@ def saved_jobs():
         item["review_status"]="needs_review"
         results.append(item)
     return {"results":results,"count":len(results)}
+
+
+def _parse_utc(value):
+    try:
+        parsed=datetime.fromisoformat(str(value or "").replace("Z","+00:00"))
+        if parsed.tzinfo is None: parsed=parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError,ValueError):
+        return None
+
+
+def _posting_freshness(item, now=None, source_status=""):
+    """Conservative saved-posting status; network failure never means expired."""
+    now=now or datetime.now(timezone.utc)
+    availability=str(item.get("availability_status") or "unknown").casefold()
+    verified=_parse_utc(item.get("last_verified_at"))
+    age_days=(now-verified).total_seconds()/86400 if verified else None
+    if availability in {"expired","closed","removed"}:
+        return "expired_or_closed"
+    if not item.get("active") and availability in {"expired","closed","removed"}:
+        return "expired_or_closed"
+    if availability in {"unavailable","source_unavailable","network_failure"} or source_status in {
+        "temporarily_unavailable","network_timeout","rate_limited","access_restricted","robots_disallowed",
+        "authentication_required","permanently_unavailable"
+    }:
+        return "source_unavailable"
+    if availability=="current" and item.get("active") and verified and age_days is not None and 0<=age_days<=30:
+        return "currently_verified"
+    if verified or item.get("imported_source_url"):
+        return "previously_verified_recheck_required"
+    return "unverified"
+
+
+def _saved_job_shortlist(limit=10):
+    """Build a read-only, deterministic shortlist from saved jobs and current evidence."""
+    limit=max(1,min(int(limit),10))
+    prefs=preferences() or {}
+    with database() as db:
+        rows=db.execute("""SELECT company,title,location,url,job_key,discovered_at,employment_type,location_status,
+            location_reason,search_prompt,source_platform,source_id,country,work_arrangement,posting_date,
+            last_verified_at,active,job_url,career_category,experience_level,salary_json,description,
+            content_fingerprint,graduation_windows_json,availability_status,imported_source_url,
+            import_eligibility_status,import_review_json FROM discovered_openings WHERE user_id=?""",(USER,)).fetchall()
+        sources=db.execute("SELECT source_type,source_token,connector_status,discovery_status,health_reason,last_attempt_at FROM employers").fetchall()
+    sources_by_key={(str(s["source_type"] or "").casefold(),str(s["source_token"] or "").casefold()):dict(s) for s in sources}
+    jobs=[dict(row) for row in rows]
+    matches={}
+    if jobs:
+        try:
+            import resume_job_matcher
+            active_resume,_,_=resume_job_matcher.active_candidate()
+            matched=resume_job_matcher._match_rows([j["job_key"] for j in jobs],active_resume)
+            matches={str(m.get("job_key")):m for m in matched}
+        except (ImportError,sqlite3.Error,KeyError,TypeError,ValueError,HTTPException):
+            matches={}
+    now=datetime.now(timezone.utc)
+    candidates=[]
+    counts={"currently_verified":0,"previously_verified_recheck_required":0,"expired_or_closed":0,"source_unavailable":0,"unverified":0}
+    for item in jobs:
+        key=str(item.get("job_key") or "")
+        try: provider,token,_=key.split(":",2)
+        except ValueError: provider,token=str(item.get("source_platform") or ""),""
+        source=sources_by_key.get((provider.casefold(),token.casefold()),{})
+        freshness=_posting_freshness(item,now,source.get("connector_status", "") if source.get("discovery_status")=="verified" else "")
+        counts[freshness]=counts.get(freshness,0)+1
+        match=matches.get(key)
+        if not match:
+            match_status="never_analyzed"; match_freshness="never_analyzed"
+        elif match.get("status")=="queued":
+            match_status="queued"; match_freshness="queued"
+        elif match.get("status")=="excluded":
+            match_status="excluded_before_ai"; match_freshness="excluded_before_ai"
+        elif match.get("status")!="completed":
+            match_status=str(match.get("status") or "failed"); match_freshness="failed" if match_status in {"failed","error"} else match_status
+        elif match.get("freshness_status") in {None,"","legacy"}:
+            match_status=str(match.get("classification") or "needs_review"); match_freshness="legacy_unknown"
+        elif match.get("stale") or match.get("freshness_status")=="stale":
+            match_status=str(match.get("classification") or "needs_review"); match_freshness="stale"
+        else:
+            match_status=str(match.get("classification") or "needs_review"); match_freshness="current"
+        item["posting_freshness"]=freshness
+        item["match_freshness"]=match_freshness
+        item["matching_status"]=match_status
+        item["match_score"]=match.get("match_score") if match_freshness=="current" else None
+        generic_employer_label=bool(re.search(r"\b(careers? page|job board|company careers|unknown employer)\b",str(item.get("company") or ""),re.I))
+        source_verified=source.get("connector_status")=="healthy" and source.get("discovery_status")=="verified"
+        item["employer_identity_status"]=("needs_review" if generic_employer_label or not str(item.get("company") or "").strip()
+            else "verified" if source_verified or str(item.get("source_platform") or "").casefold() in {"greenhouse","ashby","lever"}
+            else "needs_review")
+        item["eligibility_status"]=(match_status if match_freshness=="current" else
+            str(item.get("import_eligibility_status") or "needs_review"))
+        item["description_available"]=len(str(item.get("description") or "").strip())>=240
+        item["experience_level_evidence"]=classify_experience_level(item.get("title"),item.get("description"),item.get("employment_type"))[0]
+        item["location"]=item.get("location") or "Location not listed"
+        item["work_arrangement"]=item.get("work_arrangement") or "Unknown"
+        item["employment_type"]=item.get("employment_type") or "Unknown"
+        item["missing_requirements"]=(match.get("match") or {}).get("missing_information",[]) if match_freshness=="current" else []
+        item["next_action"]=("Review eligibility" if item["eligibility_status"]=="needs_review" and match_freshness=="current" else
+            "Not eligible" if item["eligibility_status"]=="not_eligible" and match_freshness=="current" else
+            "Confirm employer identity" if item["employer_identity_status"]!="verified" else
+            "Recheck posting" if freshness!="currently_verified" else
+            "Add or enrich description" if not item["description_available"] else
+            "Queued in an existing matching session" if match_freshness=="queued" else
+            "Ready for matching" if match_freshness in {"never_analyzed","stale","legacy_unknown","failed"} else "Review result")
+        title=str(item.get("title") or "")
+        # Keep a broad software title eligible, but descriptions alone cannot
+        # turn clearly unrelated operations/support roles into opportunities.
+        relevant,_,_=relevance_for_job(item,prefs)
+        level=item["experience_level_evidence"]
+        early=level in {"New Graduate","Early Career","Graduate Eligible"}
+        senior=level in {"Senior","Experienced"}
+        exclude=(not relevant or senior or freshness=="expired_or_closed" or
+                 (match_freshness=="current" and match_status=="not_eligible"))
+        item["shortlist_eligible"]=not exclude
+        item["priority_score"]=(
+            (100 if freshness=="currently_verified" else 0)+(30 if early else 0)+
+            (15 if item["description_available"] else 0)+(12 if match_freshness=="current" else 0)+
+            (8 if source.get("connector_status")=="healthy" and source.get("discovery_status")=="verified" else 0)+
+            (10 if item.get("location_status")=="eligible" else 0)-
+            (30 if level in {"Ambiguous","Mid-Level"} else 0))
+        item["source_reliability"]=("Verified employer feed" if source.get("connector_status")=="healthy" and source.get("discovery_status")=="verified"
+            else "Official ATS provenance" if str(item.get("source_platform") or "").casefold() in {"greenhouse","ashby","lever"} and item.get("imported_source_url")
+            else "Source not currently verified")
+        candidates.append(item)
+    candidates=[j for j in candidates if j["shortlist_eligible"]]
+    candidates.sort(key=lambda j:(-int(j["priority_score"]),str(j.get("company") or "").casefold(),str(j.get("title") or "").casefold()))
+    selected=[]; seen_urls={}; duplicate_count=0
+    for item in candidates:
+        canonical=canonicalize_job_url(item.get("url") or "")
+        if canonical and canonical in seen_urls:
+            duplicate_count+=1
+            continue
+        if canonical:seen_urls[canonical]=item.get("job_key")
+        selected.append(item)
+        if len(selected)>=limit:break
+    ready=[j["job_key"] for j in selected if j["posting_freshness"]=="currently_verified" and j["employer_identity_status"]=="verified" and j["description_available"] and j["match_freshness"] in {"never_analyzed","stale","legacy_unknown","failed"}]
+    with database() as db:
+        row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone() if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_authorizations'").fetchone() else None
+    try: matching_allowed=bool(json.loads(row["settings_json"] or "{}").get("allow_ai_matching",False)) if row else False
+    except (TypeError,json.JSONDecodeError): matching_allowed=False
+    match_counts={"current":0,"stale":0,"legacy_unknown":0,"never_analyzed":0,"failed":0,"excluded_before_ai":0,"queued":0,"processing":0}
+    for item in jobs:
+        match=matches.get(str(item.get("job_key")))
+        if not match: status="never_analyzed"
+        elif match.get("status") in {"failed","error"}: status="failed"
+        elif match.get("status")=="excluded": status="excluded_before_ai"
+        elif match.get("status")=="queued": status="queued"
+        elif match.get("status")!="completed": status="processing"
+        elif match.get("freshness_status") in {None,"","legacy"}: status="legacy_unknown"
+        elif match.get("stale") or match.get("freshness_status")=="stale": status="stale"
+        else: status="current"
+        match_counts[status]+=1
+    return {"results":selected,"count":len(selected),"saved_count":len(jobs),"duplicate_postings_excluded":duplicate_count,"freshness_counts":counts,
+            "match_freshness_counts":match_counts,
+            "never_analyzed_count":match_counts["never_analyzed"],"ready_job_keys":ready[:5],"ready_count":min(len(ready),5),
+            "matching_authorized":matching_allowed,
+            "ranking_note":"Priority order is a discovery aid only; it does not establish eligibility or application readiness."}
+
+
+@router.get("/api/jobs/shortlist")
+def saved_job_shortlist(limit: int = 10):
+    return _saved_job_shortlist(limit)
 
 
 def _verified_registered_employer(domain: str) -> str:
@@ -1619,6 +1809,13 @@ def list_employers(request: Request):
     awaiting=sum(row["connector_status"] in {"ready","needs_verification"} or
         row["discovery_status"] in {"needs_verification","registered","candidate"} for row in rows)
     scheduled=sum(bool(row["next_retry_at"] and row["next_retry_at"]>current.isoformat()) for row in rows)
+    recent_cutoff=(current-timedelta(days=30)).isoformat()
+    recent_sources=sum(bool(row["discovered_at"] and row["discovered_at"]>=recent_cutoff) for row in rows)
+    failure_reasons={}
+    for row in rows:
+        reason=str(row["health_reason"] or row["connector_status"] or "unknown")
+        if reason not in {"valid_with_postings","valid_zero_postings"}:
+            failure_reasons[reason]=failure_reasons.get(reason,0)+1
     summary={"employers":len({row["employer_id"] for row in rows}),
         "sources":len(rows),"active_employers":len({row["employer_id"] for row in rows if row["active"]}),
         "active_sources":sum(bool(row["active"]) for row in rows),
@@ -1626,6 +1823,7 @@ def list_employers(request: Request):
             row["discovery_status"]=="verified" and row["last_success_at"]) for row in rows),
         "eligible_discovery_sources":len(eligible_sources),"unsupported_sources":unsupported,
         "awaiting_verification_sources":awaiting,"scheduled_retry_sources":scheduled,
+        "recently_discovered_sources":recent_sources,"source_failure_reasons":failure_reasons,
         "saved_openings":len(openings),"current_verified_openings":sum(current_counts.values()),
         "current_early_career_openings":sum(early_counts.values()),
         "current_missing_descriptions":sum(missing_description_counts.values()),
@@ -1634,20 +1832,31 @@ def list_employers(request: Request):
 
 
 @router.get("/api/employer-candidates")
-def list_employer_candidates(request: Request):
+def list_employer_candidates(request: Request, limit: int = 50):
     _require_local_admin(request)
+    limit=max(1,min(int(limit),100))
     with database() as db:
-        rows=db.execute("SELECT candidate_id,name,website_url,careers_url,evidence_url,candidate_source,candidate_record_url,candidate_license,discovered_at,last_attempt_at,status,diagnostics_json FROM employer_candidate_seeds ORDER BY discovered_at DESC").fetchall()
+        total=int(db.execute("SELECT COUNT(*) FROM employer_candidate_seeds").fetchone()[0])
+        status_counts={str(row[0]):int(row[1]) for row in db.execute("SELECT status,COUNT(*) FROM employer_candidate_seeds GROUP BY status")}
+        recent_cutoff=(datetime.now(timezone.utc)-timedelta(days=30)).isoformat()
+        recent=int(db.execute("SELECT COUNT(*) FROM employer_candidate_seeds WHERE discovered_at>=?",(recent_cutoff,)).fetchone()[0])
+        rows=db.execute("SELECT candidate_id,name,website_url,careers_url,evidence_url,candidate_source,candidate_record_url,candidate_license,discovered_at,last_attempt_at,status,diagnostics_json FROM employer_candidate_seeds ORDER BY discovered_at DESC LIMIT ?",(limit,)).fetchall()
     results=[]
+    candidate_ids=[row["candidate_id"] for row in rows]
+    provenance_by_candidate={candidate_id:[] for candidate_id in candidate_ids}
+    if candidate_ids:
+        placeholders=",".join("?" for _ in candidate_ids)
+        with database() as db:
+            provenance_rows=db.execute(f"SELECT candidate_id,provider,record_url,evidence_url,access_terms,discovered_at FROM employer_candidate_provenance WHERE candidate_id IN ({placeholders}) ORDER BY discovered_at",candidate_ids).fetchall()
+        for provenance in provenance_rows:
+            provenance_by_candidate[provenance["candidate_id"]].append({key:provenance[key] for key in ("provider","record_url","evidence_url","access_terms","discovered_at")})
     for row in rows:
         item=dict(row)
         try:item["diagnostics"]=json.loads(item.pop("diagnostics_json") or "{}")
         except (TypeError,json.JSONDecodeError):item["diagnostics"]={}
-        with database() as db:
-            provenance=db.execute("SELECT provider,record_url,evidence_url,access_terms,discovered_at FROM employer_candidate_provenance WHERE candidate_id=? ORDER BY discovered_at",(item["candidate_id"],)).fetchall()
-        item["provenance"]=[dict(p) for p in provenance]
+        item["provenance"]=provenance_by_candidate.get(item["candidate_id"],[])
         results.append(item)
-    return {"results":results,"count":len(results)}
+    return {"results":results,"count":len(results),"summary":{"total":total,"showing":len(results),"recently_discovered":recent,"by_status":status_counts}}
 
 
 def _run_employer_discovery_job(run_id: str, providers: list[str], limit: int, seed_limit: int):
@@ -1725,7 +1934,14 @@ def employer_discovery_run_status(run_id: str, request: Request):
 @router.get("/employers", response_class=HTMLResponse)
 def employer_sources_page(request: Request):
     _require_local_admin(request)
-    return HTMLResponse(apply_ui_theme(EMPLOYER_PAGE))
+    page=apply_ui_theme(EMPLOYER_PAGE)
+    candidate_script=r'''async function loadProviderHealth(){const d=await api('/api/employer-discovery/providers');$('providers').replaceChildren();for(const p of d.providers){const label=document.createElement('label');const input=document.createElement('input');input.type='checkbox';input.name='provider';input.value=p.provider;input.checked=p.provider==='yc_api';label.append(input,document.createTextNode(` ${p.label} · saved candidates ${p.candidate_count} · ${p.access_terms}${p.checkpoint?` · checkpoint ${p.checkpoint.status}`:''}`));$('providers').append(label,document.createElement('br'))}const c=await api('/api/employer-candidates?limit=50');let summary=document.getElementById('candidateSummary');if(!summary){summary=document.createElement('p');summary.id='candidateSummary';summary.className='muted';$('candidateList').before(summary)}const counts=Object.entries(c.summary?.by_status||{}).map(([name,count])=>`${name}: ${count}`).join(' · ');summary.textContent=`Candidates ${c.summary?.total||0} · Recently discovered ${c.summary?.recently_discovered||0} · ${counts} · Showing ${c.summary?.showing||0} most recent`;$('candidateList').replaceChildren();for(const x of c.results){const item=document.createElement('p');const reason=x.diagnostics?.reason||x.diagnostics?.failure?.reason||x.diagnostics?.error||'';item.textContent=`${x.name} · ${x.candidate_source} · ${x.status}${reason?` · ${reason}`:''} · ${x.website_url} · evidence ${x.evidence_url||x.candidate_record_url}`;$('candidateList').append(item)}}'''
+    page=re.sub(r"async function loadProviderHealth\(\)\{.*?\}\nasync function pollRun",candidate_script+"\nasync function pollRun",page,count=1,flags=re.S)
+    page=page.replace(" · Awaiting verification ${c.awaiting_verification_sources??'—'}",
+        " · Newly discovered sources ${c.recently_discovered_sources??'—'} · Awaiting verification ${c.awaiting_verification_sources??'—'}")
+    page=page.replace(" · Scheduled retry ${c.scheduled_retry_sources??'—'}",
+        " · Scheduled retry ${c.scheduled_retry_sources??'—'} · Source issue categories ${Object.entries(c.source_failure_reasons||{}).map(([reason,count])=>`${reason}: ${count}`).join(', ')||'none'}")
+    return HTMLResponse(page)
 
 
 def register_employer_sources(payload: EmployerImportRequest):

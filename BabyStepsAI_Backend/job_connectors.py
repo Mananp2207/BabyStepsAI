@@ -396,8 +396,10 @@ class _NextPageParser(HTMLParser):
         super().__init__(); self.links=[]
     def handle_starttag(self,tag,attrs):
         if tag.lower()!="a": return
-        attrs=dict(attrs); href=attrs.get("href",""); rel=(attrs.get("rel","")+" "+attrs.get("aria-label","")).casefold()
-        if href and ("next" in rel or attrs.get("data-page-type","").casefold()=="next"):
+        attrs=dict(attrs); href=str(attrs.get("href") or "")
+        rel=" ".join(str(attrs.get(key) or "") for key in ("rel","aria-label")).casefold()
+        page_type=str(attrs.get("data-page-type") or "").casefold()
+        if href and ("next" in rel or page_type=="next"):
             self.links.append(href)
 
 
@@ -1073,15 +1075,20 @@ def normalize_job(source_type: str, source: EmployerSource, raw: dict) -> dict:
     if source_type in {"career_page", "public_html", "sitemap", "rss", "workday"}:
         country = raw.get("country") or country
     work_arrangement = raw.get("workplaceType") or ("Remote" if raw.get("isRemote") is True else "")
-    active = raw.get("status", "").casefold() not in {"closed", "inactive", "expired", "archived"}
+    raw_status = str(raw.get("status") or "").casefold()
+    explicit_closed = raw_status in {"closed", "inactive", "expired", "archived", "removed"}
+    active = not explicit_closed
     valid_through = raw.get("validThrough")
+    expired_by_date = False
     if valid_through:
         try:
             expiry = datetime.fromisoformat(str(valid_through).replace("Z", "+00:00"))
             if expiry.tzinfo is None: expiry = expiry.replace(tzinfo=timezone.utc)
-            active = active and expiry > datetime.now(timezone.utc)
+            expired_by_date = expiry <= datetime.now(timezone.utc)
+            active = active and not expired_by_date
         except ValueError:
             pass
+    availability_status = "current" if active else ("expired" if explicit_closed or expired_by_date else "unknown")
     return {
         "job_key": stable_key, "source_platform": source_type, "source_id": external_id,
         "company": source.name, "title": title.strip(), "career_category": None,
@@ -1091,7 +1098,7 @@ def normalize_job(source_type: str, source: EmployerSource, raw: dict) -> dict:
         "description": description, "required_qualifications": None, "preferred_qualifications": None,
         "application_url": str(url or ""), "job_url": str(raw.get("jobUrl") or raw.get("hostedUrl") or url or ""),
         "posting_date": posting_date, "last_verified_at": datetime.now(timezone.utc).isoformat(),
-        "active": active, "content_fingerprint": fingerprint,
+        "active": active, "availability_status": availability_status, "content_fingerprint": fingerprint,
         "raw_source_record": raw,
     }
 

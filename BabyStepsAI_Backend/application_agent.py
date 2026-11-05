@@ -1181,14 +1181,19 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
 
 @router.post("/api/applications/form-inspections", status_code=200)
 def inspect_saved_application_form(request: FormInspectionRequest):
-    """Read-only compatibility check for a fresh, eligible saved opening."""
+    """Read-only compatibility check for a fresh match or reviewable opening.
+
+    Inspecting a public form does not establish eligibility or authorize
+    preparation. Keep those gates separate so applicants can review form
+    constraints while qualification evidence is unresolved.
+    """
     jobs=list_saved_application_jobs(eligibility="all")["results"]
     job=next((item for item in jobs if item.get("job_key")==request.job_key),None)
     if not job:
         raise HTTPException(404,"Saved job not found.")
-    if (job.get("classification")!="potential_match" or job.get("eligibility_stale") or
+    if (job.get("classification") not in {"potential_match","needs_review"} or job.get("eligibility_stale") or
             job.get("match_status")!="completed" or job.get("freshness_status")!="current"):
-        raise HTTPException(409,"Only a current potential match can be inspected from this action. Reassess the job first.")
+        raise HTTPException(409,"Only a current potential match or needs-review job can be inspected from this action. Reassess the job first.")
     if not job.get("active"):
         raise HTTPException(410,"This posting is no longer active in its saved source.")
     if not job.get("url_syntax_allowed"):
