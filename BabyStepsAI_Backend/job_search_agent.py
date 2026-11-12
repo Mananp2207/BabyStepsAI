@@ -28,7 +28,9 @@ from job_relevance import (_arrangement, evaluate_location, evaluate_relocation_
                            infer_prompt_preferences, normalize_job_record, relevance_for_job,
                            classify_experience_level, discovery_relevance_score,
                            extract_graduation_windows, extract_education_requirements,
-                           classify_career_category)
+                           extract_gpa_requirements, extract_internship_requirements,
+                           classify_career_category, infer_country_from_location,
+                           classify_role_level, extract_sponsorship_requirement)
 from ui_theme import apply_ui_theme
 from job_connectors import (EmployerSource, canonicalize_job_url, discover_source_candidates, fetch_source,
                             fetch_public_job_url, normalize_job, observe_fetch, validate_public_https_url)
@@ -74,6 +76,7 @@ logger=logging.getLogger("babysteps.job_discovery")
 class SearchRequest(BaseModel):
     prompt: str = Field(min_length=3, max_length=1500)
     run_id: str | None = Field(default=None, max_length=64)
+    source_keys: list[str] = Field(default_factory=list, max_length=15)
 
 
 class JobUrlImportRequest(BaseModel):
@@ -152,6 +155,7 @@ def initialize():
             ("required_qualifications_json","TEXT"),("preferred_qualifications_json","TEXT"),
             ("graduation_windows_json","TEXT NOT NULL DEFAULT '[]'"),
             ("availability_status","TEXT NOT NULL DEFAULT 'unknown'"),
+            ("reopened_review_required","INTEGER NOT NULL DEFAULT 0"),
             ("imported_source_url","TEXT NOT NULL DEFAULT ''"),
             ("import_eligibility_status","TEXT NOT NULL DEFAULT 'needs_review'"),
             ("import_review_json","TEXT NOT NULL DEFAULT '[]'"),
@@ -356,6 +360,13 @@ def _job_location(job):
 
 def _employment(job):
     return str(normalize_job_record(job).get("employment_type") or "").casefold()
+
+
+def _employment_type_matches(preference, observed):
+    """Compare ATS employment labels without treating punctuation/casing as meaning."""
+    expected = re.sub(r"[^a-z0-9]+", "", str(preference or "").casefold())
+    actual = re.sub(r"[^a-z0-9]+", "", str(observed or "").casefold())
+    return bool(expected and actual and (expected in actual or actual in expected))
 
 
 def _confirmed_professional_experience_years(job=None):
@@ -879,24 +890,36 @@ def recover_abandoned_discovery(run_id,confirmed_abandoned=False):
             "sources_checked":row["sources_checked"],"postings_retrieved":row["postings_retrieved"]}
 
 
-def discover(prompt, prefs, run_id=None, workflow_id=None):
+def select_discovery_sources(source_keys=None):
+    """Return active verified sources, optionally constrained to a bounded set."""
+    available=_employer_sources()
+    if not source_keys:return available
+    requested=list(dict.fromkeys(str(value or "").strip() for value in source_keys if str(value or "").strip()))
+    if len(requested)>15:raise HTTPException(422,"A targeted discovery run can select at most 15 verified sources.")
+    by_key={f"{item.source_type}:{item.token}":item for item in available}
+    unknown=[key for key in requested if key not in by_key]
+    if unknown:raise HTTPException(422,"Targeted discovery accepts only currently active, verified employer source keys.")
+    return [by_key[key] for key in requested]
+
+
+def discover(prompt, prefs, run_id=None, workflow_id=None, source_keys=None):
     """Serialize local feed runs and make unexpected interruption resumable."""
     if not _DISCOVERY_LOCK.acquire(blocking=False):
         raise HTTPException(409,"Another employer search is still running. Wait for its checkpoint or cancel it before starting another.")
     run_id=run_id or str(uuid.uuid4())
     try:
-        return _discover(prompt,prefs,run_id,workflow_id)
+        return _discover(prompt,prefs,run_id,workflow_id,source_keys)
     finally:
         _DISCOVERY_LOCK.release()
 
 
-def _discover(prompt, prefs, run_id, workflow_id=None):
+def _discover(prompt, prefs, run_id, workflow_id=None, source_keys=None):
     prefs = infer_prompt_preferences(prompt, prefs)
     terms = search_terms(prompt, prefs)
     if not terms:
         raise HTTPException(422, "Add a role or career category in Career Preferences, or include a role in your search prompt.")
 
-    sources = _employer_sources()
+    sources = select_discovery_sources(source_keys)
     with database() as db:
         configured_employers = db.execute("SELECT COUNT(DISTINCT lower(trim(name))) FROM employers").fetchone()[0]
     started_at = datetime.now(timezone.utc).isoformat()
@@ -1033,7 +1056,7 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                         except (TypeError,ValueError):
                             continue
                 with database() as db:
-                    saved_rows=db.execute("SELECT job_key,active,availability_status FROM discovered_openings WHERE user_id=? AND source_platform=?",
+                    saved_rows=db.execute("SELECT job_key,active,availability_status,reopened_review_required FROM discovered_openings WHERE user_id=? AND source_platform=?",
                                           (USER,source.source_type)).fetchall()
                     has_match_table=bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone())
                     source_job_prefix=f"{source.source_type}:{source.token}:"
@@ -1053,8 +1076,10 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                                                (USER,saved["job_key"]))
                             continue
                         state=observed.get("availability_status") or "unknown"
-                        db.execute("UPDATE discovered_openings SET active=?,availability_status=?,last_verified_at=? WHERE user_id=? AND job_key=?",
-                                   (int(bool(observed["active"])),state,observed["last_verified_at"],USER,saved["job_key"]))
+                        was_explicitly_closed=(not bool(saved["active"]) and str(saved["availability_status"]).casefold() in {"closed","expired","removed"})
+                        reopened=bool(was_explicitly_closed and observed["active"] and state=="current")
+                        db.execute("UPDATE discovered_openings SET active=?,availability_status=?,last_verified_at=?,reopened_review_required=CASE WHEN ? THEN 1 ELSE reopened_review_required END WHERE user_id=? AND job_key=?",
+                                   (int(bool(observed["active"])),state,observed["last_verified_at"],int(reopened),USER,saved["job_key"]))
                         if has_match_table and (not observed["active"] or state!="current") and saved["active"]:
                             db.execute("UPDATE job_match_results SET freshness_status='stale' WHERE user_id=? AND job_key=? AND freshness_status='current'",
                                        (USER,saved["job_key"]))
@@ -1076,7 +1101,7 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                     diagnostics["rejected_by_filter"]["invalid_posting"] += 1
                     continue
                 with database() as db:
-                    prior=db.execute("SELECT content_fingerprint FROM discovered_openings WHERE user_id=? AND job_key=?",
+                    prior=db.execute("SELECT content_fingerprint,active,availability_status,reopened_review_required FROM discovered_openings WHERE user_id=? AND job_key=?",
                                      (USER,record["job_key"])).fetchone()
                     was_previously_seen=bool(prior)
                     if prior:
@@ -1085,12 +1110,14 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                         diagnostics["new_jobs"] += 1
                     if prior:
                         changed=bool(prior["content_fingerprint"] and prior["content_fingerprint"]!=record["content_fingerprint"])
+                        reopened=bool(not prior["active"] and prior["availability_status"] in {"closed","expired","removed"} and record["active"] and record["availability_status"]=="current")
                         db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,description=?,
-                            country=?,work_arrangement=?,posting_date=?,last_verified_at=?,active=?,availability_status=?,content_fingerprint=?,job_url=?,salary_json=?
+                            country=?,work_arrangement=?,posting_date=?,last_verified_at=?,active=?,availability_status=?,content_fingerprint=?,job_url=?,salary_json=?,
+                            reopened_review_required=CASE WHEN ? THEN 1 ELSE reopened_review_required END
                             WHERE user_id=? AND job_key=?""",
                             (source.name,record["title"],record["location"] or "Unspecified",record["application_url"],record["employment_type"],
                              record["description"],record["country"],record["work_arrangement"],record["posting_date"],record["last_verified_at"],
-                             int(record["active"]),record["availability_status"],record["content_fingerprint"],record["job_url"],json.dumps(record["salary"]) if record["salary"] is not None else None,USER,record["job_key"]))
+                             int(record["active"]),record["availability_status"],record["content_fingerprint"],record["job_url"],json.dumps(record["salary"]) if record["salary"] is not None else None,int(reopened),USER,record["job_key"]))
                         if changed:
                             table=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
                             if table:
@@ -1125,12 +1152,12 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                     continue
                 location = _job_location(job) or "Unspecified"
                 employment_type = _employment(job)
-                experience_level, experience_level_evidence = classify_experience_level(
+                experience_level, experience_level_evidence = classify_role_level(
                     job["title"], record["description"], employment_type)
                 record["experience_level"] = experience_level
                 record["career_category"] = classify_career_category(job["title"], prefs)
-                if experience_level_evidence and experience_level == "Ambiguous":
-                    review_reasons.append(experience_level_evidence[0])
+                if experience_level=="Unknown":
+                    review_reasons.extend(experience_level_evidence)
                 score, ranking_explanation, _, _ = discovery_relevance_score(
                     {**job, "title": job["title"], "description": record["description"],
                      "employment_type": employment_type, "location_status": geo_status,
@@ -1160,6 +1187,11 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                     "title": job["title"], "location": location, "url": url,
                     "employment_type": employment_type, "location_status": geo_status,
                     "location_reason": geo_reason, "search_prompt": str(prompt or "")[:1500],
+                    "role_level":experience_level,"experience_level":experience_level,
+                    "experience_level_evidence":experience_level_evidence,
+                    "experience_requirements":extract_experience_requirements(record["description"]),
+                    "graduation_requirements":extract_graduation_windows(record["description"]),
+                    "sponsorship_requirement":extract_sponsorship_requirement(record["description"]),
                     "review_status": "needs_review",
                     "review_reasons": review_reasons or ["Verify job details and eligibility before applying."],
                     "discovery_source": "Company Careers Page",
@@ -1273,10 +1305,14 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
         result={**stored[item["job_key"]],"review_status":item["review_status"],"review_reasons":item["review_reasons"]}
         score, ranking_explanation, experience_level, level_evidence = discovery_relevance_score(result, prefs, ranking_skills)
         result.update(experience_level=result.get("experience_level") or experience_level,
+                      role_level=item.get("role_level",result.get("experience_level")),
                       career_category=result.get("career_category") or classify_career_category(result.get("title"), prefs),
                       relevance_score=item.get("relevance_score",score),
                       ranking_explanation=item.get("ranking_explanation",ranking_explanation),
                       experience_level_evidence=item.get("experience_level_evidence",level_evidence),
+                      experience_requirements=item.get("experience_requirements",extract_experience_requirements(result.get("description"))),
+                      graduation_requirements=item.get("graduation_requirements",extract_graduation_windows(result.get("description"))),
+                      sponsorship_requirement=item.get("sponsorship_requirement",extract_sponsorship_requirement(result.get("description"))),
                       graduation_windows=item.get("graduation_windows",extract_graduation_windows(result.get("description"))),
                       education_requirements=item.get("education_requirements",extract_education_requirements(result.get("description"))))
         result.update(discovery_status=item.get("discovery_status","previously_seen"),
@@ -1302,7 +1338,7 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                 item["matching_status"]="stale" if match.get("stale") else match.get("status","not_analyzed")
                 item["eligibility_classification"]=(match.get("classification") if match.get("status")=="completed" and not match.get("stale")
                     else "needs_review")
-                item["matching_failure_reason"]=match.get("error") or ""
+                item["matching_failure_reason"]=_public_match_error(match.get("error")) if match.get("status")=="failed" else ""
         except (ImportError,sqlite3.Error,KeyError,TypeError,ValueError,HTTPException):
             # Search results must remain available if the optional saved-match
             # diagnostic cannot be read in a partially migrated database.
@@ -1311,10 +1347,11 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
                                    str(item.get("posting_date") or ""),
                                    str(item.get("company") or "").casefold()))
     diagnostics["genuine_early_career_candidates"] = sum(
-        item.get("experience_level") in {"New Graduate", "Early Career", "Internship", "Graduate Eligible"}
+        item.get("role_level") in {"New Graduate","University Graduate","Entry Level","Junior","Associate","Software Engineer I"}
         for item in results)
-    diagnostics["experience_level_needs_review"] = sum(
-        item.get("experience_level") in {"Ambiguous", "Mid-Level"} for item in results)
+    diagnostics["experience_level_needs_review"] = sum(item.get("role_level")=="Unknown" for item in results)
+    diagnostics["internship_candidates"] = sum(item.get("role_level")=="Internship" for item in results)
+    diagnostics["mid_level_or_senior_candidates"] = sum(item.get("role_level") in {"Mid-Level","Senior","Staff/Principal"} for item in results)
     diagnostics["jobs_requiring_analysis"] = len(results)
     warnings = [f"Some sources were unavailable; results cover only feeds that responded ({len(diagnostics['feed_failures'])}/{len(sources)} failed)."
                 for _ in [0] if diagnostics["feed_failures"] and not all_failed]
@@ -1332,11 +1369,35 @@ def _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior
 
 @router.get("/find-jobs", response_class=HTMLResponse)
 def find_jobs_page():
-    shortlist_panel='''<main class="panel" aria-labelledby="shortlistHeading"><h2 id="shortlistHeading">Saved opportunities shortlist</h2><p class="note">Ranked by posting verification, early-career evidence, description completeness, saved preferences, and match freshness. Ranking is not an eligibility decision.</p><button id="refreshShortlist" type="button">Refresh shortlist</button> <button id="analyzeShortlist" type="button" disabled>Analyze current shortlist with AI</button><p id="shortlistStatus" role="status" aria-live="polite">Loading saved openings…</p><div id="shortlistCounts" class="diagnostics"></div><div id="shortlistResults"></div></main>'''
+    shortlist_panel='''<main class="panel" aria-labelledby="shortlistHeading"><h2 id="shortlistHeading">Saved opportunities shortlist</h2><p class="note">Ranked by posting verification, early-career evidence, description completeness, saved preferences, and match freshness. Ranking is not an eligibility decision.</p><p class="note">Analyze targets only openings labeled “Ready for matching” in the visible shortlist (up to five). Current results and paused checkpoints are excluded; starting analysis requires this button.</p><button id="refreshShortlist" type="button">Refresh shortlist</button> <button id="analyzeShortlist" type="button" disabled>Analyze current shortlist with AI</button><p id="shortlistStatus" role="status" aria-live="polite">Loading saved openings…</p><div id="shortlistCounts" class="diagnostics"></div><div id="shortlistResults"></div></main>'''
     shortlist_script=r'''const shortlistRoot=document.getElementById('shortlistResults');
-async function loadShortlist(){const status=document.getElementById('shortlistStatus');status.className="";status.textContent='Loading saved openings…';try{const response=await fetch('/api/jobs/shortlist?limit=10');const data=await readApiResponse(response,'Saved opportunities could not be loaded.');const counts=data.freshness_counts||{},mc=data.match_freshness_counts||{};document.getElementById('shortlistCounts').textContent=`Saved ${data.saved_count||0} · Current postings ${counts.currently_verified||0} · Recheck required ${counts.previously_verified_recheck_required||0} · Expired/closed ${counts.expired_or_closed||0} · Source unavailable ${counts.source_unavailable||0} · Unverified ${counts.unverified||0} · Current matches ${mc.current||0} · Stale ${mc.stale||0} · Legacy unknown ${mc.legacy_unknown||0} · Queued in existing session ${mc.queued||0} · Excluded before AI ${mc.excluded_before_ai||0} · Never analyzed ${mc.never_analyzed||0} · Failed ${mc.failed||0}`;shortlistRoot.replaceChildren();for(const job of data.results||[]){const card=document.createElement('article');card.className='job';const h=document.createElement('h3');h.textContent=`${job.title||'Untitled role'} · ${job.company||'Employer unknown'}`;const details=document.createElement('p');details.textContent=`${job.location} · ${job.work_arrangement} · ${job.employment_type}`;const freshness=document.createElement('p');freshness.textContent=`Posting: ${String(job.posting_freshness||'unverified').replaceAll('_',' ')}${job.last_verified_at?' · last verified '+new Date(job.last_verified_at).toLocaleDateString():''} · ${job.experience_level_evidence} · Employer identity ${String(job.employer_identity_status||'needs review').replaceAll('_',' ')} · ${job.source_reliability}`;const match=document.createElement('p');match.textContent=`Match: ${String(job.match_freshness||'never analyzed').replaceAll('_',' ')} · Eligibility: ${job.eligibility_status||'needs review'}${job.match_score===null||job.match_score===undefined?'':` · score ${job.match_score} (ranking aid only)`}`;const next=document.createElement('p');next.textContent=`Next action: ${job.next_action}${job.missing_requirements?.length?' · Missing: '+job.missing_requirements.join('; '):''}`;card.append(h,details,freshness,match,next);if(job.url){const link=document.createElement('a');link.href=job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Open official posting';card.append(link)}shortlistRoot.append(card)}const analyze=document.getElementById('analyzeShortlist');analyze.dataset.jobKeys=(data.ready_job_keys||[]).join(',');analyze.disabled=!data.matching_authorized||!data.ready_count;analyze.title=!data.matching_authorized?'Enable AI matching in Application settings first.':(!data.ready_count?'No currently verified, identity-verified, description-complete jobs need matching.':'Starts a bounded matching run only after you click.');status.className="";status.textContent=data.count?`Showing ${data.count} prioritized openings. No matching or application preparation was started.`:`No saved postings currently meet the relevance and freshness filters. Recheck sources or import another official posting.`}catch(error){shortlistRoot.replaceChildren();status.className='error';status.textContent=error.message}}
-document.getElementById('refreshShortlist').addEventListener('click',loadShortlist);
-document.getElementById('analyzeShortlist').addEventListener('click',async event=>{const button=event.currentTarget,keys=(button.dataset.jobKeys||'').split(',').filter(Boolean);if(!keys.length)return;button.disabled=true;const status=document.getElementById('shortlistStatus');status.textContent=`Starting matching for ${keys.length} selected saved jobs…`;try{const response=await fetch('/api/jobs/analyze-matches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:keys,batch_size:Math.min(5,Math.max(3,keys.length))})});const data=await readApiResponse(response,'Matching could not start.');currentMatchJobKeys=keys;currentMatchSessionId=data.session_id||null;pollingGeneration++;polling=false;matchResults.replaceChildren();matchStatus.textContent='Bounded matching session started for the selected shortlist. No unrelated paused session was resumed.';if(currentMatchSessionId)startPolling(currentMatchSessionId);status.textContent='Matching started. Check the analysis progress below.'}catch(error){status.className='error';status.textContent=error.message}finally{button.disabled=false;loadShortlist()}});
+let shortlistLoad=null;
+function addEvidenceDetails(card,evidence){
+  if(!evidence)return;
+  const alignment=evidence.candidate_alignment||{};
+  const groups=[['Mandatory qualifications',evidence.mandatory],['Confirmed matches',evidence.confirmed_matches],['Confirmed conflicts',evidence.confirmed_conflicts],['Needs applicant evidence',evidence.needs_review],['Preferred qualifications',evidence.preferred]];
+  const present=groups.some(([,items])=>Array.isArray(items)&&items.length)||evidence.missing_information?.length||evidence.employer_metadata_missing?.length||Object.keys(alignment).length;
+  if(!present)return;
+  const details=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Eligibility evidence and remaining details';details.append(summary);
+  for(const [label,items] of groups){if(!Array.isArray(items)||!items.length)continue;const heading=document.createElement('h4');heading.textContent=label;details.append(heading);const list=document.createElement('ul');for(const item of items){const row=document.createElement('li');const cited=(item.candidate_evidence||[]).join('; ');row.textContent=`${item.requirement} · ${String(item.status||'needs review').replaceAll('_',' ')}${cited?` · Candidate evidence cited: ${cited}`:''}`;list.append(row)}details.append(list)}
+  if(Object.keys(alignment).length){const heading=document.createElement('h4');heading.textContent='Candidate and preference fit';details.append(heading);const list=document.createElement('ul');for(const [label,value] of [['Role alignment',alignment.role_relevance_status],['Saved location preference',alignment.target_location_reason],['Relocation',alignment.effective_location_reason],['Work authorization',alignment.work_authorization_status==='needs_applicant_confirmation'?`Applicant confirmation needed for ${alignment.country||'the posting country'}`:String(alignment.work_authorization_status||'Unknown').replaceAll('_',' ')],['Employment type',String(alignment.employment_type_status||'unknown').replaceAll('_',' ')],['Work arrangement',String(alignment.work_arrangement_status||'unknown').replaceAll('_',' ')],['Seniority',String(alignment.experience_level_status||'unknown').replaceAll('_',' ')],['Mandatory pre-screen',alignment.mandatory_conflict||'No confirmed mandatory conflict found']]){if(!value)continue;const row=document.createElement('li');row.textContent=`${label}: ${value}`;list.append(row)}details.append(list)}
+  if(evidence.missing_information?.length){const p=document.createElement('p');p.textContent='Missing applicant evidence: '+evidence.missing_information.join('; ');details.append(p)}
+  if(evidence.employer_metadata_missing?.length){const p=document.createElement('p');p.textContent='Employer metadata not stated: '+evidence.employer_metadata_missing.join(', ');details.append(p)}card.append(details)
+}
+async function loadShortlist(){if(shortlistLoad)return shortlistLoad;shortlistLoad=(async()=>{const status=document.getElementById('shortlistStatus');status.className='';status.textContent='Loading saved openings…';try{const response=await fetch('/api/jobs/shortlist?limit=10');const data=await readApiResponse(response,'Saved opportunities could not be loaded.');const counts=data.freshness_counts||{},mc=data.match_freshness_counts||{};document.getElementById('shortlistCounts').textContent=`Saved ${data.saved_count||0} · Current postings ${counts.currently_verified||0} · Recheck required ${counts.previously_verified_recheck_required||0} · Expired/closed ${counts.expired_or_closed||0} · Source unavailable ${counts.source_unavailable||0} · Unverified ${counts.unverified||0} · Current matches ${mc.current||0} · Stale ${mc.stale||0} · Legacy unknown ${mc.legacy_unknown||0} · Queued ${mc.queued||0} · Never analyzed ${mc.never_analyzed||0} · Failed ${mc.failed||0}`;shortlistRoot.replaceChildren();if(data.confirmed_ineligible?.length){const group=document.createElement('details'),summary=document.createElement('summary');summary.textContent=`Confirmed ineligible (${data.confirmed_ineligible.length})`;group.append(summary);for(const item of data.confirmed_ineligible){const row=document.createElement('p');row.textContent=`${item.title} · ${item.company} · ${item.location}${item.reasons?.length?' · Mandatory conflict: '+item.reasons.join('; '):''} · ${item.next_action}`;group.append(row)}shortlistRoot.append(group)}if(data.preference_conflicts?.length){const group=document.createElement("details"),summary=document.createElement("summary");summary.textContent=`Saved preference conflicts (${data.preference_conflicts.length})`;group.append(summary);for(const item of data.preference_conflicts){const row=document.createElement("p");row.textContent=`${item.title} · ${item.company} · ${item.location||"Location not listed"} · ${item.reason} · ${item.next_action}`;group.append(row)}shortlistRoot.append(group)}for(const job of data.results||[]){const card=document.createElement('article');card.className='job';const h=document.createElement('h3');h.textContent=`${job.title||'Untitled role'} · ${job.company||'Employer unknown'}`;const details=document.createElement('p');details.textContent=`${job.location} · ${job.work_arrangement} · ${job.employment_type}`;const freshness=document.createElement('p');freshness.textContent=`Posting: ${String(job.posting_freshness||'unverified').replaceAll('_',' ')}${job.last_verified_at?' · last verified '+new Date(job.last_verified_at).toLocaleDateString():''} · Level: ${job.experience_level_evidence} · Employer: ${String(job.employer_identity_status||'needs review').replaceAll('_',' ')} · ${job.source_reliability}`;const statusLabels={potential_match:'Potential match',needs_review:'Needs review',not_eligible:'Not eligible'};const match=document.createElement('p');match.textContent=`Readiness: ${String(job.readiness_status||'needs review').replaceAll('_',' ')} · Match: ${String(job.match_freshness||'never analyzed').replaceAll('_',' ')} · Eligibility: ${statusLabels[job.eligibility_status]||job.eligibility_status||'Needs review'}${job.match_score===null||job.match_score===undefined?'':` · score ${job.match_score} (ranking aid only)`}`;const next=document.createElement('p');next.textContent=`Next action: ${job.next_action}${job.missing_requirements?.length?' · Missing: '+job.missing_requirements.join('; '):''}`;card.append(h,details,freshness,match,next);if(job.match_error){const error=document.createElement('p');error.className='error';error.textContent=job.match_error;card.append(error)}addEvidenceDetails(card,job.qualification_evidence);if(job.url){const link=document.createElement('a');link.href=job.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Open official posting';card.append(link)}if(job.match_freshness==='failed'&&data.matching_authorized&&job.posting_freshness==='currently_verified'&&job.employer_identity_status==='verified'&&job.description_available){const retry=document.createElement('button');retry.type='button';retry.textContent='Retry this job only';retry.setAttribute('aria-label',`Retry matching for ${job.title} at ${job.company}`);retry.addEventListener('click',async()=>{retry.disabled=true;status.className='';status.textContent=`Rechecking the official posting before retrying ${job.title}…`;try{const retried=await readApiResponse(await fetch('/api/jobs/matches/retry-failed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_key:job.job_key})}),'Selected job retry could not start.');currentMatchJobKeys=[job.job_key];currentMatchSessionId=retried.session_id||null;pollingGeneration++;polling=false;matchResults.replaceChildren();matchStatus.textContent='A new matching-only session started for this failed job. Paused sessions were left unchanged; no application was queued.';if(currentMatchSessionId)startPolling(currentMatchSessionId);status.textContent='Retry started for the selected job only.'}catch(error){status.className='error';status.textContent=error.message}finally{retry.disabled=false;loadShortlist()}});card.append(retry)}shortlistRoot.append(card)}const analyze=document.getElementById('analyzeShortlist');analyze.dataset.jobKeys=(data.ready_job_keys||[]).join(',');analyze.disabled=!data.matching_authorized||!data.ready_count;analyze.title=!data.matching_authorized?'Enable AI matching in Application settings first.':(!data.ready_count?'No current verified jobs need a new matching run. Failed jobs have a separate targeted retry action.':'Starts a bounded matching run only after you click.');status.className='';status.textContent=data.count?`Showing ${data.count} prioritized openings. A match score is not eligibility approval.`:'No saved postings currently meet the relevance and freshness filters. Recheck sources or import another official posting.'}catch(error){shortlistRoot.replaceChildren();status.className='error';status.textContent=error.message}finally{shortlistLoad=null}})();return shortlistLoad}
+'''
+    shortlist_script=shortlist_script.replace("for(const job of data.results||[]){",
+  "const groupLabels={strong_early_career:'Strong early-career opportunities',promising_needs_review:'Promising jobs needing review',level_or_location_uncertain:'Level or location uncertain',awaiting_posting_verification:'Awaiting posting verification'};for(const groupKey of Object.keys(groupLabels)){const jobs=(data.results||[]).filter(job=>job.opportunity_group===groupKey);if(!jobs.length)continue;const heading=document.createElement('h2');heading.textContent=groupLabels[groupKey]+` (${jobs.length})`;shortlistRoot.append(heading);for(const job of jobs){")
+    shortlist_script=shortlist_script.replace("shortlistRoot.append(card)}const analyze=document.getElementById('analyzeShortlist');",
+  "shortlistRoot.append(card)}}if(!data.results?.length){const empty=document.createElement('p');empty.textContent='No saved openings currently meet the relevance and freshness checks.';shortlistRoot.append(empty)}const analyze=document.getElementById('analyzeShortlist');")
+    shortlist_script=shortlist_script.replace("['Preferred qualifications',evidence.preferred]",
+  "['Preferred qualifications',evidence.preferred],['Professional experience requirements',evidence.experience_requirements],['Education requirements',evidence.education_requirements],['GPA requirements',evidence.gpa_requirements],['Graduation requirements',evidence.graduation_requirements],['Internship requirements',evidence.internship_requirements?.required]")
+    shortlist_script=shortlist_script.replace("const counts=data.freshness_counts||{},mc=data.match_freshness_counts||{};",
+  "const counts=data.freshness_counts||{},mc=data.match_freshness_counts||{},oc=data.opportunity_counts||{};")
+    shortlist_script=shortlist_script.replace(" · Failed ${mc.failed||0}`;shortlistRoot.replaceChildren();",
+  " · Failed ${mc.failed||0} · Strong early-career ${oc.strong_early_career||0} · Promising/review ${oc.promising_needs_review||0} · Level/location uncertain ${oc.level_or_location_uncertain||0} · Awaiting verification ${oc.awaiting_posting_verification||0}`;shortlistRoot.replaceChildren();")
+    shortlist_script += r'''document.getElementById('refreshShortlist').addEventListener('click',loadShortlist);
+document.getElementById('analyzeShortlist').addEventListener('click',async event=>{const button=event.currentTarget,keys=(button.dataset.jobKeys||'').split(',').filter(Boolean);if(!keys.length)return;button.disabled=true;const status=document.getElementById('shortlistStatus');status.textContent=`Starting matching for ${keys.length} selected saved jobs…`;try{const response=await fetch('/api/jobs/analyze-matches',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_keys:keys,batch_size:Math.min(5,Math.max(3,keys.length))})});const data=await readApiResponse(response,'Matching could not start.');currentMatchJobKeys=keys;currentMatchSessionId=data.session_id||null;pollingGeneration++;polling=false;matchResults.replaceChildren();matchStatus.textContent='Bounded matching session started for selected saved jobs. No unrelated paused session was resumed.';if(currentMatchSessionId)startPolling(currentMatchSessionId);status.textContent='Matching started. Check the analysis progress below.'}catch(error){status.className='error';status.textContent=error.message}finally{button.disabled=false;loadShortlist()}});
 loadShortlist();'''
     page=PAGE.replace("<script>\nconst button",shortlist_panel+"\n<script>\n"+shortlist_script+"\nconst button",1)
     return apply_ui_theme(page)
@@ -1354,7 +1415,7 @@ def search_jobs(request: SearchRequest):
     prefs = preferences()
     if prefs is None:
         raise HTTPException(422, "Save your career preferences before searching for jobs.")
-    return discover(request.prompt, prefs, request.run_id)
+    return discover(request.prompt, prefs, request.run_id,source_keys=request.source_keys)
 
 
 @router.get("/api/jobs/discovery/{run_id}")
@@ -1421,6 +1482,22 @@ def _parse_utc(value):
         return None
 
 
+def _public_match_error(error):
+    """Map stored model diagnostics to a short actionable message."""
+    message=str(error or "").casefold()
+    if "read timed out" in message or "read timeout" in message:
+        return "Local model timed out while generating this match. Check Ollama, then retry this job."
+    if "connection refused" in message or "not reachable" in message or "connectionerror" in message:
+        return "Local Ollama is unavailable. Start or check the model service, then retry this job."
+    if "malformed" in message or "schema validation" in message:
+        return "The model returned invalid structured data. Retry this job once the local model is responsive."
+    if "expired" in message or "no longer present" in message:
+        return "The posting could not be found in the latest source feed. Refresh posting availability before matching."
+    if message:
+        return "Matching failed. Review the source and model status, then retry this job."
+    return "Matching failed. Retry this job after checking the local model."
+
+
 def _posting_freshness(item, now=None, source_status=""):
     """Conservative saved-posting status; network failure never means expired."""
     now=now or datetime.now(timezone.utc)
@@ -1454,19 +1531,27 @@ def _saved_job_shortlist(limit=10):
             content_fingerprint,graduation_windows_json,availability_status,imported_source_url,
             import_eligibility_status,import_review_json FROM discovered_openings WHERE user_id=?""",(USER,)).fetchall()
         sources=db.execute("SELECT source_type,source_token,connector_status,discovery_status,health_reason,last_attempt_at FROM employers").fetchall()
+        paused_job_keys=set()
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_sessions'").fetchone():
+            for paused in db.execute("SELECT job_keys_json FROM job_match_sessions WHERE user_id=? AND status='paused'",(USER,)):
+                try:paused_job_keys.update(str(key) for key in json.loads(paused["job_keys_json"] or "[]"))
+                except (TypeError,json.JSONDecodeError):continue
     sources_by_key={(str(s["source_type"] or "").casefold(),str(s["source_token"] or "").casefold()):dict(s) for s in sources}
     jobs=[dict(row) for row in rows]
-    matches={}
+    matches={};matcher=None;profile_status="unverified";profile={};confirmed_facts={}
     if jobs:
         try:
             import resume_job_matcher
-            active_resume,_,_=resume_job_matcher.active_candidate()
+            matcher=resume_job_matcher
+            active_resume,profile_status,profile=resume_job_matcher.active_candidate()
+            if resume_job_matcher._profile_is_verified(profile_status):
+                confirmed_facts=resume_job_matcher.canonical_verified_candidate_facts(profile)
             matched=resume_job_matcher._match_rows([j["job_key"] for j in jobs],active_resume)
             matches={str(m.get("job_key")):m for m in matched}
         except (ImportError,sqlite3.Error,KeyError,TypeError,ValueError,HTTPException):
             matches={}
     now=datetime.now(timezone.utc)
-    candidates=[]
+    candidates=[];confirmed_ineligible=[];preference_conflicts=[]
     counts={"currently_verified":0,"previously_verified_recheck_required":0,"expired_or_closed":0,"source_unavailable":0,"unverified":0}
     for item in jobs:
         key=str(item.get("job_key") or "")
@@ -1502,34 +1587,300 @@ def _saved_job_shortlist(limit=10):
         item["eligibility_status"]=(match_status if match_freshness=="current" else
             str(item.get("import_eligibility_status") or "needs_review"))
         item["description_available"]=len(str(item.get("description") or "").strip())>=240
-        item["experience_level_evidence"]=classify_experience_level(item.get("title"),item.get("description"),item.get("employment_type"))[0]
+        item["role_level"],item["experience_level_reasons"]=classify_role_level(
+            item.get("title"),item.get("description"),item.get("employment_type"))
+        item["experience_level_evidence"]=item["role_level"]
+        item["experience_requirements"]=extract_experience_requirements(item.get("description"))
+        item["graduation_requirements"]=extract_graduation_windows(item.get("description"))
+        item["sponsorship_requirement"]=extract_sponsorship_requirement(item.get("description"))
         item["location"]=item.get("location") or "Location not listed"
         item["work_arrangement"]=item.get("work_arrangement") or "Unknown"
         item["employment_type"]=item.get("employment_type") or "Unknown"
         item["missing_requirements"]=(match.get("match") or {}).get("missing_information",[]) if match_freshness=="current" else []
-        item["next_action"]=("Review eligibility" if item["eligibility_status"]=="needs_review" and match_freshness=="current" else
+        match_detail=match.get("match") or {} if match else {}
+        mandatory=[];preferred=[];confirmed=[];conflicts=[];uncertain=[]
+        if match_freshness=="current" and isinstance(match_detail,dict):
+            for field in ("required_skills","required_experience","education_requirements"):
+                for evidence in match_detail.get(field) or []:
+                    if not isinstance(evidence,dict):continue
+                    entry={"requirement":str(evidence.get("requirement") or ""),
+                           "status":str(evidence.get("status") or "unclear"),
+                           "candidate_evidence":list(evidence.get("candidate_evidence") or [])}
+                    mandatory.append(entry)
+                    if entry["status"]=="met":confirmed.append(entry)
+                    elif entry["status"]=="confirmed_mismatch":conflicts.append(entry)
+                    elif entry["status"] in {"gap","unclear"}:uncertain.append(entry)
+            for field in ("preferred_skills","preferred_experience","preferred_education_requirements"):
+                for evidence in match_detail.get(field) or []:
+                    if isinstance(evidence,dict):preferred.append({"requirement":str(evidence.get("requirement") or ""),
+                        "status":str(evidence.get("status") or "preferred"),"candidate_evidence":list(evidence.get("candidate_evidence") or [])})
+        unresolved_year_requirements=[str(evidence.get("requirement") or "") for evidence in
+            (match_detail.get("required_experience") or []) if isinstance(evidence,dict) and
+            evidence.get("status") in {"gap","unclear"} and re.search(r"\b\d+(?:\s*[-–]\s*\d+)?\+?\s+years?\b",str(evidence.get("requirement") or ""),re.I)]
+        item["match_error"]=_public_match_error(match.get("error")) if match and match_freshness=="failed" else ""
+        target_location_status,target_location_reason=evaluate_location(item,prefs.get("location", ""))
+        relocation=evaluate_relocation_preference(item,prefs)
+        effective_location=relocation or (target_location_status,target_location_reason)
+        mandatory_conflict=(matcher._pre_ai_mandatory_conflict(item,profile,profile_status)
+                            if matcher and profile else None)
+        assessment_ok,assessment_reason,assessment_notes=assess_job(
+            item,prefs,str(item.get("search_prompt") or ""))
+        relevant,relevance_reason,relevance_evidence=relevance_for_job(item,prefs)
+        relevance_basis=str((relevance_evidence or {}).get("basis") or "")
+        role_review=bool(relevant and relevance_basis!="title_alias")
+        level=item["role_level"]
+        early_preference=any(str(value).casefold() in {"new graduate","entry level","junior","associate","early career"}
+                             for value in prefs.get("levels",[]) if isinstance(value,str))
+        experience_evidence_missing=any("confirmed professional experience is unavailable" in str(note).casefold()
+                                        for note in assessment_notes or [])
+        seniority_preference_conflict=(early_preference and level in {"Senior","Staff/Principal","Mid-Level"}
+                                       and not experience_evidence_missing)
+        role_seniority_missing=any(re.search(r"experience level.{0,60}(?:not clear|unclear|not established)",
+            str(value),re.I) for value in (match_detail.get("missing_information") or []))
+        preference_conflict=(not assessment_ok and assessment_reason in {
+            "location","experience_level","employment_type","work_arrangement","instructions"})
+        if experience_evidence_missing and assessment_reason=="experience_level":
+            preference_conflict=False
+        preference_conflict=preference_conflict or seniority_preference_conflict
+        if seniority_preference_conflict and not assessment_reason:assessment_reason="experience_level"
+        if item.get("employment_type")!="Unknown":
+            employment_status="compatible" if not prefs.get("employment_types") or any(
+                _employment_type_matches(value,item["employment_type"])
+                for value in prefs.get("employment_types",[])) else "mismatch"
+        else:
+            employment_status="unknown" if prefs.get("employment_types") else "not_configured"
+        selected_arrangement=_arrangement(str(prefs.get("work_arrangement") or ""))
+        observed_arrangement=_arrangement(str(item.get("work_arrangement") or ""))
+        arrangement_status=("not_configured" if not selected_arrangement else "unknown" if not observed_arrangement else
+            "compatible" if selected_arrangement==observed_arrangement else "mismatch")
+        country=infer_country_from_location(item.get("location"),item.get("country"))
+        if country:
+            auth_confirmed=bool(matcher and profile and matcher._profile_is_verified(profile_status) and
+                matcher._confirmed_work_authorization_for_country(confirmed_facts,country))
+            authorization_status="confirmed_for_country" if auth_confirmed else "needs_applicant_confirmation"
+        else:
+            authorization_status="country_not_stated"
+        experience_evidence=[]
+        for requirement in item["experience_requirements"]["required"]:
+            if matcher and profile and matcher._profile_is_verified(profile_status):
+                requirement_status,requirement_evidence=matcher._experience_requirement_status(
+                    requirement["requirement"],confirmed_facts,item)
+            else:requirement_status,requirement_evidence="unclear",[]
+            experience_evidence.append({"requirement":requirement["requirement"],"status":requirement_status,
+                "candidate_evidence":requirement_evidence})
+        for requirement in item["experience_requirements"]["preferred"]:
+            experience_evidence.append({"requirement":requirement["requirement"],"status":"preferred","candidate_evidence":[]})
+        item["experience_requirement_evidence"]=experience_evidence
+        sponsorship_status=item["sponsorship_requirement"]["status"]
+        if sponsorship_status=="not_available":
+            sponsor_facts=[confirmed_facts.get(key) for key in (
+                "sponsorship_required_now","sponsorship_required_future","requires_sponsorship")]
+            sponsor_facts=[str(value).strip().casefold() for value in sponsor_facts if value not in (None,"",[],{})]
+            if any(value in {"yes","true","required","1"} for value in sponsor_facts):
+                item["sponsorship_compatibility"]="confirmed_conflict"
+                mandatory_conflict=mandatory_conflict or "mandatory: employer states sponsorship is unavailable, but confirmed applicant facts indicate sponsorship is required"
+            elif sponsor_facts and all(value in {"no","false","not required","0"} for value in sponsor_facts):
+                item["sponsorship_compatibility"]="confirmed_compatible"
+            else:item["sponsorship_compatibility"]="needs_applicant_confirmation"
+        else:item["sponsorship_compatibility"]="not_stated"
+        employment_unknown=item["employment_type"]=="Unknown"
+        arrangement_unknown=arrangement_status=="unknown"
+        role_level_unknown=level=="Unknown"
+        education_requirements=extract_education_requirements(item.get("description"))
+        education_evidence=[]
+        for requirement in education_requirements["required"]:
+            state,evidence=(matcher._degree_requirement_status(requirement,confirmed_facts)
+                if matcher and profile and matcher._profile_is_verified(profile_status) else ("unclear",[]))
+            education_evidence.append({"requirement":requirement,"status":state,"candidate_evidence":evidence})
+        gpa_requirements=extract_gpa_requirements(item.get("description"))
+        gpa_evidence=[]
+        for requirement in gpa_requirements["required"]:
+            state,evidence=(matcher._gpa_requirement_status(requirement,confirmed_facts)
+                if matcher and profile and matcher._profile_is_verified(profile_status) else ("unclear",[]))
+            gpa_evidence.append({"requirement":requirement,"status":state,"candidate_evidence":evidence})
+        graduation_evidence=[]
+        graduation_dates=list(dict.fromkeys([str(confirmed_facts.get("graduation_date") or ""),
+            *[str(row.get("graduation_date") or "") for row in confirmed_facts.get("education",[]) if isinstance(row,dict)]]))
+        graduation_dates=[value for value in graduation_dates if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])",value)]
+        for requirement in item["graduation_requirements"]:
+            if requirement.get("status") not in {"required","unclear"}:continue
+            states=[matcher._graduation_window_matches(requirement,date) for date in graduation_dates] if matcher else []
+            state=("met" if True in states else "confirmed_mismatch" if requirement.get("status")=="required" and states and all(value is False for value in states)
+                else "unclear")
+            graduation_evidence.append({"requirement":requirement.get("requirement"),"status":state,
+                "candidate_evidence":["Confirmed graduation date matches the posting window."] if state=="met" else []})
+        if item["sponsorship_requirement"]["status"]=="not_available" and item["sponsorship_compatibility"]=="needs_applicant_confirmation":
+            item["missing_requirements"]=list(dict.fromkeys([*item["missing_requirements"],
+                "Employer does not offer sponsorship; confirm whether sponsorship will be required."]))
+        if role_level_unknown:
+            item["missing_requirements"]=list(dict.fromkeys([*item["missing_requirements"],*item["experience_level_reasons"]]))
+        if country and authorization_status!="confirmed_for_country":
+            item["missing_requirements"]=list(dict.fromkeys([*item["missing_requirements"],
+                f"Work authorization for {country.replace('_',' ').title()} is not confirmed."]))
+        elif not country:
+            item["missing_requirements"]=list(dict.fromkeys([*item["missing_requirements"],
+                "The employer has not identified the eligible country for remote work."]))
+        if match_freshness=="current" and unresolved_year_requirements:
+            item["missing_requirements"]=list(dict.fromkeys([*item["missing_requirements"],
+                *["Confirm relevant professional experience for the stated minimum: "+value
+                  for value in unresolved_year_requirements]]))
+        for evidence in experience_evidence+education_evidence+gpa_evidence+graduation_evidence:
+            if evidence.get("status")=="unclear":
+                requirement=str(evidence.get("requirement") or "").strip()
+                if requirement:item["missing_requirements"]=list(dict.fromkeys([*item["missing_requirements"],
+                    "Confirm evidence for mandatory qualification: "+requirement]))
+            if evidence.get("status")=="confirmed_mismatch":
+                mandatory_conflict=mandatory_conflict or ("mandatory: verified candidate evidence conflicts with "+str(evidence.get("requirement") or "a required qualification"))
+        item["qualification_evidence"]={"mandatory":mandatory,"confirmed_matches":confirmed,
+            "confirmed_conflicts":conflicts,"needs_review":uncertain,"preferred":preferred,
+            "experience_requirements":experience_evidence,"education_requirements":education_evidence,
+            "gpa_requirements":gpa_evidence,"graduation_requirements":graduation_evidence,
+            "internship_requirements":extract_internship_requirements(item.get("description")),
+            "sponsorship_requirement":item["sponsorship_requirement"],
+            "missing_information":list(dict.fromkeys([*item["missing_requirements"],
+                *((match_detail.get("missing_information") or []) if match_freshness=="current" else [])])),
+            "employer_metadata_missing":[label for label,value in (("employment type",item.get("employment_type")),
+                ("work arrangement",item.get("work_arrangement")),("country for remote work",country),
+                ("role level",item.get("role_level"))) if str(value or "").strip().casefold() in {"","unknown","not listed","n/a"}]}
+        item["candidate_alignment"]={
+            "role_relevance_status":("title_aligned" if relevant and not role_review else
+                "related_or_ambiguous_needs_review" if relevant else "unrelated"),
+            "role_relevance_reason":relevance_reason or "Saved role preference matches the posting title.",
+            "target_location_status":target_location_status,"target_location_reason":target_location_reason,
+            "relocation_status":relocation[0] if relocation else "not_applicable",
+            "effective_location_status":effective_location[0],"effective_location_reason":effective_location[1],
+            "work_authorization_status":authorization_status,"country":country or None,
+            "sponsorship_status":sponsorship_status,
+            "sponsorship_compatibility":item["sponsorship_compatibility"],
+            "employment_type_status":employment_status,"work_arrangement_status":arrangement_status,
+            "experience_level_status":("early_career_evidence" if level in {"New Graduate","University Graduate","Entry Level","Junior","Associate","Software Engineer I"}
+                else "senior_evidence" if level in {"Senior","Staff/Principal"}
+                else "mid_level_evidence" if level=="Mid-Level" else "needs_review"),
+            "experience_review_reasons":[str(note) for note in (assessment_notes or [])
+                if "experience" in str(note).casefold()],
+            "preference_review_reasons":list(assessment_notes or []),
+            "mandatory_conflict":mandatory_conflict,
+        }
+        item["qualification_evidence"]["candidate_alignment"]=item["candidate_alignment"]
+        if mandatory_conflict and match_freshness!="current":
+            item["eligibility_status"]="not_eligible"
+            item["readiness_status"]="confirmed_ineligible"
+        elif (match_freshness=="current" and match_status=="not_eligible") or mandatory_conflict:
+            item["readiness_status"]="confirmed_ineligible"
+        elif freshness!="currently_verified" or item["employer_identity_status"]!="verified":
+            item["readiness_status"]="posting_verification_required"
+        elif early_preference and level in {"Mid-Level","Senior","Staff/Principal"}:
+            item["readiness_status"]="preference_conflict"
+        elif match_freshness=="current" and role_seniority_missing and level not in {"New Graduate","University Graduate","Entry Level","Junior","Associate","Software Engineer I","Internship"}:
+            item["readiness_status"]="needs_applicant_review"
+        elif match_freshness=="current" and (not country or (country and authorization_status!="confirmed_for_country")
+                or employment_unknown
+                or (selected_arrangement and arrangement_unknown)
+                or item["sponsorship_compatibility"]=="needs_applicant_confirmation"):
+            item["readiness_status"]="needs_applicant_review"
+        elif match_freshness=="current":
+            item["readiness_status"]="current_match"
+        elif match_freshness=="failed":
+            item["readiness_status"]="failed_analysis"
+        elif item["job_key"] in paused_job_keys:
+            item["readiness_status"]="paused_checkpoint_preserved"
+        elif match_freshness=="queued":
+            item["readiness_status"]="matching_queued"
+        elif preference_conflict:
+            item["readiness_status"]="preference_conflict"
+        elif role_review:
+            item["readiness_status"]="needs_applicant_review"
+        elif experience_evidence_missing:
+            item["readiness_status"]="needs_applicant_review"
+        elif role_level_unknown:
+            item["readiness_status"]="needs_applicant_review"
+        elif item["sponsorship_compatibility"]=="needs_applicant_confirmation":
+            item["readiness_status"]="needs_applicant_review"
+        elif country and authorization_status!="confirmed_for_country":
+            item["readiness_status"]="needs_applicant_review"
+        elif not country:
+            item["readiness_status"]="needs_applicant_review"
+        elif employment_unknown or arrangement_unknown:
+            item["readiness_status"]="needs_applicant_review"
+        elif not item["description_available"]:
+            item["readiness_status"]="description_incomplete"
+        elif match_freshness in {"never_analyzed","stale","legacy_unknown"}:
+            item["readiness_status"]="ready_for_matching"
+        else:
+            item["readiness_status"]="needs_review"
+        item["next_action"]=("Do not prepare; confirmed mandatory mismatch" if item["readiness_status"]=="confirmed_ineligible" else
+            "Review saved preference conflict" if item["readiness_status"]=="preference_conflict" else
+            "Review whether this job family matches your target roles" if role_review and match_freshness!="current" else
+            "Retry this failed match" if match_freshness=="failed" else
+            "Review role seniority; the posting does not establish early-career suitability" if role_seniority_missing and match_freshness=="current" else
+            "Confirm experience for the stated minimum" if experience_evidence_missing and match_freshness!="current" else
+            "Verify role level against the posting requirements" if role_level_unknown else
+            "Confirm whether employer sponsorship will be required" if item["sponsorship_compatibility"]=="needs_applicant_confirmation" else
+            "Confirm remote hiring country with the employer" if not country else
+            "Confirm country-specific work authorization" if authorization_status=="needs_applicant_confirmation" else
+            "Verify employment type and work arrangement with the employer" if employment_unknown or arrangement_unknown else
+            "Confirm professional experience for the stated minimum" if unresolved_year_requirements or experience_evidence_missing else
+            "Review mandatory qualification evidence" if any(str(value).startswith("Confirm evidence for mandatory qualification:") for value in item["missing_requirements"]) else
+            "Review eligibility" if item["eligibility_status"]=="needs_review" and match_freshness=="current" else
             "Not eligible" if item["eligibility_status"]=="not_eligible" and match_freshness=="current" else
             "Confirm employer identity" if item["employer_identity_status"]!="verified" else
             "Recheck posting" if freshness!="currently_verified" else
             "Add or enrich description" if not item["description_available"] else
             "Queued in an existing matching session" if match_freshness=="queued" else
-            "Ready for matching" if match_freshness in {"never_analyzed","stale","legacy_unknown","failed"} else "Review result")
+            "Retry this failed match" if match_freshness=="failed" else
+            "Review preserved paused checkpoint" if item["readiness_status"]=="paused_checkpoint_preserved" else
+            "Ready for matching" if item["readiness_status"]=="ready_for_matching" else "Review result")
+        if preference_conflict:
+            preference_conflicts.append({"company":item.get("company"),"title":item.get("title"),
+                "location":item.get("location"),"reason":assessment_reason or effective_location[1],
+                "next_action":"Review saved career preferences before treating this opening as a candidate-aligned opportunity."})
         title=str(item.get("title") or "")
         # Keep a broad software title eligible, but descriptions alone cannot
         # turn clearly unrelated operations/support roles into opportunities.
         relevant,_,_=relevance_for_job(item,prefs)
         level=item["experience_level_evidence"]
-        early=level in {"New Graduate","Early Career","Graduate Eligible"}
-        senior=level in {"Senior","Experienced"}
-        exclude=(not relevant or senior or freshness=="expired_or_closed" or
+        early=level in {"New Graduate","University Graduate","Entry Level","Junior","Associate","Software Engineer I"}
+        senior=level in {"Senior","Staff/Principal"}
+        mid=level=="Mid-Level"
+        exclude=(not relevant or senior or (mid and early_preference and not experience_evidence_missing) or freshness=="expired_or_closed" or preference_conflict or mandatory_conflict or
                  (match_freshness=="current" and match_status=="not_eligible"))
         item["shortlist_eligible"]=not exclude
+        if freshness!="currently_verified" or item["employer_identity_status"]!="verified":
+            item["opportunity_group"]="awaiting_posting_verification"
+        elif item["readiness_status"]=="confirmed_ineligible":
+            item["opportunity_group"]="confirmed_ineligible"
+        elif level=="Unknown" or not country:
+            item["opportunity_group"]="level_or_location_uncertain"
+        elif early and match_freshness=="current" and match_status=="potential_match" and not item["missing_requirements"] and not mandatory_conflict:
+            item["opportunity_group"]="strong_early_career"
+        elif early:
+            item["opportunity_group"]="promising_needs_review"
+        else:
+            item["opportunity_group"]="level_or_location_uncertain"
+        if (match_freshness=="current" and match_status=="not_eligible") or mandatory_conflict:
+            reasons=[str(evidence.get("requirement") or "Confirmed mandatory conflict")
+                for field in ("required_skills","required_experience","education_requirements")
+                for evidence in (match_detail.get(field) or [])
+                if isinstance(evidence,dict) and evidence.get("status")=="confirmed_mismatch"]
+            if mandatory_conflict:reasons.append(mandatory_conflict.removeprefix("mandatory:").strip())
+            confirmed_ineligible.append({"company":item.get("company"),"title":item.get("title"),
+                "location":item.get("location") or "Location not listed","reasons":reasons[:8],
+                "next_action":"Do not prepare; verified evidence conflicts with a mandatory qualification."})
+        target_location_bonus=35 if target_location_status=="eligible" else (-15 if target_location_status=="mismatch" else 0)
+        employment_bonus=5 if employment_status=="compatible" else (-3 if employment_status=="unknown" else 0)
+        arrangement_bonus=4 if arrangement_status=="compatible" else (-2 if arrangement_status=="unknown" else 0)
         item["priority_score"]=(
-            (100 if freshness=="currently_verified" else 0)+(30 if early else 0)+
+            (100 if freshness=="currently_verified" else 0)+(50 if early else 0)+target_location_bonus+
             (15 if item["description_available"] else 0)+(12 if match_freshness=="current" else 0)+
-            (8 if source.get("connector_status")=="healthy" and source.get("discovery_status")=="verified" else 0)+
-            (10 if item.get("location_status")=="eligible" else 0)-
-            (30 if level in {"Ambiguous","Mid-Level"} else 0))
+            (10 if source.get("connector_status")=="healthy" and source.get("discovery_status")=="verified" else 0)+
+            employment_bonus+arrangement_bonus-(10 if authorization_status=="needs_applicant_confirmation" else 0)-
+            (15 if role_review else 0)-
+            (20 if level in {"Unknown","Mid-Level"} else 0)+
+            (25 if item["readiness_status"]=="ready_for_matching" else
+             20 if item["readiness_status"]=="current_match" and item["eligibility_status"]=="potential_match" else
+             -5 if item["readiness_status"]=="needs_applicant_review" else
+             -20 if item["readiness_status"]=="failed_analysis" else
+             -30 if item["readiness_status"]=="paused_checkpoint_preserved" else 0))
         item["source_reliability"]=("Verified employer feed" if source.get("connector_status")=="healthy" and source.get("discovery_status")=="verified"
             else "Official ATS provenance" if str(item.get("source_platform") or "").casefold() in {"greenhouse","ashby","lever"} and item.get("imported_source_url")
             else "Source not currently verified")
@@ -1545,7 +1896,13 @@ def _saved_job_shortlist(limit=10):
         if canonical:seen_urls[canonical]=item.get("job_key")
         selected.append(item)
         if len(selected)>=limit:break
-    ready=[j["job_key"] for j in selected if j["posting_freshness"]=="currently_verified" and j["employer_identity_status"]=="verified" and j["description_available"] and j["match_freshness"] in {"never_analyzed","stale","legacy_unknown","failed"}]
+    ready=[j["job_key"] for j in selected if j["readiness_status"]=="ready_for_matching" and
+           j["posting_freshness"]=="currently_verified" and j["employer_identity_status"]=="verified" and
+           j["description_available"] and j["match_freshness"] in {"never_analyzed","stale","legacy_unknown"} and
+           j["role_level"] in {"New Graduate","University Graduate","Entry Level","Junior","Associate","Software Engineer I"} and
+           j["candidate_alignment"].get("work_authorization_status")=="confirmed_for_country" and
+           j["candidate_alignment"].get("sponsorship_compatibility")!="needs_applicant_confirmation" and
+           j["job_key"] not in paused_job_keys]
     with database() as db:
         row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone() if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='application_authorizations'").fetchone() else None
     try: matching_allowed=bool(json.loads(row["settings_json"] or "{}").get("allow_ai_matching",False)) if row else False
@@ -1562,7 +1919,20 @@ def _saved_job_shortlist(limit=10):
         elif match.get("stale") or match.get("freshness_status")=="stale": status="stale"
         else: status="current"
         match_counts[status]+=1
-    return {"results":selected,"count":len(selected),"saved_count":len(jobs),"duplicate_postings_excluded":duplicate_count,"freshness_counts":counts,
+    readiness_counts={}
+    for item in jobs:
+        state=item.get("readiness_status","needs_review")
+        readiness_counts[state]=readiness_counts.get(state,0)+1
+    opportunity_counts={"strong_early_career":0,"promising_needs_review":0,
+        "level_or_location_uncertain":0,"confirmed_ineligible":len(confirmed_ineligible),
+        "awaiting_posting_verification":0}
+    for item in selected:
+        state=item.get("opportunity_group")
+        if state in opportunity_counts:opportunity_counts[state]+=1
+    return {"results":selected,"confirmed_ineligible":confirmed_ineligible[:10],
+            "preference_conflicts":preference_conflicts[:10],"readiness_counts":readiness_counts,
+            "opportunity_counts":opportunity_counts,
+            "count":len(selected),"saved_count":len(jobs),"duplicate_postings_excluded":duplicate_count,"freshness_counts":counts,
             "match_freshness_counts":match_counts,
             "never_analyzed_count":match_counts["never_analyzed"],"ready_job_keys":ready[:5],"ready_count":min(len(ready),5),
             "matching_authorized":matching_allowed,
@@ -1686,7 +2056,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
 
     stamp = str(detail.get("retrieved_at") or datetime.now(timezone.utc).isoformat())
     with database() as db:
-        existing = db.execute("""SELECT o.job_key,o.source_platform,o.source_id,o.discovered_at,o.content_fingerprint
+        existing = db.execute("""SELECT o.job_key,o.source_platform,o.source_id,o.discovered_at,o.content_fingerprint,o.active,o.availability_status,o.reopened_review_required
             FROM discovered_openings o LEFT JOIN job_source_provenance p ON p.source_job_key=o.job_key
             WHERE o.user_id=? AND p.canonical_url=? LIMIT 1""",
             (USER, posting_url)).fetchone()
@@ -1702,6 +2072,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
             provider = existing["source_platform"]
             source_id = existing["source_id"]
             changed = bool(existing["content_fingerprint"] and existing["content_fingerprint"] != fingerprint)
+            reopened=bool(not existing["active"] and existing["availability_status"] in {"closed","expired","removed"} and detail.get("active",True))
             if changed:
                 table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='job_match_results'").fetchone()
                 if table:
@@ -1711,11 +2082,12 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
             db.execute("""UPDATE discovered_openings SET company=?,title=?,location=?,url=?,employment_type=?,department=?,country=?,
                  work_arrangement=?,description=?,posting_date=?,last_verified_at=?,active=?,content_fingerprint=?,job_url=?,
                 experience_level=?,required_qualifications_json=?,preferred_qualifications_json=?,graduation_windows_json=?,
-                availability_status=?,imported_source_url=?,import_eligibility_status=?,import_review_json=?
+                 availability_status=?,imported_source_url=?,import_eligibility_status=?,import_review_json=?,
+                 reopened_review_required=CASE WHEN ? THEN 1 ELSE reopened_review_required END
                 WHERE user_id=? AND job_key=?""",
                 (company,title,location,application_url,employment_type,department,country,str(detail.get("work_arrangement") or ""),description,detail.get("date_posted"),stamp,
                  int(detail.get("active", True)),fingerprint,posting_url,level,json.dumps(qualifications),json.dumps(detail.get("preferred_qualifications") or []),
-                 json.dumps(graduation_windows),"expired" if not detail.get("active",True) else "current",str(detail.get("source_url") or payload.url),eligibility,json.dumps(review_reasons),USER,job_key))
+                 json.dumps(graduation_windows),"expired" if not detail.get("active",True) else "current",str(detail.get("source_url") or payload.url),eligibility,json.dumps(review_reasons),int(reopened),USER,job_key))
         else:
             db.execute("""INSERT INTO discovered_openings
                 (user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,
@@ -1763,6 +2135,7 @@ def list_employers(request: Request):
         row["source_fingerprint"]==_source_fingerprint(dict(row))]
     cutoff=(current-timedelta(days=30)).isoformat()
     opening_counts={};current_counts={};early_counts={};university_counts={};missing_description_counts={}
+    source_current_counts={};source_early_counts={};source_university_counts={};source_missing_counts={}
     for opening in openings:
         company=(opening["company"] or "").casefold()
         opening_counts[company]=opening_counts.get(company,0)+1
@@ -1771,14 +2144,18 @@ def list_employers(request: Request):
         verified=bool(opening["active"] and opening["last_verified_at"] and opening["last_verified_at"]>=cutoff and matching_source)
         if not verified:continue
         current_counts[company]=current_counts.get(company,0)+1
-        level=classify_experience_level(opening["title"],opening["description"],opening["employment_type"])[0]
-        if level in {"New Graduate","Early Career","Graduate Eligible"}:
+        level=classify_role_level(opening["title"],opening["description"],opening["employment_type"])[0]
+        source_id=matching_source["employer_id"]
+        source_current_counts[source_id]=source_current_counts.get(source_id,0)+1
+        if level in {"New Graduate","University Graduate","Entry Level","Junior","Associate","Software Engineer I"}:
             early_counts[company]=early_counts.get(company,0)+1
-        if re.search(r"\b(new\s*grad|university graduate|university recruiting|campus recruiting|campus hiring|graduate program|rotational program|class of 20\d{2})\b",
-                     f"{opening['title']} {opening['description']}",re.I):
+            source_early_counts[source_id]=source_early_counts.get(source_id,0)+1
+        if level in {"New Graduate","University Graduate"}:
             university_counts[company]=university_counts.get(company,0)+1
+            source_university_counts[source_id]=source_university_counts.get(source_id,0)+1
         if not usable_posting_description(opening["description"]):
             missing_description_counts[company]=missing_description_counts.get(company,0)+1
+            source_missing_counts[source_id]=source_missing_counts.get(source_id,0)+1
     grouped={}
     for row in rows:
         item=dict(row)
@@ -1799,6 +2176,10 @@ def list_employers(request: Request):
         try: evidence=json.loads(item["verification_evidence_json"] or "{}")
         except (TypeError,json.JSONDecodeError): evidence={}
         group["sources"].append({"employer_id":item["employer_id"],**{field:item[field] for field in ("source_type","source_token","public_feed_url","last_success_at","last_attempt_at","connector_status","error_details","active","candidate_source","candidate_record_url","candidate_license","discovered_at","discovery_status","health_reason","consecutive_failures","next_retry_at","force_revalidate")},
+                                 "current_verified_openings_count":source_current_counts.get(item["employer_id"],0),
+                                 "early_career_current_openings_count":source_early_counts.get(item["employer_id"],0),
+                                 "university_hiring_evidence_count":source_university_counts.get(item["employer_id"],0),
+                                 "current_missing_descriptions_count":source_missing_counts.get(item["employer_id"],0),
                                  "verification_evidence":evidence})
     with database() as db:
         for employer in grouped.values():
@@ -1816,6 +2197,8 @@ def list_employers(request: Request):
         reason=str(row["health_reason"] or row["connector_status"] or "unknown")
         if reason not in {"valid_with_postings","valid_zero_postings"}:
             failure_reasons[reason]=failure_reasons.get(reason,0)+1
+    verified_source_ids={row["employer_id"] for row in eligible_sources}
+    verified_early_source_count=sum(bool(source_early_counts.get(source_id)) for source_id in verified_source_ids)
     summary={"employers":len({row["employer_id"] for row in rows}),
         "sources":len(rows),"active_employers":len({row["employer_id"] for row in rows if row["active"]}),
         "active_sources":sum(bool(row["active"]) for row in rows),
@@ -1824,6 +2207,9 @@ def list_employers(request: Request):
         "eligible_discovery_sources":len(eligible_sources),"unsupported_sources":unsupported,
         "awaiting_verification_sources":awaiting,"scheduled_retry_sources":scheduled,
         "recently_discovered_sources":recent_sources,"source_failure_reasons":failure_reasons,
+        "verified_early_career_sources":verified_early_source_count,
+        "verified_sources_with_no_early_career_openings":max(0,len(verified_source_ids)-verified_early_source_count),
+        "unsupported_providers":sorted({str(row["source_type"]) for row in rows if "unsupported" in str(row["connector_status"]).casefold()}),
         "saved_openings":len(openings),"current_verified_openings":sum(current_counts.values()),
         "current_early_career_openings":sum(early_counts.values()),
         "current_missing_descriptions":sum(missing_description_counts.values()),
@@ -1941,6 +2327,12 @@ def employer_sources_page(request: Request):
         " · Newly discovered sources ${c.recently_discovered_sources??'—'} · Awaiting verification ${c.awaiting_verification_sources??'—'}")
     page=page.replace(" · Scheduled retry ${c.scheduled_retry_sources??'—'}",
         " · Scheduled retry ${c.scheduled_retry_sources??'—'} · Source issue categories ${Object.entries(c.source_failure_reasons||{}).map(([reason,count])=>`${reason}: ${count}`).join(', ')||'none'}")
+    page=page.replace(" · Early-career openings ${c.current_early_career_openings??'—'}",
+        " · Early-career openings ${c.current_early_career_openings??'—'} · Verified early-career sources ${c.verified_early_career_sources??0} · Verified sources without early-career openings ${c.verified_sources_with_no_early_career_openings??0}")
+    page=page.replace(" · Unsupported ${c.unsupported_sources??'—'}",
+        " · Unsupported ${c.unsupported_sources??'—'} (${(c.unsupported_providers||[]).join(', ')||'none'})")
+    page=page.replace(" · Jobs observed ${s.verification_evidence?.postings_observed||0}",
+        " · Current early-career jobs ${s.early_career_current_openings_count||0} · Current university hiring jobs ${s.university_hiring_evidence_count||0} · Current verified jobs ${s.current_verified_openings_count||0} · Jobs observed ${s.verification_evidence?.postings_observed||0}")
     return HTMLResponse(page)
 
 

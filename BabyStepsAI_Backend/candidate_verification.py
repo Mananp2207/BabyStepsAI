@@ -103,7 +103,12 @@ def canonical_answer_identity(question):
     category=next((name for name,pattern in categories if re.search(pattern,text)),"other")
     context=""
     if category=="technical_qualification":
-        if re.search(r"data structures?.{0,80}algorithms?|software design fundamentals",text):context="data_structures_algorithms_design"
+        if re.search(r"release cycles?|multiple releases|release cadence",text):context="product_release_cycles"
+        elif re.search(r"customer empathy|customer work|stakeholder goals|customer feedback|customer.{0,140}(?:requirements|specifications|need)|translate.{0,80}(?:stakeholder|customer)",text):context="customer_product_translation"
+        elif re.search(r"founder.level ownership|technical evidence \(ownership\)|ownership.{0,140}(?:ambiguity|independent)|independent execution|ambiguous task",text):context="founder_level_ownership"
+        elif re.search(r"excellent communicator|technical evidence \(communication\)|technical communication|architectural trade.off|business outcomes",text):context="technical_business_communication"
+        elif re.search(r"technical evidence \(full.stack\)",text):context="full_stack_fluency"
+        elif re.search(r"data structures?.{0,80}algorithms?|software design fundamentals",text):context="data_structures_algorithms_design"
         elif re.search(r"front(?:end|[ -]?end).{0,80}back(?:end|[ -]?end)|full[ -]?stack",text):context="frontend_backend"
         else:context="web_application_experience"
     elif category=="relocation":
@@ -628,9 +633,12 @@ def canonical_verified_candidate_facts(profile):
     facts={}
     for key in ("country","state_province","location","current_location","work_authorization",
                 "work_authorization_by_country","sponsorship_needs_by_country","sponsorship_required_now",
-                "sponsorship_required_future","availability","relocation_willingness"):
+                "sponsorship_required_future","availability","earliest_available_date","notice_period",
+                "full_time_availability","relocation_willingness"):
         value=source.get(key)
         if value not in (None,"",[],{}):facts[key]=value
+    earliest=str(facts.get("earliest_available_date") or "").strip()
+    if earliest and not re.fullmatch(r"\d{4}-\d{2}-\d{2}",earliest):facts.pop("earliest_available_date",None)
     for key in ("graduation_date","graduation_year","graduation_month"):
         value=str(source.get(key) or "").strip()
         if key=="graduation_date" and re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])",value):facts[key]=value

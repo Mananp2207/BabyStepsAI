@@ -76,6 +76,62 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
         self.assertNotIn("gemini_configured",stored)
         self.assertFalse(status["settings"]["live_submission_enabled"])
 
+    def test_standing_policy_is_bounded_versioned_revocable_and_default_off(self):
+        from fastapi import HTTPException
+        self.assertFalse(assistant.get_authorization()["settings"]["standing_policy_enabled"])
+        scope={
+            "allow_automated_form_preparation":True,"allow_auto_use_confirmed_answers":True,
+            "standing_policy_enabled":True,"standing_policy_categories":["Software Engineering"],
+            "standing_policy_employment_types":["Full-time"],"standing_policy_countries":["United States"],
+            "standing_policy_locations":["Austin"],
+            "standing_policy_work_arrangements":["Remote"],"standing_policy_experience_levels":["New Graduate"],
+            "standing_policy_daily_limit":2,"standing_policy_field_keys":["full_name","email","education","projects"],
+            "standing_policy_document_types":["resume"],"standing_policy_reuse_confirmed_answers":True,
+        }
+        with patch("career_preferences.get_preferences",return_value={"categories":["Software Engineering"],"roles":["Software Engineer"]}):
+            saved=assistant.update_authorization(assistant.AuthorizationUpdate(**scope))
+        self.assertTrue(saved["settings"]["standing_policy_enabled"])
+        self.assertTrue(saved["settings"]["allow_automatic_discovery"])
+        self.assertTrue(saved["settings"]["allow_ai_matching"])
+        self.assertTrue(saved["settings"]["allow_automated_form_preparation"])
+        self.assertEqual(saved["settings"]["standing_policy_daily_limit"],2)
+        self.assertTrue(saved["settings"]["standing_policy_preferences_fingerprint"])
+        self.assertFalse(saved["settings"]["live_submission_enabled"])
+        page=assistant.application_settings_page().body.decode()
+        self.assertNotIn('name="allow_automatic_discovery"',page)
+        self.assertNotIn('name="allow_ai_matching"',page)
+        self.assertNotIn('name="allow_automated_form_preparation"',page)
+        self.assertNotIn('name="allow_auto_use_confirmed_answers"',page)
+        self.assertNotIn('name="allow_ai_drafting"',page)
+        with patch("career_preferences.get_preferences",return_value={"categories":["Software Engineering"],"roles":["Software Engineer"]}):
+            with self.assertRaises(HTTPException) as caught:
+                assistant.update_authorization(assistant.AuthorizationUpdate(**{**scope,"standing_policy_field_keys":["work_authorization"]}))
+        self.assertEqual(caught.exception.status_code,422)
+        revoked=assistant.update_authorization(assistant.AuthorizationUpdate())
+        self.assertFalse(revoked["settings"]["standing_policy_enabled"])
+        self.assertGreater(revoked["version"],saved["version"])
+        with assistant.connect() as db:
+            history=db.execute("SELECT COUNT(*) FROM application_authorization_history WHERE user_id=?",(USER,)).fetchone()[0]
+        self.assertGreaterEqual(history,4)
+
+    def test_standing_policy_requires_complete_scope_and_separate_cloud_permission(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as caught:
+            assistant.update_authorization(assistant.AuthorizationUpdate(
+                allow_automated_form_preparation=True,standing_policy_enabled=True))
+        self.assertEqual(caught.exception.status_code,422)
+        scope={"allow_automated_form_preparation":True,"allow_ai_drafting":True,"matching_provider":"ollama",
+            "standing_policy_enabled":True,"standing_policy_categories":["Software Engineering"],
+            "standing_policy_employment_types":["Full-time"],"standing_policy_countries":["United States"],
+            "standing_policy_locations":["Anywhere"],
+            "standing_policy_work_arrangements":["Remote"],"standing_policy_experience_levels":["New Graduate"],
+            "standing_policy_field_keys":["full_name"],"standing_policy_document_types":["resume"],
+            "standing_policy_allow_ai_answers":True,"standing_policy_allow_cloud_ai":True}
+        with patch("career_preferences.get_preferences",return_value={"categories":["Software Engineering"],"roles":["Software Engineer"]}):
+            with self.assertRaises(HTTPException) as caught:
+                assistant.update_authorization(assistant.AuthorizationUpdate(**scope))
+        self.assertEqual(caught.exception.status_code,422)
+
     def test_sensitive_and_referral_questions_are_never_ai_drafted(self):
         from fastapi import HTTPException
         for question in ("Are you authorized to work in the US?","Do you require visa sponsorship?","Did someone refer you?"):

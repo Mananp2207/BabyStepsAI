@@ -2,6 +2,7 @@
 
 import html
 import re
+import unicodedata
 from datetime import datetime, timezone
 
 
@@ -405,6 +406,21 @@ def _country_hits(values):
     return hits
 
 
+def infer_country_from_location(location, country=""):
+    """Return a country only when the saved country/location identifies one unambiguously."""
+    explicit=str(country or "").strip().casefold()
+    country_codes={"us":"united states","usa":"united states","gb":"united kingdom","uk":"united kingdom",
+        "ca":"canada","au":"australia","in":"india","de":"germany","fr":"france","ie":"ireland",
+        "nl":"netherlands","sg":"singapore","jp":"japan","il":"israel","es":"spain","se":"sweden",
+        "no":"norway","dk":"denmark","ch":"switzerland","it":"italy","br":"brazil","mx":"mexico",
+        "pl":"poland","pt":"portugal","nz":"new zealand","cn":"china","tw":"taiwan","za":"south africa",
+        "ae":"united arab emirates","kr":"south korea"}
+    if explicit in country_codes:
+        return country_codes[explicit]
+    hits=_country_hits([str(country or ""),str(location or "")])
+    return next(iter(hits)) if len(hits)==1 else ""
+
+
 def _state_hits(values, *, allow_bare_abbreviation=False):
     text=" | ".join(str(value or "") for value in values)
     hits=set()
@@ -617,9 +633,10 @@ def extract_experience_requirements(description):
         r"(?P<years>\b\d{1,2}(?:\s*[-–]\s*\d{1,2})?\+?)\s+years?\s+(?:of\s+)?"
         r"(?:(?:professional|industry|relevant|related|work|software|engineering|technical|development)\s+){0,3}experience\b", re.I)
     output = {"required": [], "preferred": [], "unclear": []}
-    headings=re.compile(r"\b(?:nice to have|bonus points|preferred qualifications|preferred experience|the skillset you(?:'|’)ll bring|what you(?:'|’)ll bring|requirements|required qualifications|minimum qualifications)\b",re.I)
-    preferred_headings={"nice to have","bonus points","preferred qualifications","preferred experience"}
-    required_headings={"requirements","required qualifications","minimum qualifications"}
+    headings=re.compile(r"\b(?:nice to have|bonus points|preferred skills|preferred qualifications|preferred experience|the skillset you(?:'|’)ll bring|what you(?:'|’)ll bring|what we(?:'|’)re looking for|what we are looking for|requirements|required skills|required qualifications|basic qualifications|minimum requirements|minimum qualifications)\b",re.I)
+    preferred_headings={"nice to have","bonus points","preferred skills","preferred qualifications","preferred experience"}
+    required_headings={"requirements","required skills","required qualifications","basic qualifications","minimum requirements","minimum qualifications",
+                       "what we're looking for","what we are looking for"}
     for match in pattern.finditer(text):
         start = max(0, text.rfind(".", 0, match.start()) + 1)
         end = text.find(".", match.end())
@@ -754,6 +771,28 @@ def extract_internship_requirements(description):
             "unclear":[x for x in found if x["status"]=="unclear"]}
 
 
+def extract_sponsorship_requirement(description):
+    """Identify explicit employer sponsorship policy without inferring applicant status."""
+    text=html.unescape(re.sub(r"<[^>]+>"," ",str(description or "")))
+    text=re.sub(r"\s+"," ",text)
+    no_sponsorship=re.compile(
+        r"\b(?:does not|do not|will not|cannot|can't|not eligible for|no)\s+"
+        r"(?:immigration\s+|employment\s+|visa\s+)?sponsorship\b|"
+        r"\b(?:sponsorship|visa sponsorship)\s+(?:is\s+)?(?:not available|unavailable|not provided)\b",re.I)
+    available=re.compile(r"\b(?:visa\s+)?sponsorship\s+(?:is\s+)?available\b|\bwe\s+(?:can|will)\s+sponsor\b",re.I)
+    restriction=no_sponsorship.search(text)
+    if restriction:
+        return {"status":"not_available","requirement":restriction.group(0).strip(),"evidence":text[max(0,restriction.start()-80):min(len(text),restriction.end()+80)]}
+    offered=available.search(text)
+    if offered:
+        return {"status":"available","requirement":offered.group(0).strip(),"evidence":text[max(0,offered.start()-80):min(len(text),offered.end()+80)]}
+    question=re.search(r"\b(?:do you|will you|would you).{0,90}\b(?:require|need).{0,50}\bsponsorship\b",text,re.I)
+    if question:
+        return {"status":"applicant_confirmation_requested","requirement":question.group(0).strip(),
+                "evidence":text[max(0,question.start()-50):min(len(text),question.end()+50)]}
+    return {"status":"not_stated","requirement":"","evidence":""}
+
+
 def extract_education_requirements(description):
     """Extract degree evidence into required/preferred/unclear buckets."""
     text=html.unescape(str(description or ""))
@@ -808,38 +847,83 @@ def classify_career_category(title, preferences=None):
     return None
 
 
+def _experience_year_range(value):
+    match=re.search(r"(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?",str(value or ""))
+    return (int(match.group(1)),int(match.group(2) or match.group(1))) if match else None
+
+
+def classify_role_level(title, description="", employment_type=""):
+    """Classify a role using title and mandatory-posting evidence.
+
+    Returns the requested display taxonomy and concise reasons. Preferred years
+    never establish a mandatory level, and an early-career title contradicted by
+    a multi-year requirement remains Unknown for suitability review.
+    """
+    title_text=unicodedata.normalize("NFKC",str(title or ""))
+    combined=f"{title_text} {employment_type or ''}"
+    posting_text=re.sub(r"\s+"," ",re.sub(r"<[^>]+>"," ",html.unescape(str(description or ""))))
+    evidence_text=f"{combined} {posting_text}"
+    required=extract_experience_requirements(description)["required"]
+    ranges=[_experience_year_range(item.get("years")) for item in required]
+    ranges=[item for item in ranges if item]
+    strongest=max((item[1] for item in ranges),default=0)
+    early_signal=bool(re.search(
+        r"\b(new\s*grad(?:uate)?|university graduate|university recruiting|university hire|campus recruiting|campus hire|graduate program|rotational(?: engineering)? program|entry[- ]level|early career|junior|associate|software engineer\s+(?:i|1))\b",
+        evidence_text,re.I))
+    if re.search(r"\b(intern|internship|co[- ]op)\b",combined,re.I):
+        return "Internship",["The title or employment metadata identifies an internship or co-op."]
+    if re.search(r"\b(staff|principal)\b",title_text,re.I):
+        return "Staff/Principal",["The title explicitly identifies a staff or principal role."]
+    if re.search(r"\b(senior|sr\.?|lead|director|manager|vp|head of)\b",title_text,re.I):
+        return "Senior",["The title explicitly identifies a senior or leadership role."]
+    if re.search(r"\b(?:software\s+)?(?:engineer|developer)\s+(?:ii|2)\b",combined,re.I):
+        return "Mid-Level",["The title identifies a level II engineering role."]
+    if early_signal and strongest>=3:
+        return "Unknown",["Early-career title conflicts with a mandatory requirement for at least 3 years of experience."]
+    if re.search(r"\b(university graduate|university recruiting|university hire|campus recruiting|campus hire|graduate program|rotational(?: engineering)? program|class of 20\d{2})\b",evidence_text,re.I):
+        return "University Graduate",["The title identifies a university hiring or graduate program."]
+    if re.search(r"\b(new\s*grad(?:uate)?|recent graduates?|graduating in 20\d{2})\b",evidence_text,re.I):
+        return "New Graduate",["The title explicitly identifies a new-graduate role."]
+    if re.search(r"\b(entry[- ]level|early career)\b",evidence_text,re.I):
+        return "Entry Level",["The title explicitly identifies an entry-level or early-career role."]
+    if re.search(r"\bjunior\b",combined,re.I):
+        return "Junior",["The title identifies a junior role; mandatory qualifications are assessed separately."]
+    if re.search(r"\bassociate\b",combined,re.I):
+        return "Associate",["The title identifies an associate role; mandatory qualifications are assessed separately."]
+    if re.search(r"\b(?:software\s+)?(?:engineer|developer)\s+(?:i|1)\b",combined,re.I):
+        return "Software Engineer I",["The title explicitly identifies Software Engineer I."]
+    if ranges:
+        # A broad required range spanning entry and experienced bands is
+        # ambiguous evidence; do not classify from its upper bound alone.
+        if any(low <= 2 < high or low < 5 <= high for low, high in ranges):
+            return "Unknown",["Mandatory experience range spans multiple career levels."]
+        if strongest>=5:
+            return "Senior",["Mandatory qualifications require at least 5 years of experience."]
+        if strongest>=3:
+            return "Mid-Level",["Mandatory qualifications require multiple years of experience."]
+        if strongest<=1:
+            return "Entry Level",["Mandatory experience is limited to at most 1 year."]
+        if ranges and all(high<=2 for _,high in ranges):
+            return "Entry Level",["Mandatory experience requirements are limited to at most 2 years."]
+    windows=[item for item in extract_graduation_windows(description) if item.get("status") in {"required","unclear"}]
+    if windows:
+        return "University Graduate",["The posting includes an explicit graduation eligibility window."]
+    return "Unknown",["The posting does not establish an experience level from its title or mandatory qualifications."]
+
+
 def classify_experience_level(title, description="", employment_type=""):
-    """Classify posting seniority from explicit posting evidence; return level and rationale."""
-    title_text = str(title or "")
-    combined = f"{title_text} {employment_type or ''}"
-    requirements = extract_experience_requirements(description)
-    reasons = []
-    if re.search(r"\b(intern|internship)\b", combined, re.I):
-        return "Internship", ["Title or employment metadata identifies an internship."]
-    if re.search(r"\b(senior|sr\.?|staff|principal|lead|director|manager|vp|head of)\b", title_text, re.I):
-        return "Senior", ["Title identifies a senior or leadership role."]
-    if re.search(r"\b(new\s*grad(?:uate)?|university graduate|university recruiting|university hire|campus recruiting|campus hire|graduate program|rotational(?: engineering)? program)\b", combined, re.I):
-        reasons.append("Title identifies a new graduate or graduate program.")
-        return "New Graduate", reasons
-    if re.search(r"\b(entry[- ]level|junior|associate|early career|graduate software engineer|software engineer i)\b", combined, re.I):
-        reasons.append("Title identifies an entry-level or early-career role.")
-        return "Early Career", reasons
-    required = requirements["required"]
-    if required:
-        lower_bounds = [int(re.match(r"\d+", item["years"]).group()) for item in required]
-        if max(lower_bounds) >= 5:
-            reasons.append("Required qualifications specify at least 5 years of experience.")
-            return "Experienced", reasons
-        if any("–" in item["years"] or "-" in item["years"] for item in required):
-            reasons.append("Required experience spans a range; seniority is ambiguous.")
-            return "Ambiguous", reasons
-        if max(lower_bounds) >= 3:
-            reasons.append("Required qualifications specify multiple years of experience; the title is not level-specific.")
-            return "Mid-Level", reasons
-    if extract_graduation_windows(description):
-        reasons.append("Description includes a graduation eligibility window.")
-        return "Graduate Eligible", reasons
-    return "Ambiguous", ["Neither the title nor required qualifications establish an experience level."]
+    """Compatibility classifier for existing consumers; new UI uses role taxonomy."""
+    role,reasons=classify_role_level(title,description,employment_type)
+    legacy={"University Graduate":"New Graduate","New Graduate":"New Graduate",
+        "Entry Level":"Early Career","Junior":"Early Career","Associate":"Early Career",
+        "Software Engineer I":"Early Career","Internship":"Internship",
+        "Mid-Level":"Mid-Level","Senior":"Senior","Staff/Principal":"Senior",
+        "Unknown":"Ambiguous"}
+    # Keep the historic term for high required experience where older consumers
+    # distinguish general experienced roles from title-level seniority.
+    if role=="Senior" and reasons and "5 years of experience" in reasons[0] and not re.search(r"\b(senior|sr\.?|lead|director|manager|vp|head of)\b",str(title or ""),re.I):
+        return "Experienced",reasons
+    return legacy.get(role,"Ambiguous"),reasons
 
 
 def discovery_relevance_score(job, preferences, confirmed_skills=()):

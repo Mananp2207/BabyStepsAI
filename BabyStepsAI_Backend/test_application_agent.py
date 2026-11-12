@@ -709,14 +709,33 @@ class ApplicationAgentTests(unittest.TestCase):
                 "human_actions":{"required":[],"count":0},"browser_compatibility":"Supported","last_checkpoint":"Synthetic checkpoint",
                 "resume_allowed":False,"resume_reason":"Not resumable","retry_allowed":False,"retry_reason":"No retry required",
                 "retry_creates_new_attempt":False,"manual_submission_outcome":"","manual_completion_reported":False}}
-        state={"posts":[],"submission_enabled":False,"requests":[]};errors=[];browser=None
+        saved_job={"job_key":"synthetic:netic:job-1","company":"Synthetic Employer","title":"Synthetic New Grad Engineer",
+            "location":"San Francisco","employment_type":"Full-time","classification":"potential_match","match_score":68,
+            "eligibility_stale":False,"preparation_authorized":False,"application_state":"not_started",
+            "application_status_label":"Not prepared","preparation_allowed":False,"preparation_authorization_required":False,
+            "preparation_plan_available":True,"url_syntax_allowed":True,"url":"https://example.invalid/apply",
+            "eligibility_review_assessment":{"classification":"potential_match","preparation_blocked":True,
+                "eligibility_resolved":False,"mandatory_unresolved":["Release cycles"],"confirmed_conflicts":[],
+                "next_action":"Review the synthetic release-cycle evidence."}}
+        readiness_plan={"job_key":saved_job["job_key"],"employer":"Synthetic Employer","title":saved_job["title"],
+            "application_url":"https://example.invalid/apply","eligibility":"needs_review","preparation_ready":False,
+            "preparation_blockers":[{"requirement":"Release cycles","explanation":"Synthetic evidence is unresolved."}],
+            "missing_requirements":[{"requirement":"Multiple release cycles","status":"needs_review","missing_question":"Describe the confirmed release sequence."}],
+            "missing_applicant_information":["Describe the confirmed release sequence."],"candidate_fields":[{"key":"full_name","label":"Full name","sensitive":False}],
+            "available_documents":[{"type":"resume","label":"Active resume"}],"inspection_blocker":"Synthetic form is unverified.",
+            "human_only_actions":["Synthetic form controls remain unverified."],"attempt_history_count":0,
+            "live_submission_enabled":False,"ai_answers_proposed":[],"cloud_processing_permission":"No cloud permission is granted.",
+            "ai_drafting_enabled":True,"local_ai_answer_permission_available":True,"cloud_ai_authorized":False,
+            "preparation_authorized":False,"authorization_current":False,"posting_verified_at":"2026-10-01T00:00:00Z",
+            "provider":{"provider":"ashby"}}
+        state={"posts":[],"authorization_posts":[],"submission_enabled":False,"requests":[]};errors=[];browser=None
         self.patch_playwright.stop()
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 browser=p.chromium.launch(headless=True);page=browser.new_page(viewport={"width":390,"height":844})
                 page.on("pageerror",lambda error:errors.append(str(error)))
-                page.on("request",lambda req:state["requests"].append(req.url))
+                page.on("request",lambda req:(state["requests"].append(req.url),state["authorization_posts"].append(req.url) if req.method=="POST" and req.url.endswith("/preparation-authorization") else None))
                 def route_api(route):
                     path=route.request.url.split("?",1)[0]
                     if path.endswith("/api/applications"):
@@ -726,7 +745,9 @@ class ApplicationAgentTests(unittest.TestCase):
                     elif path.endswith("/api/application-questions/attention"):
                         body={"groups":[],"technical_groups":[]}
                     elif path.endswith("/api/applications/saved-jobs"):
-                        body={"results":[]}
+                        body={"results":[saved_job]}
+                    elif path.endswith("/preparation-authorization"):
+                        body=readiness_plan
                     elif path.endswith("/manual-outcome"):
                         payload=json.loads(route.request.post_data or "{}")
                         state["posts"].append(payload);synthetic["readiness"]["manual_submission_outcome"]=payload.get("outcome","")
@@ -735,6 +756,24 @@ class ApplicationAgentTests(unittest.TestCase):
                     route.fulfill(status=200,content_type="application/json",body=json.dumps(body))
                 page.route("**/api/**",route_api)
                 page.goto("http://127.0.0.1:8000/applications",wait_until="domcontentloaded")
+                page.locator("#load-jobs").click()
+                page.get_by_role("button",name="View Preparation Readiness").click()
+                readiness=page.get_by_role("region",name="Read-only preparation readiness plan")
+                self.assertIn("Preparation readiness · read only",readiness.inner_text())
+                readiness.locator("details summary").nth(1).click()
+                self.assertIn("Multiple release cycles",readiness.inner_text())
+                self.assertIn("No authorization was created",readiness.inner_text())
+                self.assertIn("Live submission: disabled",readiness.inner_text())
+                self.assertEqual(state["authorization_posts"],[])
+                self.assertEqual(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),True)
+                page.locator(".bsa-mobile-bar .bsa-theme-toggle").click()
+                self.assertEqual(page.locator("html").get_attribute("data-bsa-theme"),"dark")
+                for width,height in ((390,844),(768,1024),(1440,950)):
+                    page.set_viewport_size({"width":width,"height":height})
+                    self.assertTrue(page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"),f"horizontal overflow at {width}px")
+                page.locator(".bsa-sidebar .bsa-theme-toggle").click()
+                self.assertEqual(page.locator("html").get_attribute("data-bsa-theme"),"light")
+                page.set_viewport_size({"width":390,"height":844})
                 card=page.locator(".application-card");card.wait_for()
                 self.assertIn("Synthetic New Grad Engineer",card.inner_text())
                 page.get_by_text("Record a manual application outcome").click()
@@ -895,6 +934,132 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(len(result["skipped"]),2)
         self.assertTrue(all(item.get("reason") for item in result["skipped"]))
 
+    def test_standing_policy_derives_a_job_scoped_grant_before_automatic_queueing(self):
+        key="standing-policy-synthetic"
+        job={"job_key":key,"company":"Policy Example","title":"New Graduate Software Engineer",
+            "application_url":"https://jobs.example.test/apply/123","job_url":"https://jobs.example.test/jobs/123",
+            "location":"Austin, Texas, United States","employment_type":"Full time","career_category":"Software Engineering",
+            "country":"United States","work_arrangement":"Remote","last_verified_at":app_agent.now(),
+            "description":"New graduate full-time software engineer"}
+        with app_agent.connect() as db:
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (USER,key,job["company"],job["title"],job["location"],job["application_url"],app_agent.now(),job["employment_type"],"eligible","","","Synthetic official source"))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at,freshness_status,matching_model_version) VALUES(?,?,?,'completed','potential_match',0,'{}',NULL,?,?,'current',?)",
+                (USER,key,"r1",app_agent.now(),app_agent.now(),matcher.MATCHING_ENGINE_VERSION))
+            setting_version=int(db.execute("SELECT version FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()[0])
+        snapshot={"resume_id":"r1","application_url_hash":"url-hash","match_updated_at":"match-stamp",
+            "matching_engine_version":matcher.MATCHING_ENGINE_VERSION,"profile_fingerprint":"profile-hash",
+            "answers_fingerprint":"answers-hash","documents_fingerprint":"documents-hash","settings_version":setting_version,
+            "match_status":"completed","freshness_status":"current","classification":"potential_match"}
+        settings={"allow_automated_form_preparation":True,"standing_policy_enabled":True,"standing_policy_field_keys":["full_name"],
+            "standing_policy_document_types":["resume"],"standing_policy_reuse_confirmed_answers":False,
+            "allow_auto_use_confirmed_answers":False,"standing_policy_allow_ai_answers":False,"allow_ai_drafting":False,
+            "standing_policy_allow_cloud_ai":False,"matching_provider":"ollama","standing_policy_daily_limit":1}
+        context=(job,{"id":"r1"},{"full_name":"A Candidate"},{},[{"key":"full_name"}],[{"type":"resume"}],
+            {"compatibility_status":"compatible","requested_application_url":job["application_url"]},snapshot)
+        with (patch.object(app_agent,"get_authorization",return_value={"version":setting_version,"settings":settings}),
+              patch.object(app_agent,"_get_job",return_value=job), patch.object(app_agent,"validate_application_url"),
+              patch.object(app_agent,"_saved_preparation_context",return_value=context),
+              patch.object(app_agent,"_preparation_inspection_blocker",return_value=""),
+              patch.object(app_agent,"_unmapped_requirements_blocker",return_value=""),
+              patch.object(app_agent,"_standing_policy_blocker",return_value=""),
+              patch.object(app_agent,"_preparation_snapshot",return_value=snapshot),
+              patch.object(app_agent,"_standing_policy_still_current",return_value=True),
+              patch.object(app_agent,"_schedule_application_queue",return_value=True)):
+            result=app_agent.enqueue_saved_jobs(app_agent.ApplicationQueueRequest(job_keys=[key]))
+            scope=app_agent._current_preparation_authorization(key,"r1",job["application_url"])
+            scoped=app_agent._scoped_candidate({"full_name":"A Candidate","work_authorization":"US authorized",
+                "__application_documents":[{"document_type":"resume"},{"document_type":"transcript"}]},scope)
+            scoped_answers=app_agent._scoped_answers({"custom:private":{"answer":"private answer"},"__settings":{}},scope)
+            job2={**job,"job_key":key+"-2"};context2=(*context[:1],*context[1:7],{**snapshot,"application_url_hash":"url-hash-2"})
+            with patch.object(app_agent,"_saved_preparation_context",return_value=context2):
+                granted_again,reason=app_agent._derive_standing_policy_authorization(job2["job_key"],"r1",job2["application_url"])
+        self.assertEqual(result["queued"],1)
+        self.assertFalse(result["submission_enabled"])
+        self.assertEqual(scoped,{"full_name":"A Candidate","__application_documents":[{"document_type":"resume"}]})
+        self.assertNotIn("custom:private",scoped_answers)
+        self.assertFalse(scoped_answers["__settings"]["allow_auto_use_confirmed_answers"])
+        self.assertFalse(granted_again)
+        self.assertIn("daily preparation limit",reason)
+        with app_agent.connect() as db:
+            authorization=db.execute("SELECT authorization_source,field_keys_json,document_types_json FROM application_preparation_authorizations WHERE user_id=? AND job_key=? AND revoked_at IS NULL",(USER,key)).fetchone()
+            application=db.execute("SELECT state FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
+        self.assertEqual(authorization["authorization_source"],"standing_policy")
+        self.assertEqual(json.loads(authorization["field_keys_json"]),["full_name"])
+        self.assertEqual(json.loads(authorization["document_types_json"]),["resume"])
+        self.assertEqual(application["state"],"queued")
+
+    def test_persistent_opening_identity_blocks_cross_source_duplicates_and_auto_retries(self):
+        resume={"id":"r1"}
+        first={"job_key":"ashby:board-one:req-742","company":"Acme Systems","title":"Software Engineer I",
+            "application_url":"http://127.0.0.1:8000/mock-apps/simple?source=one"}
+        second={**first,"job_key":"ashby:board-two:req-742","application_url":"http://127.0.0.1:8000/mock-apps/simple?source=two"}
+        mirrored={**first,"job_key":"greenhouse:acme:req-742","application_url":"http://127.0.0.1:8000/mock-apps/simple?utm_source=import"}
+        changed_req={**first,"job_key":"ashby:board-one:req-743","title":"Software Engineer I — Platform"}
+        app_id,state,created=app_agent._create(first,resume,allow_queue=True)
+        duplicate_id,duplicate_state,duplicate_created=app_agent._create(second,resume,allow_queue=True)
+        mirrored_id,mirrored_state,mirrored_created=app_agent._create(mirrored,resume,allow_queue=True)
+        new_id,new_state,new_created=app_agent._create(changed_req,resume,allow_queue=True)
+        self.assertTrue(created);self.assertEqual(state,"queued")
+        self.assertEqual(duplicate_id,app_id);self.assertEqual(duplicate_state,"skipped_duplicate");self.assertFalse(duplicate_created)
+        self.assertEqual(mirrored_id,app_id);self.assertEqual(mirrored_state,"skipped_duplicate");self.assertFalse(mirrored_created)
+        self.assertTrue(new_created);self.assertNotEqual(new_id,app_id);self.assertEqual(new_state,"queued")
+        app_agent._update(app_id,"opening")
+        app_agent._update(app_id,"failed",error="synthetic interruption")
+        retry_id,retry_state,retry_created=app_agent._create(first,resume,allow_queue=True)
+        self.assertEqual(retry_id,app_id);self.assertEqual(retry_state,"failed");self.assertFalse(retry_created)
+        with app_agent.connect() as db:db.execute("UPDATE applications SET attempt_number=? WHERE id=?",(app_agent.MAX_APPLICATION_ATTEMPTS,app_id))
+        with self.assertRaises(HTTPException) as retry_limit:app_agent.retry_one(app_id)
+        self.assertEqual(retry_limit.exception.status_code,409)
+        racing=[{**first,"job_key":f"ashby:race-{n}:req-800","application_url":f"http://127.0.0.1:8000/mock-apps/simple?race={n}"} for n in (1,2)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes=list(pool.map(lambda job:app_agent._create(job,resume,allow_queue=True),racing))
+        self.assertEqual(sum(1 for item in outcomes if item[2]),1)
+        self.assertEqual(len({item[0] for item in outcomes}),1)
+        unknown={**first,"job_key":"ashby:acme:req-900"}
+        unknown_id,_,_=app_agent._create(unknown,resume,allow_queue=True)
+        with app_agent.connect() as db:
+            db.execute("INSERT INTO manual_submission_events(event_id,application_id,user_id,attempt_number,outcome,confirmed_by_applicant,recorded_at) VALUES(?,?,?,1,'outcome_unknown',1,?)",
+                ("synthetic-unknown-event",unknown_id,USER,app_agent.now()))
+            db.execute("UPDATE applications SET state='failed' WHERE id=?",(unknown_id,))
+        blocked_id,blocked_state,blocked_created=app_agent._create(unknown,resume,allow_queue=True)
+        self.assertEqual(blocked_id,unknown_id);self.assertEqual(blocked_state,"failed");self.assertFalse(blocked_created)
+        mirror={**unknown,"job_key":"greenhouse:another-board:req-900"}
+        mirror_id,mirror_state,mirror_created=app_agent._create(mirror,resume,allow_queue=True)
+        self.assertEqual(mirror_id,unknown_id);self.assertEqual(mirror_state,"skipped_duplicate");self.assertFalse(mirror_created)
+        with app_agent.connect() as db:
+            count=db.execute("SELECT COUNT(*) FROM applications WHERE user_id=?",(USER,)).fetchone()[0]
+            reservations=db.execute("SELECT COUNT(*) FROM application_opening_reservations WHERE user_id=?",(USER,)).fetchone()[0]
+        self.assertEqual(count,4);self.assertEqual(reservations,4)
+
+    def test_reopened_requisition_is_human_review_only_and_never_queued(self):
+        with app_agent.connect() as db:
+            db.execute("UPDATE discovered_openings SET active=1,availability_status='current',reopened_review_required=1 WHERE user_id=? AND job_key='saved-simple'",(USER,))
+        queued=app_agent.enqueue_saved_jobs(app_agent.ApplicationQueueRequest(job_keys=["saved-simple"]))
+        self.assertEqual(queued["queued"],0)
+        self.assertIn("closed and reopened",queued["skipped"][0]["reason"])
+        card=next(item for item in app_agent.list_saved_application_jobs()["results"] if item["job_key"]=="saved-simple")
+        self.assertEqual(card["application_status_label"],"Needs Human Review · Reopened requisition")
+        self.assertFalse(card["preparation_allowed"])
+
+    def test_attention_inbox_is_application_grouped_and_manual_submission_stays_clear(self):
+        self.assertIn('id="attention-inbox"',app_agent.APPLICATIONS_PAGE)
+        self.assertIn("function renderAttentionInbox(apps)",app_agent.APPLICATIONS_PAGE)
+        self.assertIn("Human actions grouped once per application",app_agent.APPLICATIONS_PAGE)
+        self.assertIn("submit manually if you choose",app_agent.APPLICATIONS_PAGE)
+
+    def test_standing_policy_scope_fails_closed_for_stale_or_unclassified_postings(self):
+        settings={"standing_policy_enabled":True,"standing_policy_excluded_employers":[],
+            "standing_policy_categories":["Software Engineering"],"standing_policy_employment_types":["Full-time"],
+            "standing_policy_countries":["United States"],"standing_policy_locations":["Anywhere"],
+            "standing_policy_work_arrangements":["Remote"],"standing_policy_experience_levels":["New Graduate"]}
+        with (patch.object(app_agent,"get_authorization",return_value={"settings":settings}),
+              patch.object(app_agent,"_standing_policy_still_current",return_value=True)):
+            stale=app_agent._standing_policy_blocker({"active":False,"availability_status":"unknown"})
+            incomplete=app_agent._standing_policy_blocker({"active":True,"availability_status":"current","career_category":""})
+        self.assertIn("inactive or is not verified",stale)
+        self.assertIn("category is outside or missing",incomplete)
+
     def test_authorized_rolling_limit_remains_source_of_truth_on_dashboard(self):
         answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(max_applications_per_24_hours=7))
         progress=app_agent.application_progress()
@@ -974,13 +1139,13 @@ class ApplicationAgentTests(unittest.TestCase):
         filtered=app_agent.list_saved_application_jobs(q="Austin",eligibility="potential_match")
         self.assertEqual(filtered["count"],1)
 
-    def _make_external_eligible_job(self):
+    def _make_external_eligible_job(self,description=""):
         key="saved-external"
         url="https://jobs.ashbyhq.com/example/software-engineer"
         stamp=app_agent.now()
         with app_agent.connect() as db:
-            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,job_url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source,active) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
-                (USER,key,"Example Employer","Software Engineer I","New York, NY",url,"https://jobs.ashbyhq.com/example/software-engineer",stamp,"Full time","eligible","","","Company Careers Page"))
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,job_url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source,active,description) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)",
+                (USER,key,"Example Employer","Software Engineer I","New York, NY",url,"https://jobs.ashbyhq.com/example/software-engineer",stamp,"Full time","eligible","","","Company Careers Page",description))
             db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,error,created_at,updated_at,freshness_status,matching_model_version) VALUES(?,?,?,'completed','potential_match',90,'{}',NULL,?,?,'current',?)",
                 (USER,key,"r1",stamp,stamp,matcher.MATCHING_ENGINE_VERSION))
             report={"provider":{"provider":"ashby","support_level":"accessibility_first"},"form_detected":True,
@@ -991,6 +1156,54 @@ class ApplicationAgentTests(unittest.TestCase):
             db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
                 ("inspection-external",USER,key,"ashby","compatible",json.dumps(report),stamp))
         return key,url
+
+    def test_unassessed_plaintext_requirements_block_authorization_and_preparation(self):
+        description=("What You'll Bring: Proven product builder able to ship software at scale. "
+            "Full-stack fluency with React, TypeScript, and Python. AI experience (nice-to-have). "
+            "We need to hire graduates available to start between winter 2026 and summer 2027.")
+        key,url=self._make_external_eligible_job(description)
+        with patch.object(app_agent,"validate_application_url"):
+            plan=app_agent.preparation_authorization_plan(key)
+            self.assertIn("mandatory posting requirements",plan["inspection_blocker"])
+            self.assertFalse(plan["preparation_ready"])
+            self.assertFalse(plan["preparation_authorized"])
+            self.assertFalse(plan["live_submission_enabled"])
+            self.assertFalse(plan["ai_answers_authorized"])
+            self.assertTrue(plan["missing_requirements"])
+            self.assertEqual(plan["attempt_history_count"],0)
+            request=app_agent.PreparationAuthorizationRequest(confirmed=True,confirmed_employer=plan["employer"],
+                confirmed_title=plan["title"],confirmed_application_url=plan["application_url"],
+                field_keys=["full_name"],document_types=["resume"])
+            with self.assertRaises(HTTPException) as authorization_error:
+                app_agent.authorize_saved_job_preparation(key,request)
+            self.assertEqual(authorization_error.exception.status_code,409)
+            with self.assertRaises(HTTPException) as preparation_error:
+                app_agent.start_dry_run(app_agent.DryRunRequest(job_key=key))
+            self.assertEqual(preparation_error.exception.status_code,409)
+        self.assertEqual(app_agent.list_applications(),[])
+
+    def test_read_only_authorization_proposal_explains_unresolved_eligibility_without_granting_access(self):
+        description="Requirements: Experience delivering user-facing software through multiple release cycles."
+        key,url=self._make_external_eligible_job(description)
+        pending={"classification":"needs_review","match_score":68,"missing_information":["Confirm the requested release-cycle example."],
+            "technical_qualifications":[{"requirement":"multiple release cycles","category":"product_release_cycles",
+                "requiredness":"required","status":"needs_review","missing_question":"Technical evidence (release cycles): Give the sequence and your contribution."}],
+            "required_skills":[],"required_experience":[],"education_requirements":[]}
+        with app_agent.connect() as db:
+            db.execute("UPDATE job_match_results SET classification='needs_review',result_json=? WHERE user_id=? AND job_key=?",
+                (json.dumps(pending),USER,key))
+        plan=app_agent.preparation_authorization_plan(key)
+        self.assertEqual(plan["eligibility"],"needs_review")
+        self.assertFalse(plan["preparation_ready"])
+        self.assertFalse(plan["authorization_current"])
+        self.assertEqual(plan["available_documents"],[{"type":"resume","label":"Active resume"}])
+        self.assertTrue(plan["missing_requirements"])
+        self.assertTrue(any("release-cycle" in item.casefold() for item in plan["missing_applicant_information"]))
+        self.assertFalse(plan["live_submission_enabled"])
+        self.assertEqual(plan["attempt_history_count"],0)
+        with app_agent.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM application_preparation_authorizations WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0],0)
 
     def test_job_specific_authorization_is_required_for_real_employers(self):
         key,url=self._make_external_eligible_job()
@@ -1318,6 +1531,108 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertIn("The saved assessment is stale. Reassess saved evidence without AI before continuing.",source)
         self.assertIn('"targeted_evidence_review"',source)
 
+    def test_review_assessment_separates_missing_mandatory_evidence_from_conflicts(self):
+        result={"classification":"needs_review","required_experience":[
+            {"requirement":"3+ years of experience in an industry role","status":"unclear","candidate_evidence":[]}],
+            "experience_level_assessment":"The candidate has 3+ years of experience, which is relevant to the job."}
+        assessment=app_agent._eligibility_review_assessment({"employment_type":"full-time","work_arrangement":"Remote"},result)
+        self.assertIn("3+ years of experience in an industry role",assessment["mandatory_unresolved"])
+        self.assertFalse(assessment["confirmed_conflicts"])
+        self.assertTrue(any(item["category"]=="unsupported_ai_evidence" for item in assessment["unsupported_ai_evidence"]))
+        self.assertIn("mandatory evidence",assessment["next_action"].casefold())
+
+    def test_review_assessment_keeps_confirmed_mismatch_blocking(self):
+        result={"classification":"not_eligible","required_skills":[
+            {"requirement":"Required Rust experience","status":"confirmed_mismatch","candidate_evidence":["Confirmed profile evidence"]}]}
+        assessment=app_agent._eligibility_review_assessment({"employment_type":"full-time","work_arrangement":"Remote"},result)
+        self.assertEqual(assessment["confirmed_conflicts"],["Required Rust experience"])
+        self.assertTrue(assessment["preparation_blocked"])
+        self.assertIn("cannot override",assessment["next_action"])
+
+    def test_review_assessment_keeps_employer_unknowns_separate_and_nonblocking(self):
+        result={"classification":"needs_review","preferred_experience":[{"requirement":"Internship preferred","status":"preferred"}]}
+        assessment=app_agent._eligibility_review_assessment({"employment_type":"","work_arrangement":""},result)
+        self.assertFalse(assessment["mandatory_unresolved"])
+        self.assertFalse(assessment["confirmed_conflicts"])
+        self.assertEqual(len(assessment["employer_uncertainties"]),2)
+        self.assertEqual(assessment["preferred_qualifications"][0]["requirement"],"Internship preferred")
+        self.assertTrue(assessment["employer_uncertainties"])
+
+    def test_review_assessment_flags_ai_absence_claim_against_confirmed_projects(self):
+        result={"classification":"needs_review","experience_level_assessment":
+            "The candidate profile does not mention any relevant projects and does not have experience with Haskell or other programming languages."}
+        assessment=app_agent._eligibility_review_assessment({"employment_type":"full-time","work_arrangement":"Remote"},result,
+            confirmed_projects_available=True)
+        diagnostics=" ".join(item["explanation"] for item in assessment["unsupported_ai_evidence"])
+        self.assertIn("confirmed project evidence",diagnostics)
+        self.assertIn("does not establish Haskell proficiency",diagnostics)
+        self.assertFalse(assessment["confirmed_conflicts"])
+
+    def test_experience_evidence_question_is_specific_and_requires_dated_employment(self):
+        question=app_agent._experience_requirement_question("3+ years of experience",
+            "It's important that you have 3+ years of experience in an industry role. Programming experience required.")
+        self.assertIn("3+ years of experience in an industry role",question)
+        self.assertNotIn("Programming experience",question)
+        self.assertIn("employer, role, and dates",question)
+        self.assertIn("Projects and coursework do not count",question)
+
+    def test_grouped_mandatory_experience_questions_merge_only_equivalent_requirements(self):
+        stamp=matcher.now();engine=matcher.matching_engine_version()
+        requirements=[("deepgram-a","Deepgram","Backend Engineer A","3+ years of experience",
+            "You need 3+ years of experience in an industry role."),
+            ("deepgram-b","Deepgram","Backend Engineer B","3+ years of experience",
+            "You need 3+ years of experience in an industry role."),
+            ("other-role","Other Employer","Engineer","5+ years of experience",
+            "You need 5+ years of experience in a professional role.")]
+        with app_agent.connect() as db:
+            opening_cols={row[1] for row in db.execute("PRAGMA table_info(discovered_openings)")}
+            if "availability_status" not in opening_cols:db.execute("ALTER TABLE discovered_openings ADD COLUMN availability_status TEXT DEFAULT 'current'")
+            if "last_verified_at" not in opening_cols:db.execute("ALTER TABLE discovered_openings ADD COLUMN last_verified_at TEXT")
+            for key,company,title,requirement,description in requirements:
+                db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,availability_status,last_verified_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (USER,key,company,title,"United States","https://example.test/"+key,stamp,description,"current",stamp))
+                result={"classification":"needs_review","required_experience":[{"requirement":requirement,"status":"unclear","candidate_evidence":[]}],"technical_qualifications":[]}
+                db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                    created_at,updated_at,matching_model_version,freshness_status) VALUES(?,?,?,'completed','needs_review',55,?,?,?,?,?)""",
+                    (USER,key,"r1",json.dumps(result),stamp,stamp,engine,"current"))
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,country,availability_status,last_verified_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (USER,"mytos-uk","Mytos","Junior Software Engineer","London","https://jobs.example/uk",stamp,
+                 "Build software in the London office.","GB","current",stamp))
+            uk_result={"classification":"needs_review","missing_information":[
+                "Work authorization for United Kingdom is not confirmed; confirm whether you are authorized there or would require employer sponsorship."],
+                "required_experience":[],"technical_qualifications":[]}
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,matching_model_version,freshness_status) VALUES(?,?,?,'completed','needs_review',55,?,?,?,?,?)""",
+                (USER,"mytos-uk","r1",json.dumps(uk_result),stamp,stamp,engine,"current"))
+        groups=app_agent.grouped_application_questions()["eligibility_groups"]
+        grouped=next(group for group in groups if len(group["jobs"])==2)
+        self.assertEqual({job["job_key"] for job in grouped["jobs"]},{"deepgram-a","deepgram-b"})
+        self.assertEqual(grouped["expected_answer_type"],"confirmed dated employment history")
+        self.assertIn("a yes/no response is not sufficient",grouped["eligibility_effect"])
+        self.assertTrue(any(len(group["jobs"])==1 and group["jobs"][0]["job_key"]=="other-role" for group in groups))
+        country_group=next(group for group in groups if group["canonical_category"]=="work_authorization_country")
+        self.assertEqual(country_group["context"],"united kingdom")
+        self.assertTrue(country_group["sensitive"])
+        self.assertEqual(country_group["reuse_scope"],"country_specific_profile_confirmation")
+        self.assertEqual(country_group["jobs"][0]["job_key"],"mytos-uk")
+
+    def test_dashboard_exposes_blocker_categories_and_grouped_mandatory_questions(self):
+        page=app_agent.APPLICATIONS_PAGE
+        self.assertIn("Eligibility evidence review",page)
+        self.assertIn("eligibility_groups",page)
+        self.assertIn("Review dated employment evidence in Candidate Profile",page)
+        self.assertIn("Do not answer yes/no here",page)
+        self.assertIn("Sensitive · country-specific · applicant confirmation required",page)
+        self.assertIn("Confirm country-specific work authorization in Candidate Profile",page)
+        self.assertIn("Potential Match — Further Review Required",page)
+        self.assertIn("Eligible for Preparation Review",page)
+        self.assertIn("Confirmed Mandatory Conflict",page)
+        self.assertIn("Ready for Review",page)
+        self.assertIn("Add earliest available date in Candidate Profile",page)
+        self.assertIn("preparation_plan_available",page)
+        self.assertIn("View Preparation Readiness",page)
+        self.assertIn("Read-only preparation readiness plan",page)
+
     def test_prepare_rejects_invalid_saved_url_before_browser(self):
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as caught:
@@ -1345,7 +1660,7 @@ class ApplicationAgentTests(unittest.TestCase):
         candidate={"country":"United States","state_province":"California"}
         country=FakeQuestionPage({"tag":"select","type":"select-one","label":"Country","required":True,"options":["Choose","United States","Canada"]})
         state=FakeQuestionPage({"tag":"select","type":"select-one","label":"State / Province","required":True,"options":["Choose","CA","NY"]})
-        settings={"__settings":{"allow_auto_use_confirmed_answers":True}}
+        settings={"__settings":{"allow_auto_use_confirmed_answers":True,"allow_confirmed_profile_fields":True}}
         report,missing,_=app_agent._fill_page(country,candidate,settings,Path(self.temp.name)/"r1.pdf")
         self.assertFalse(missing); self.assertEqual(country.fields.nth(0).selected,"United States")
         report,missing,_=app_agent._fill_page(state,candidate,settings,Path(self.temp.name)/"r1.pdf")
@@ -1430,6 +1745,55 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(apps,0)
         self.assertEqual(history,1)
 
+    def test_role_seniority_uncertainty_requires_job_specific_ack_and_verified_source(self):
+        from fastapi import HTTPException
+        description=("Requirements: B.S. in Computer Science or equivalent. Build and maintain software using "
+            "Haskell and related tools. The posting does not specify a seniority level.")
+        key,profile_data,prefs=self._save_evidence_review_fixture(description)
+        with app_agent.connect() as db:
+            columns={row[1] for row in db.execute("PRAGMA table_info(discovered_openings)")}
+            if "availability_status" not in columns:db.execute("ALTER TABLE discovered_openings ADD COLUMN availability_status TEXT NOT NULL DEFAULT ''")
+            db.execute("UPDATE discovered_openings SET title='Software Engineer',employment_type='Full-time',active=1,availability_status='current',last_verified_at=? WHERE user_id=? AND job_key=?",
+                (matcher.now(),USER,key))
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone())
+            row=db.execute("SELECT result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id='r1'",(USER,key)).fetchone()
+            result=matcher.MatchResult.model_validate_json(row["result_json"])
+            result.missing_information=["Experience level is not clear from the posting title."]
+            db.execute("UPDATE job_match_results SET result_json=?,job_fingerprint=? WHERE user_id=? AND job_key=? AND resume_id='r1'",
+                (result.model_dump_json(),matcher.job_fingerprint(opening),USER,key))
+        request=self._evidence_review_request(key,profile_data,prefs,accept_unspecified_employment_type=False,
+            accept_unclear_role_seniority=False)
+        review_result=matcher.MatchResult.model_validate_json(result.model_dump_json())
+        with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",profile_data)), \
+             patch.object(matcher,"preferences",return_value=prefs), \
+             patch.object(matcher,"apply_safety_rules",return_value=review_result), \
+             patch.object(matcher,"_verified_saved_employer_source",return_value=True), \
+             patch.object(matcher,"analyze_with_ollama",side_effect=AssertionError("review must not call AI")):
+            with self.assertRaises(HTTPException) as missing:
+                app_agent.resolve_saved_job_evidence_review(key,request)
+            self.assertEqual(missing.exception.status_code,422)
+            self.assertIn("seniority still unknown",missing.exception.detail)
+            request=app_agent.TargetedEligibilityReviewRequest(**{**request.model_dump(),"accept_unclear_role_seniority":True})
+            with patch.object(matcher,"_verified_saved_employer_source",return_value=False):
+                with self.assertRaises(HTTPException) as unverified:
+                    app_agent.resolve_saved_job_evidence_review(key,request)
+            self.assertEqual(unverified.exception.status_code,409)
+            self.assertIn("healthy official employer source",unverified.exception.detail)
+            resolved=app_agent.resolve_saved_job_evidence_review(key,request)
+        self.assertEqual(resolved["classification"],"potential_match")
+        self.assertEqual(resolved["role_seniority"],"unknown")
+        self.assertFalse(resolved["application_preparation_authorized"])
+        with app_agent.connect() as db:
+            saved=json.loads(db.execute("SELECT result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id='r1'",(USER,key)).fetchone()[0])
+            review=json.loads(db.execute("SELECT details_json FROM eligibility_evidence_reviews WHERE user_id=? AND job_key=? ORDER BY review_id DESC LIMIT 1",(USER,key)).fetchone()[0])
+        self.assertIn("role seniority remains unknown",saved["explanation"])
+        self.assertTrue(review["accepted_unclear_role_seniority"])
+
+    def test_needs_review_preparation_reason_does_not_hide_review_blocker_with_authorization(self):
+        source=inspect.getsource(app_agent.list_saved_application_jobs)
+        self.assertIn("Confirm the missing mandatory evidence in Candidate Profile",source)
+        self.assertIn("Review the employer-side uncertainty for this job",source)
+
     def test_targeted_review_rejects_stale_fingerprints(self):
         key,profile_data,prefs=self._save_evidence_review_fixture("Requirements: a relevant degree.")
         request=self._evidence_review_request(key,profile_data,prefs,profile_fingerprint="f"*64)
@@ -1468,6 +1832,27 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(saved["classification"],"needs_review")
         self.assertEqual(review_count,0)
         self.assertEqual(application_count,0)
+
+    def test_flattened_ashby_new_grad_requirements_block_until_assessed(self):
+        description=("About the role\nBuild and ship full-stack product features.\n"
+            "What You'll Bring\nA product builder able to deliver user-facing software at scale.\n"
+            "Full-stack fluency with React, TypeScript, Python, databases, and cloud systems.\n"
+            "AI experience with LLM APIs, embeddings, and RAG is a nice-to-have.\n"
+            "What You'll Do\nPartner with customers to deliver high-quality features.\n"
+            "We are hiring new graduates available to start between winter 2026 and summer 2027.")
+        unmapped=app_agent._unmapped_required_posting_items(description,{})
+        self.assertEqual(len(unmapped),3)
+        self.assertTrue(any("product builder" in item for item in unmapped))
+        self.assertTrue(any("available to start" in item for item in unmapped))
+        self.assertFalse(any("nice-to-have" in item for item in unmapped))
+        self.assertFalse(any("Partner with customers" in item for item in unmapped))
+
+    def test_start_window_is_considered_assessed_only_with_explicit_availability_assessment(self):
+        description="We need to hire new graduates available to start between winter of 2026 and summer of 2027."
+        missing=app_agent._unmapped_required_posting_items(description,{})
+        self.assertTrue(any("available to start" in item for item in missing))
+        assessed={"availability_assessment":{"status":"needs_review","requirement":"available to start between winter of 2026 and summer of 2027"}}
+        self.assertEqual(app_agent._unmapped_required_posting_items(description,assessed),[])
 
     def test_technical_evidence_answer_requires_specific_confirmation_and_reassesses_without_ai(self):
         key,profile_data,prefs=self._save_evidence_review_fixture(
@@ -1923,6 +2308,20 @@ class ApplicationAgentTests(unittest.TestCase):
         city_identity=app_agent.canonical_answer_identity("Location (City)")
         country_identity=app_agent.canonical_answer_identity("Location (Country)")
         self.assertNotEqual(city_identity[:2],country_identity[:2])
+
+    def test_netic_technical_prompts_group_by_the_actual_requirement(self):
+        prompts={
+            "Technical evidence (release cycles): Which project did you carry through multiple cycles?":"product_release_cycles",
+            "Technical evidence (full-stack): Describe your React and backend work.":"full_stack_fluency",
+            "Technical evidence (customer work): Describe a customer or stakeholder need and product change.":"customer_product_translation",
+            "Technical evidence (ownership): Describe an ambiguous feature you owned.":"founder_level_ownership",
+            "Technical evidence (communication): Describe an architectural trade-off and business outcome.":"technical_business_communication",
+        }
+        for question,expected in prompts.items():
+            category,context,_=profile.canonical_answer_identity(question)
+            with self.subTest(question=question):
+                self.assertEqual(category,"technical_qualification")
+                self.assertEqual(context,expected)
 
     def test_invalid_historical_city_answer_is_never_reused_by_browser_filler(self):
         answers={"custom:old-city":{"question":"Location (City)*","answer":"yes","confirmed":True,

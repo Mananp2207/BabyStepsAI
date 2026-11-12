@@ -2,6 +2,7 @@
 
 import json
 import html
+import calendar
 import logging
 import re
 import os
@@ -11,7 +12,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import Literal
 
 import requests
@@ -19,7 +20,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
 
 from job_search_agent import (
-    BOARDS, USER, assess_job, database, fetch_board, preferences, search_terms, initialize as initialize_job_sources,
+    BOARDS, USER, assess_job, database, fetch_board, preferences, search_terms, _public_match_error,
+    _source_fingerprint, initialize as initialize_job_sources,
 )
 from candidate_verification import (canonical_verified_candidate_facts, normalize_degree, normalize_major,
                                     verified_profile_facts, verified_values_from_json,validate_application_answer)
@@ -28,15 +30,23 @@ from job_relevance import (evaluate_location, evaluate_relocation_preference, ex
                            extract_technical_qualification_requirements,
                            extract_gpa_requirements, extract_graduation_windows, extract_internship_requirements,
                            infer_prompt_preferences, normalize_job_record,
-                           relevance_for_job)
+                           relevance_for_job, classify_experience_level, infer_country_from_location,
+                           extract_sponsorship_requirement)
 from job_connectors import EmployerSource, fetch_source, normalize_job as normalize_source_job
 from matching_versions import fingerprint as stable_fingerprint, profile_fingerprint, job_fingerprint
 
 router = APIRouter()
 MODEL = "qwen2.5:3b"
-MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v18-target-role-filtering"
+MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v23-early-career-sponsorship-review"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
-OLLAMA_TIMEOUT = (5, 120)
+def _bounded_env_float(name,default,minimum,maximum):
+    try:value=float(os.getenv(name,str(default)))
+    except (TypeError,ValueError):value=float(default)
+    return max(float(minimum),min(float(maximum),value))
+
+
+OLLAMA_TIMEOUT = (_bounded_env_float("BABYSTEPS_OLLAMA_CONNECT_TIMEOUT",5,1,20),
+                  _bounded_env_float("BABYSTEPS_OLLAMA_READ_TIMEOUT",120,30,300))
 OLLAMA_ATTEMPTS = 3
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -58,6 +68,29 @@ MATCH_HEARTBEAT_SECONDS = 20
 class MatchRequest(BaseModel):
     job_keys: list[str] = Field(min_length=1, max_length=250)
     batch_size: int = Field(default=3, ge=MIN_JOBS_PER_BATCH, le=MAX_JOBS_PER_BATCH)
+
+
+class FailedMatchRetryRequest(BaseModel):
+    job_key: str = Field(min_length=3,max_length=400)
+
+
+class MatchingProviderError(RuntimeError):
+    """Safe user-facing provider error without prompt or response contents."""
+    def __init__(self,category,message):
+        super().__init__(message)
+        self.category=category
+        self.public_message=message
+
+
+def _safe_feed_failure(error):
+    text=str(error or "").casefold()
+    if "robots" in text:return "The official source disallows this check under its robots policy."
+    if "ssl" in text or "tls" in text or "certificate" in text:return "The official source failed secure TLS verification."
+    if "429" in text or "rate limit" in text:return "The official source rate limited this check. Retry after its published delay."
+    if "dns" in text or "name or service not known" in text:return "The official source hostname could not be resolved."
+    if "timeout" in text or "temporarily unavailable" in text:return "The official job feed is temporarily unavailable."
+    if "no longer present" in text or "no longer listed" in text:return "The posting was not present in the latest official feed. Refresh availability before matching."
+    return "The current public posting could not be verified. Refresh the employer source and retry."
 
 
 class MatchRecovery(BaseModel):
@@ -106,6 +139,7 @@ class MatchResult(BaseModel):
     technical_qualifications: list[TechnicalQualificationEvidence] = Field(default_factory=list,max_length=40)
     technical_qualification_assessed_at: str = Field(default="",max_length=100)
     technical_qualification_snapshot: dict = Field(default_factory=dict)
+    availability_assessment: dict = Field(default_factory=dict)
 
 
 def now():
@@ -170,11 +204,12 @@ def initialize():
         db.execute("""CREATE TABLE IF NOT EXISTS job_match_result_history (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL,job_key TEXT NOT NULL,
             resume_id TEXT NOT NULL,archived_at TEXT NOT NULL,reason TEXT NOT NULL,snapshot_json TEXT NOT NULL)""")
-        # Technical evidence semantics changed: prior results remain archived
-        # in place and are considered stale until reassessed by the current engine.
+        # Experience requirements under explicit "Required Skills" and "What
+        # we're looking for" headings are now extracted as mandatory. Preserve
+        # prior rows and mark them stale for deterministic reassessment.
         db.execute("""UPDATE job_match_results SET freshness_status='stale'
             WHERE status='completed' AND matching_model_version NOT LIKE ? AND freshness_status<>'stale'""",
-            ("%/job-match-v18-target-role-filtering",))
+            ("%/job-match-v23-early-career-sponsorship-review",))
         db.execute("""CREATE TABLE IF NOT EXISTS job_match_sessions (
             session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, resume_id TEXT NOT NULL,
             status TEXT NOT NULL, job_keys_json TEXT NOT NULL, batch_size INTEGER NOT NULL,
@@ -338,6 +373,81 @@ def _has_profile_fact(profile, key_fragments):
                    ("work_authorization","work_authorization_by_country","sponsorship_needs_by_country",
                     "sponsorship_required_now","sponsorship_required_future"))
     return False
+
+
+_COUNTRY_AUTH_ALIASES={
+    "GB":{"gb","uk","united kingdom","great britain","england","scotland","wales","northern ireland"},
+    "US":{"us","usa","united states","united states of america"},
+    "CA":{"ca","canada"},
+    "AU":{"au","australia"},
+}
+
+def _country_auth_aliases(country):
+    value=re.sub(r"[^a-z0-9]+"," ",str(country or "").casefold()).strip()
+    for code,aliases in _COUNTRY_AUTH_ALIASES.items():
+        if value in aliases or value==code.casefold():return aliases
+    return {value} if value else set()
+
+def _country_auth_label(country):
+    value=str(country or "").strip()
+    code=value.upper()
+    return {"GB":"United Kingdom","US":"United States","CA":"Canada","AU":"Australia"}.get(code,value)
+
+def _confirmed_work_authorization_for_country(profile,country):
+    """Require explicit country-scoped, affirmative authorization evidence.
+
+    Relocation willingness, sponsorship preference, and an authorization answer
+    for another country never establish right to work in this jurisdiction.
+    """
+    aliases=_country_auth_aliases(country)
+    if not aliases:return False
+    entries=profile.get("work_authorization_by_country") or profile.get("country_work_authorizations") or []
+    if isinstance(entries,dict):entries=[{"country":key,"status":value} for key,value in entries.items()]
+    if isinstance(entries,list):
+        for entry in entries:
+            if not isinstance(entry,dict):continue
+            entry_country=re.sub(r"[^a-z0-9]+"," ",str(entry.get("country") or "").casefold()).strip()
+            status=re.sub(r"[^a-z0-9]+"," ",str(entry.get("status") or "").casefold()).strip()
+            if entry_country not in aliases:continue
+            if status=="no" or re.search(r"\b(not authorized|not authorised|unauthorized|unauthorised|requires? sponsorship|need sponsorship)\b",status):
+                return False
+            if status in {"yes","authorized","authorised","authorized to work","right to work","citizen",
+                          "permanent resident","work permit","eligible to work","no sponsorship required"}:
+                return True
+    # The legacy field is a user-confirmed list of jurisdictions where the
+    # applicant says they are authorized. Match only explicit country names.
+    legacy=re.sub(r"[^a-z0-9]+"," ",str(profile.get("work_authorization") or "").casefold()).strip()
+    if not legacy or re.search(r"\b(no|not authorized|not authorised|unauthorized|unauthorised|requires? sponsorship)\b",legacy):
+        return False
+    padded=f" {legacy} "
+    return any(f" {alias} " in padded for alias in aliases)
+
+
+def _confirmed_sponsorship_need(profile,country=""):
+    """Return True/False only for confirmed sponsorship facts; otherwise None."""
+    facts=profile if isinstance(profile,dict) else {}
+    entries=facts.get("sponsorship_needs_by_country") or facts.get("sponsorship_by_country") or []
+    if isinstance(entries,dict):entries=[{"country":key,"requires_sponsorship":value} for key,value in entries.items()]
+    if isinstance(entries,list) and country:
+        aliases=_country_auth_aliases(country)
+        for entry in entries:
+            if not isinstance(entry,dict):continue
+            entry_country=re.sub(r"[^a-z0-9]+"," ",str(entry.get("country") or "").casefold()).strip()
+            if entry_country not in aliases:continue
+            value=re.sub(r"[^a-z0-9]+"," ",str(entry.get("requires_sponsorship") or entry.get("status") or "").casefold()).strip()
+            if value in {"yes","true","required","1"}:return True
+            if value in {"no","false","not required","0"}:return False
+    single=facts.get("requires_sponsorship")
+    normalized=re.sub(r"[^a-z0-9]+"," ",str(single or "").casefold()).strip()
+    if normalized in {"yes","true","required","1"}:return True
+    if normalized in {"no","false","not required","0"}:return False
+    now=facts.get("sponsorship_required_now")
+    future=facts.get("sponsorship_required_future")
+    values=[re.sub(r"[^a-z0-9]+"," ",str(value or "").casefold()).strip() for value in (now,future)]
+    affirmative={"yes","true","required","1"};negative={"no","false","not required","0"}
+    if any(value in affirmative for value in values):return True
+    if all(value in negative for value in values):return False
+    return None
 
 
 _EVIDENCE_STOPWORDS={"a","an","and","are","as","at","be","by","for","from","in","is","of","or","the","to","with","years","year","experience","professional","preferred","required","qualification","qualifications","skill","skills","degree"}
@@ -742,7 +852,138 @@ def _technical_qualification_assessments(description,profile,job_key=""):
         output.append({"requirement":item["requirement"],"category":category,"requiredness":requiredness,"status":status,
             "posting_evidence":[item["requirement"]],"candidate_evidence":evidence,"explanation":explanation,
             "missing_question":questions.get(category,"") if status=="needs_review" and requiredness=="required" else ""})
+    output.extend(_role_delivery_qualification_assessments(description,profile,sources))
     return output
+
+
+def _what_you_bring_items(description):
+    """Extract labelled expectations from an explicit What You'll Bring section."""
+    text=html.unescape(str(description or ""))
+    text=re.sub(r"</(?:li|p|div|ul|ol|h[1-6]|br)\s*>","\n",text,flags=re.I)
+    text=re.sub(r"<br\s*/?>","\n",text,flags=re.I)
+    text=re.sub(r"<[^>]+>"," ",text)
+    text=re.sub(r"\s+(?=what you(?:'|’)ll bring\s*:?)","\n",text,flags=re.I)
+    text=re.sub(r"\s+(?=our values\b|we are an equal opportunity employer\b)","\n",text,flags=re.I)
+    text=re.sub(r"\s+[-•]\s+","\n",text)
+    lines=[re.sub(r"\s+"," ",line).strip(" \t\r\n•-*") for line in text.splitlines()]
+    items=[];inside=False
+    for line in lines:
+        clean=re.sub(r"[^a-z'’ ]+"," ",line.casefold()).strip()
+        if re.fullmatch(r"what you(?:'|’)ll bring",clean):inside=True;continue
+        if not inside:continue
+        if clean in {"our values","equal opportunity employer","what you’ll do","what you'll do"} or re.match(r"^(?:our values|equal opportunity employer|what you(?:'|’)ll do)\b",clean):break
+        if line and len(line)>8:items.append(line)
+    return list(dict.fromkeys(items))
+
+
+def _role_delivery_qualification_assessments(description,profile,sources=None):
+    """Assess role expectations against confirmed narratives without granting facts from a tech list."""
+    items=_what_you_bring_items(description)
+    if not items:return []
+    sources=list(sources or [])
+    action=re.compile(r"\b(?:build|built|develop|developed|implement|implemented|create|created|design|designed|deploy|deployed|maintain|maintained|contribute|contributed|program|programmed|write|wrote|integrat|integrated|own|owned|lead|led|author|authored|collaborat|collaborated|explain|explained|configure|configured|use|used|ship|shipped)\b",re.I)
+    question_map={
+        "product_release_cycles":"Technical evidence (release cycles): Which confirmed project or role did you take through at least two distinct software release cycles? Give the sequence or dates, what changed in each release, and your contribution. A single iteration or deployment is not multiple cycles.",
+        "full_stack_fluency":"Technical evidence (full-stack): For a confirmed project or role, describe what you personally implemented with React, TypeScript, and Python; identify the database work and any cloud infrastructure you configured. A technology list alone is not enough.",
+        "customer_product_translation":"Technical evidence (customer work): Describe one confirmed example where you directly gathered a customer or stakeholder need, translated it into a technical specification or product change, and followed the result. Include your role and the feedback or outcome.",
+        "founder_level_ownership":"Technical evidence (ownership): Describe a confirmed ambiguous project or feature you personally owned from decision through delivery. Explain what you decided independently and how you responded to a failure, setback, or new evidence.",
+        "technical_business_communication":"Technical evidence (communication): Give a confirmed example of explaining an architectural trade-off to technical teammates and communicating the product or business impact to a nontechnical stakeholder. Name the audience, decision, and format.",
+    }
+    output=[]
+    for item in items:
+        lower=item.casefold()
+        preferred=bool(re.search(r"nice[\s\u2011-]+to[\s\u2011-]+have|preferred|bonus|a plus",lower))
+        label=item.split(":",1)[0].casefold()
+        if re.search(r"ai experience|llm apis|embeddings|rag patterns",lower):category="ai_experience"
+        elif re.search(r"full[\s\u2011-]+stack|react|typescript|python|cloud infrastructure",lower):category="full_stack_fluency"
+        elif re.search(r"customer empathy|stakeholder goals|customer feedback",lower):category="customer_product_translation"
+        elif re.search(r"founder.level ownership|ownership|run toward ambiguity",lower):category="founder_level_ownership"
+        elif re.search(r"communicator|architectural trade.off|business outcomes",lower):category="technical_business_communication"
+        elif re.search(r"product builder|multiple release cycles|user.facing software at scale",lower):category="product_release_cycles"
+        else:category="role_expectation_"+re.sub(r"[^a-z0-9]+","_",label).strip("_")[:40]
+        supports=[];partial=[]
+        for source in sources:
+            if source.get("source_type")=="confirmed_answer" and source.get("answer_context")!=category:continue
+            text=source.get("narrative","")
+            if category=="product_release_cycles":
+                multi=bool(re.search(r"\b(?:multiple|several|two|2|[3-9]|\d{2,})\s+(?:distinct\s+)?(?:software\s+)?(?:release|launch|ship)(?:s|ment)?\s+cycles?\b|\b(?:v?1\.?0?).{0,120}\b(?:v?2\.?0?)\b",text,re.I))
+                if action.search(text) and multi:supports.append((source,["multiple_release_cycles"]))
+                elif re.search(r"\biterat(?:e|ed|ion|ing)\b",text,re.I):partial.append((source,["iteration_evidence"]))
+            elif category=="full_stack_fluency":
+                stack=bool(action.search(text) and (re.search(r"\bfull[\s-]?stack\b",text,re.I) or
+                    (re.search(r"\bfront(?:end|[ -]?end)\b",text,re.I) and re.search(r"\bback(?:end|[ -]?end)\b",text,re.I))))
+                database_work=bool(action.search(text) and re.search(r"\b(?:database|sql|postgres(?:ql)?|mysql|mongodb)\b",text,re.I))
+                tech_work={"react":bool(action.search(text) and re.search(r"\breact\b",text,re.I)),
+                    "typescript":bool(action.search(text) and re.search(r"\btypescript\b",text,re.I)),
+                    "python":bool(action.search(text) and re.search(r"\bpython\b",text,re.I)),
+                    "database":database_work,"cloud":bool(re.search(r"\b(?:configured|provisioned|deployed|managed)\b.{0,60}\b(?:cloud|aws|gcp|azure)\b",text,re.I))}
+                facets=[name for name,matched in tech_work.items() if matched]
+                if stack or facets:partial.append((source,[*(["full_stack_project"] if stack else []),*facets]))
+                if stack and all(tech_work.values()):supports.append((source,["react","typescript","python","database","cloud_infrastructure"]))
+            elif category=="customer_product_translation":
+                direct=bool(action.search(text) and re.search(r"\b(?:customer|stakeholder|end users?)\b",text,re.I) and
+                    re.search(r"\b(?:interview|gather(?:ed)?|feedback|workflow|requirements?)\b",text,re.I) and
+                    re.search(r"\b(?:translate|translated|specification|technical spec|product change|feature)\b",text,re.I))
+                if direct:supports.append((source,["direct_stakeholder_need_to_product_change"]))
+            elif category=="founder_level_ownership":
+                owned=bool(re.search(r"\b(?:owned|led|independently delivered|responsible for)\b.{0,100}\b(?:end.to.end|feature|project|delivery|design)\b",text,re.I))
+                independent=bool(re.search(r"\b(?:independently|self.directed|without supervision|made the decision|ambiguity|ambiguous)\b",text,re.I))
+                learning=bool(re.search(r"\b(?:failure|failed|setback|incident|feedback)\b.{0,100}\b(?:learn|adjust|iterate|improv|fix|change)\w*\b",text,re.I))
+                facets=[name for name,yes in (("end_to_end_feature_ownership",owned),("independent_ambiguous_execution",independent),("learning_from_setbacks",learning)) if yes]
+                if facets:partial.append((source,facets))
+                if owned and independent and learning:supports.append((source,facets))
+            elif category=="technical_business_communication":
+                docs=bool(action.search(text) and re.search(r"\b(?:technical documentation|documentation|test plans?|design documents?)\b",text,re.I))
+                technical_audience=bool(re.search(r"\b(?:engineering team|engineers|technical teammates|architectural trade.off)\b",text,re.I))
+                business_audience=bool(re.search(r"\b(?:business outcomes?|executives?|nontechnical stakeholder|business stakeholder)\b",text,re.I))
+                facets=[name for name,yes in (("technical_writing_or_explanation",docs),("technical_audience",technical_audience),("business_audience",business_audience)) if yes]
+                if facets:partial.append((source,facets))
+                if docs and technical_audience and business_audience:supports.append((source,facets))
+        chosen=supports or partial
+        evidence=[{"source_type":source.get("source_type","confirmed_answer"),"source_ref":source.get("source_ref",""),
+            "confirmation_status":"confirmed","supports":facets,"reuse_scope":source.get("reuse_scope","profile")} for source,facets in chosen]
+        if preferred:
+            status="met" if supports else "not_applicable"
+            explanation="This is explicitly a preferred, nice-to-have qualification and does not block eligibility."
+        else:
+            status="met" if supports else "needs_review"
+            explanation=("Confirmed profile or answer evidence explicitly establishes the full posting expectation." if supports else
+                "Confirmed evidence supports only part of this expectation; the remaining posting-specific facts need applicant review." if partial else
+                "No confirmed narrative evidence establishes this expectation. Do not infer it from technology names, coursework labels, or unrelated activity.")
+        output.append({"requirement":item,"category":category,"requiredness":"preferred" if preferred else "required",
+            "status":status,"posting_evidence":[item],"candidate_evidence":evidence,"explanation":explanation,
+            "missing_question":question_map.get(category,"Technical evidence: Describe a confirmed project, coursework, or work example that demonstrates this posting expectation, what you personally did, and the result.") if status=="needs_review" and not preferred else ""})
+    return output
+
+
+def _start_window_assessment(description,profile):
+    text=html.unescape(re.sub(r"<[^>]+>"," ",str(description or "")))
+    match=re.search(r"(?:available to start|start date)[^.\n]{0,120}?(?:between\s+)?((?:winter|spring|summer|fall|autumn)(?:\s+of)?\s+20\d{2})\s+(?:and|through|to)[ -]*((?:winter|spring|summer|fall|autumn)(?:\s+of)?\s+20\d{2})",text,re.I)
+    if not match:return {}
+    evidence=[]
+    if profile.get("graduation_date"):
+        evidence.append({"source_type":"confirmed_education","source_ref":"education_entries","confirmation_status":"confirmed","supports":["graduation_date_only"]})
+    available=str(profile.get("earliest_available_date") or "").strip()
+    if not available:
+        raw=str(profile.get("availability") or "").strip()
+        if re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])-\d{2}",raw):available=raw
+        elif re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])",raw):available=raw+"-01"
+    if available:
+        evidence.append({"source_type":"confirmed_candidate_availability","source_ref":"earliest_available_date","confirmation_status":"confirmed","supports":["specific_start_date"]})
+        try:
+            available_date=datetime.strptime(available[:10],"%Y-%m-%d").date()
+            end=re.search(r"(winter|spring|summer|fall|autumn)(?:\s+of)?\s+(20\d{2})",match.group(2),re.I)
+            month={"winter":2,"spring":5,"summer":8,"fall":11,"autumn":11}[end.group(1).casefold()]
+            last_day=calendar.monthrange(int(end.group(2)),month)[1]
+            status="confirmed_mismatch" if available_date>date(int(end.group(2)),month,last_day) else "met"
+            return {"status":status,"requiredness":"required","requirement":match.group(0).strip(),
+                "posting_evidence":match.group(0).strip(),"candidate_evidence":evidence,
+                "explanation":"A confirmed earliest start date was compared with the stated window. Earlier availability is acceptable because the posting says an earlier start is preferred."}
+        except (TypeError,ValueError,AttributeError):pass
+    return {"status":"needs_review","requiredness":"required","requirement":match.group(0).strip(),
+        "posting_evidence":match.group(0).strip(),"candidate_evidence":evidence,
+        "missing_question":"What is your earliest available full-time start date or confirmed availability range? Give a specific date or range; this is separate from your graduation date and any notice period.",
+        "explanation":"The confirmed graduation record is not employment availability. No confirmed earliest start date or availability range is available."}
 
 
 def _evidence_rank_score(data,geo_status,ai_score):
@@ -769,6 +1010,7 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
     data,ai_entry_diagnostics,exp_requirements,edu_requirements,gpa_requirements=_normalized_ai_evidence(result,facts,job,description)
     technical_posting=html.unescape(str(job.get("content") or job.get("description") or description))
     data["technical_qualifications"]=_technical_qualification_assessments(technical_posting,facts,job.get("job_key") or "")
+    data["availability_assessment"]=_start_window_assessment(technical_posting,facts)
     data["technical_qualification_assessed_at"]=datetime.now(timezone.utc).isoformat()
     data["technical_qualification_snapshot"]={}
     original=result.model_dump()
@@ -801,6 +1043,20 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
             consistency.append("The AI location narrative did not reflect a deterministic geographic conflict.")
     else:
         missing.append(geo_reason)
+
+    # A willingness to relocate can resolve a location preference, but never
+    # establishes legal authorization to work in a different country.
+    job_country=str(job.get("country") or "").strip()
+    if profile_verified and job_country and not _confirmed_work_authorization_for_country(facts,job_country):
+        country_label=_country_auth_label(job_country)
+        missing.append(f"Work authorization for {country_label} is not confirmed; confirm whether you are authorized there or would require employer sponsorship.")
+    sponsorship=extract_sponsorship_requirement(description)
+    if sponsorship["status"]=="not_available":
+        sponsorship_need=_confirmed_sponsorship_need(facts,job_country) if profile_verified else None
+        if sponsorship_need is True:
+            hard_conflicts.append("Employer states sponsorship is unavailable, but confirmed applicant facts indicate sponsorship is required.")
+        elif sponsorship_need is None:
+            missing.append("Employer does not offer sponsorship; confirm whether sponsorship will be required.")
 
     posted_employment_type=str(job.get("employment_type") or "").strip()
     if not posted_employment_type:
@@ -842,6 +1098,13 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
                 missing.append("Technical qualification needs confirmation: "+item["missing_question"])
         elif item["status"]=="confirmed_mismatch":
             hard_conflicts.append("Confirmed candidate evidence does not meet the mandatory technical qualification: "+item["requirement"])
+    availability=data.get("availability_assessment") or {}
+    if availability.get("status")=="needs_review":
+        gaps.append("Needs confirmed start availability: "+str(availability.get("requirement") or "employer start window"))
+        if availability.get("missing_question"):
+            missing.append(availability["missing_question"])
+    elif availability.get("status")=="confirmed_mismatch":
+        hard_conflicts.append("Confirmed earliest availability falls outside the employer's start window: "+str(availability.get("requirement") or ""))
     for requirement in gpa_requirements["required"]:
         status,evidence=_gpa_requirement_status(requirement,facts)
         if status=="unclear":
@@ -930,7 +1193,7 @@ def apply_safety_rules(result, profile, profile_status, prefs, job):
         if not any(label.casefold() in str(item.get("requirement","")).casefold()
                    for item in data["preferred_experience"]):
             data["preferred_experience"].append({"requirement":label,"status":"preferred","candidate_evidence":[]})
-    if re.search(r"\b(?:start|begin)\s+(?:full[- ]time\s+)?by\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)(?:(?:\s*/\s*|\s+or\s+)(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?))?\s+20\d{2}",description,re.I) and not facts.get("availability"):
+    if not availability and re.search(r"\b(?:start|begin)\s+(?:full[- ]time\s+)?by\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)(?:(?:\s*/\s*|\s+or\s+)(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?))?\s+20\d{2}",description,re.I) and not facts.get("availability"):
         missing.append("The posting specifies a full-time start date; candidate availability has not been confirmed.")
 
     authorization_required=bool(re.search(
@@ -1153,7 +1416,7 @@ def current_provider_config():
 
 def matching_engine_version(provider=None,model=None):
     provider,model=(provider,model) if provider and model else current_provider_config()
-    return f"{provider}:{model}/job-match-v18-target-role-filtering"
+    return f"{provider}:{model}/job-match-v23-early-career-sponsorship-review"
 
 
 def _provider_result(profile,profile_status,prefs,job,provider,model):
@@ -1164,7 +1427,7 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
     if provider=="gemini" and not api_key:
         raise RuntimeError("Gemini matching is selected, but GEMINI_API_KEY is not configured in the server environment.")
     if provider not in {"ollama","gemini"}:raise RuntimeError("Unsupported matching provider.")
-    for attempt in range(OLLAMA_ATTEMPTS):
+    for attempt in range(max(1,min(int(OLLAMA_ATTEMPTS),3))):
         request_prompt=prompt if not repair_details else prompt+"\n\n"+MATCHING_JSON_REPAIR_INSTRUCTION+"\nValidation issue: "+repair_details
         try:
             if provider=="ollama":
@@ -1185,13 +1448,43 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
                 response.raise_for_status()
             response.raise_for_status()
             return _parse_gemini_response(response)
+        except MatchingProviderError:
+            raise
+        except requests.ReadTimeout as error:
+            if provider=="ollama":
+                # A read timeout means the model accepted the prompt but did
+                # not finish generation. Repeating the same large request
+                # immediately can tie up an 8 GB local device for minutes.
+                # Keep the failed job recoverable through an explicit retry.
+                raise MatchingProviderError("read_timeout",
+                    f"Ollama did not finish this match within {int(OLLAMA_TIMEOUT[1])} seconds. No result was saved; check local model load and retry this job when ready.") from error
+            last_error=f"network or service error ({type(error).__name__})"
+            if attempt+1>=OLLAMA_ATTEMPTS:
+                raise MatchingProviderError("read_timeout","The selected AI provider did not finish the match in time. No result was saved; retry this job later.") from error
+            time.sleep(min(0.5*(2**attempt),2))
         except (requests.RequestException,ValueError,RuntimeError) as error:
-            if provider=="gemini" and isinstance(error,requests.RequestException):
+            if provider=="ollama" and isinstance(error,requests.ConnectTimeout):
+                last_error="Ollama connection timed out"
+            elif provider=="ollama" and isinstance(error,requests.ConnectionError):
+                last_error="Ollama is not reachable"
+            elif provider=="ollama" and isinstance(error,requests.HTTPError):
+                code=getattr(getattr(error,"response",None),"status_code",None)
+                if code is not None and 400<=code<500:
+                    raise MatchingProviderError("request_rejected",f"Ollama rejected the matching request (HTTP {code}). Check the local model configuration.") from error
+                last_error=f"Ollama service error (HTTP {code})" if code else "Ollama service error"
+            elif provider=="gemini" and isinstance(error,requests.RequestException):
                 last_error=f"network or service error ({type(error).__name__})"
             else:last_error=error
             if isinstance(error,ValueError):repair_details=str(error)[:240]
             if isinstance(error,RuntimeError) and provider=="gemini" and ("HTTP " in str(error) or "rejected the configured API key" in str(error)):break
             if attempt+1<OLLAMA_ATTEMPTS:time.sleep(min(0.5*(2**attempt),2))
+    if provider=="ollama":
+        if isinstance(last_error,ValueError):
+            raise MatchingProviderError("invalid_response","Ollama returned malformed match JSON after bounded repair attempts. Retry the selected job; no application action was taken.")
+        reason=str(last_error) if isinstance(last_error,str) and re.fullmatch(
+            r"Ollama is not reachable|Ollama connection timed out|Ollama service error(?: \(HTTP [1-5][0-9]{2}\))?",last_error) else "Ollama provider failure"
+        category="connection" if "reachable" in reason.casefold() or "connection timed out" in reason.casefold() else "provider_failure"
+        raise MatchingProviderError(category,f"Ollama matching failed after {max(1,min(int(OLLAMA_ATTEMPTS),3))} bounded attempts ({reason}). Retry this job after checking the local model.")
     raise RuntimeError(f"{provider.title()} matching failed after {OLLAMA_ATTEMPTS} attempts: {last_error}")
 
 
@@ -1297,7 +1590,7 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
         _persist_state(job_key, resume_id, "processing")
         job, feed_error = _find_feed_job(job_key, feeds)
         if feed_error:
-            _persist_state(job_key, resume_id, "failed", error=feed_error)
+            _persist_state(job_key, resume_id, "failed", error=_safe_feed_failure(feed_error))
             _finish_session_job(session_id,owner_token,job_key)
             continue
         prefs = workflow_prefs or infer_prompt_preferences(job.get("_search_prompt", ""), saved_prefs)
@@ -1328,8 +1621,13 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
                     (result.model_dump_json(),candidate_fp,preferences_fp,opening_fp,engine_version,USER,job_key,resume_id))
             _finish_session_job(session_id,owner_token,job_key,completed=True)
         except Exception as error:
-            # Keep errors useful without logging resume or job description content.
-            _persist_state(job_key, resume_id, "failed", error=f"Match analysis failed: {type(error).__name__}: {error}")
+            # Persist only sanitized diagnostics; never include prompt, profile,
+            # response text, URL query values, or exception payloads.
+            public_error=getattr(error,"public_message",None)
+            if not public_error:
+                public_error=("The current public posting could not be verified for matching. Refresh the source and retry." if feed_error
+                              else f"Match analysis failed ({type(error).__name__}). No application action was taken; retry this selected job.")
+            _persist_state(job_key, resume_id, "failed", error=str(public_error)[:500])
             _finish_session_job(session_id,owner_token,job_key)
 
 
@@ -1456,6 +1754,9 @@ def _progress(session_id=None, job_keys=None):
     public_results = [{key: value for key, value in item.items()
                        if key not in {"resume_id", "created_at", "updated_at"}}
                       for item in results]
+    for item in public_results:
+        if item.get("status")=="failed" and item.get("error"):
+            item["error"]=_public_match_error(item["error"])
     current_job=None
     if session["current_job_key"]:
         with database() as db:
@@ -1550,6 +1851,10 @@ def _pre_ai_mandatory_conflict(job,profile,profile_status):
     if not _profile_is_verified(profile_status):return None
     facts=canonical_verified_candidate_facts(profile)
     raw=str(job.get("content") or job.get("description") or "")
+    sponsorship=extract_sponsorship_requirement(raw)
+    country=infer_country_from_location(job.get("location"),job.get("country"))
+    if sponsorship["status"]=="not_available" and _confirmed_sponsorship_need(facts,country) is True:
+        return "mandatory: employer does not offer sponsorship, but confirmed applicant facts indicate sponsorship is required"
     for requirement in extract_education_requirements(raw)["required"]:
         status,_=_degree_requirement_status(requirement,facts)
         if status=="confirmed_mismatch":
@@ -1617,7 +1922,7 @@ def reconcile_matching_sessions():
         _recover_expired_match_owners(db,stamp)
 
 
-def _matching_conflict(db,requested_keys,workflow_id,stamp):
+def _matching_conflict(db,requested_keys,workflow_id,stamp,*,allow_paused_overlap=False):
     """Return an active owner conflict, after safely reaping dead local leases."""
     _recover_expired_match_owners(db,stamp)
     linked_session_id=None
@@ -1657,6 +1962,11 @@ def _matching_conflict(db,requested_keys,workflow_id,stamp):
         if linked_session_id and row["session_id"]==linked_session_id:continue
         try:overlap=requested.intersection(json.loads(row["job_keys_json"] or '[]'))
         except (TypeError,json.JSONDecodeError):overlap=set()
+        if allow_paused_overlap:
+            # Explicit failed-job retry creates a separate one-job session.
+            # The paused checkpoint remains byte-for-byte untouched and can
+            # never be resumed implicitly by this retry action.
+            continue
         if overlap and requested!=set(json.loads(row["job_keys_json"] or '[]')):
             return {"code":"legacy_checkpoint_overlap",
                     "message":"A paused legacy session contains some of these jobs. Resume or explicitly recover that checkpoint before retrying the overlapping jobs.",
@@ -1664,6 +1974,48 @@ def _matching_conflict(db,requested_keys,workflow_id,stamp):
                     "same_jobs":requested==set(json.loads(row["job_keys_json"] or '[]')),
                     "overlap_count":len(overlap)}
     return None
+
+
+def _revalidate_failed_job(job_key):
+    """Confirm the saved job is still listed by its verified public source."""
+    try:source_type,token,external_id=job_key.split(":",2)
+    except ValueError:raise HTTPException(422,"This saved job has an invalid provider identifier.")
+    with database() as db:
+        saved=db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,job_key)).fetchone()
+        employer=db.execute("SELECT * FROM employers WHERE source_type=? AND source_token=?",(source_type,token)).fetchone()
+    if not saved:raise HTTPException(404,"This saved job is no longer available.")
+    if not saved["active"] or saved["availability_status"]!="current":
+        raise HTTPException(409,"This posting is not currently verified as open. Refresh its official source before retrying matching.")
+    if len(str(saved["description"] or "").strip())<240:
+        raise HTTPException(422,"The saved job description is missing or too incomplete for reliable matching. Refresh the posting first.")
+    if not employer:
+        raise HTTPException(409,"The employer source is not registered. Verify the official source before retrying.")
+    source_record=dict(employer)
+    if (not source_record.get("active") or source_record.get("connector_status")!="healthy" or
+            source_record.get("discovery_status")!="verified" or
+            source_record.get("source_fingerprint")!=_source_fingerprint(source_record)):
+        raise HTTPException(409,"The employer source is not currently verified. Reverify it before retrying matching.")
+    source=EmployerSource(source_record["name"],source_type,token,source_record["careers_url"],source_record["geographic_coverage"])
+    try:records,error=fetch_source(source)
+    except Exception as exc:
+        raise HTTPException(503,"The official job feed could not be checked. No matching retry was started; try again later.") from exc
+    if error:
+        raise HTTPException(503,"The official job feed is temporarily unavailable. No matching retry was started; try again later.")
+    for raw in records or []:
+        if not isinstance(raw,dict):continue
+        try:normalized=normalize_source_job(source_type,source,raw)
+        except (TypeError,ValueError):continue
+        if normalized["source_id"]!=external_id:continue
+        if normalized["availability_status"]!="current":
+            raise HTTPException(409,"The official source marks this posting closed or expired. Matching retry was blocked.")
+        if len(normalized["description"])<240:
+            raise HTTPException(422,"The current public feed has no usable description. Refresh the saved posting before retrying.")
+        old_fingerprint=str(saved["content_fingerprint"] or "")
+        if old_fingerprint and normalized["content_fingerprint"]!=old_fingerprint:
+            raise HTTPException(409,"The official posting changed since it was saved. Refresh the job and its eligibility evidence before retrying.")
+        return {**raw,**normalized,"company_name":saved["company"],"_source_platform":source_type,
+                "_search_prompt":saved["search_prompt"] or ""}
+    raise HTTPException(409,"This posting is no longer listed in its current official public feed. Matching retry was blocked.")
 
 
 def _attach_workflow_checkpoint(db,workflow_id,requested_keys,stamp):
@@ -1804,6 +2156,59 @@ def _match_rows(job_keys=None, resume_id=None):
     return result
 
 
+def _verified_saved_employer_source(db, job):
+    """Require an active, healthy registered employer source before promotion."""
+    try:
+        parts=str(job.get("job_key") or "").split(":",2)
+        if len(parts)!=3:return False
+        source=db.execute("SELECT active,connector_status,careers_url,website_url,evidence_url FROM employers WHERE employer_id=?",
+            (parts[0]+":"+parts[1],)).fetchone()
+    except sqlite3.OperationalError:return False
+    return bool(source and source["active"] and str(source["connector_status"] or "").casefold()=="healthy" and
+        source["careers_url"] and source["website_url"] and source["evidence_url"])
+
+
+def _resolve_deterministic_entry_level_review(result, job, profile, profile_status, prefs, source_verified):
+    """Resolve only unexplained model review when verified entry-level evidence is complete.
+
+    This never overrides a confirmed mismatch, any unresolved mandatory field,
+    stale posting, missing employer verification, or unknown employment type.
+    """
+    if result.classification!="needs_review" or not source_verified:return False
+    if not job.get("active") or job.get("availability_status")!="current" or not job.get("last_verified_at"):
+        return False
+    if not str(job.get("description") or "").strip() or not str(job.get("employment_type") or "").strip():return False
+    if not _profile_is_verified(profile_status):return False
+    facts=canonical_verified_candidate_facts(profile)
+    if not _nonempty_profile(facts):return False
+    country=infer_country_from_location(job.get("location"),job.get("country"))
+    if country and not _confirmed_work_authorization_for_country(profile,country):return False
+    data=result.model_dump()
+    if data.get("missing_information") or data.get("gaps"):return False
+    for field in ("required_skills","required_experience","education_requirements"):
+        for item in data.get(field,[]):
+            if not isinstance(item,dict) or item.get("status")!="met":return False
+    for item in data.get("technical_qualifications",[]):
+        if not isinstance(item,dict) or item.get("requiredness")=="required" and item.get("status")!="met":return False
+    level,_=classify_experience_level(job.get("title"),job.get("description"),job.get("employment_type"))
+    if level not in {"New Graduate","Early Career","Graduate Eligible","Internship"}:return False
+    requested={re.sub(r"[^a-z0-9]+"," ",str(value).casefold()).strip() for value in prefs.get("levels",[])
+        if isinstance(value,str)}
+    allowed={"new graduate","entry level","junior","associate","early career","internship"}
+    if not requested.intersection(allowed):return False
+    if (evaluate_relocation_preference(job,prefs) or evaluate_location(job,prefs.get("location","")))[0]!="eligible":return False
+    if prefs.get("employment_types"):
+        employment=str(job.get("employment_type") or "").casefold().replace("-"," ")
+        if not any(str(value).casefold().replace("-"," ") in employment for value in prefs["employment_types"]):return False
+    result.classification="potential_match"
+    result.experience_level_assessment=(f"Deterministic posting evidence identifies this as {level}; the saved early-career preference is compatible. "
+        "Mandatory evidence checks are resolved. This potential match is a ranking/review outcome, not preparation authorization.")
+    result.explanation=("A previous needs-review classification came from unclear role seniority. Current verified posting, confirmed profile, "
+        "and saved preferences resolve that uncertainty; no mandatory qualification gap or conflict remains. Job-specific preparation "
+        "authorization is still required.")
+    return True
+
+
 def reassess_saved_match_result(job_key):
     """Reapply deterministic evidence rules to a saved AI result without another provider call.
 
@@ -1824,6 +2229,9 @@ def reassess_saved_match_result(job_key):
     prefs=json.loads(pref_row["preferences_json"] or "{}") if pref_row else {}
     saved=MatchResult.model_validate_json(row["result_json"])
     checked=apply_safety_rules(saved,profile,profile_status,prefs,dict(job_row))
+    with database() as db:
+        source_verified=_verified_saved_employer_source(db,dict(job_row))
+    _resolve_deterministic_entry_level_review(checked,dict(job_row),profile,profile_status,prefs,source_verified)
     stamp=now()
     provider,_,model=((row["matching_model_version"] or f"ollama:{MODEL}/").partition("/"))[0].partition(":")
     if not provider or not model:
@@ -1848,6 +2256,73 @@ def reassess_saved_match_result(job_key):
     return {"job_key":job_key,"status":"completed","classification":checked.classification,
             "freshness_status":"current","matching_model_version":matching_engine_version(provider,model),
             "match":checked.model_dump()}
+
+
+@router.post("/api/jobs/matches/retry-failed",status_code=202)
+def retry_failed_match(request:FailedMatchRetryRequest):
+    """Start a new one-job session for one failed result after an explicit click."""
+    with database() as db:
+        row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()
+    try:settings=json.loads(row["settings_json"] or "{}") if row else {}
+    except (TypeError,json.JSONDecodeError):settings={}
+    if not settings.get("allow_ai_matching",False):
+        raise HTTPException(403,"AI matching is not enabled in Application settings.")
+    provider=settings.get("matching_provider","ollama")
+    if provider not in {"ollama","gemini"}:provider="ollama"
+    model=_provider_model(provider)
+    if provider=="gemini" and not os.getenv("GEMINI_API_KEY","").strip():
+        raise HTTPException(503,"Gemini is selected, but its server key is unavailable. No retry was started.")
+    resume_id,profile_status,profile=active_candidate()
+    profile_fp=profile_fingerprint(profile,resume_id)
+    job=_revalidate_failed_job(request.job_key)
+    prefs=preferences() or {}
+    preferences_fp=stable_fingerprint(prefs)
+    relevant,_,_=relevance_for_job(normalize_job_record(job,job.get("_source_platform","greenhouse")),prefs)
+    if not relevant:
+        raise HTTPException(409,"This posting no longer matches the saved target roles. Review its eligibility before retrying.")
+    if _pre_ai_mandatory_conflict(job,profile,profile_status):
+        raise HTTPException(409,"A confirmed mandatory qualification conflict prevents AI retry. Review the deterministic eligibility result.")
+    accepted,reason,_=assess_job(job,prefs,search_terms(job.get("_search_prompt", ""),prefs))
+    if not accepted and reason in {"location","experience_level","employment_type","work_arrangement","instructions"}:
+        raise HTTPException(409,"The posting conflicts with a confirmed saved preference. Resolve eligibility review before retrying.")
+    latest_resume,latest_status,latest_profile=active_candidate()
+    if (latest_resume!=resume_id or latest_status!=profile_status or
+            profile_fingerprint(latest_profile,latest_resume)!=profile_fp or
+            stable_fingerprint(preferences() or {})!=preferences_fp):
+        raise HTTPException(409,"Candidate profile or preferences changed during source verification. Refresh eligibility before retrying.")
+    stamp=now();token=uuid.uuid4().hex
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        conflict=_matching_conflict(db,[request.job_key],None,stamp,allow_paused_overlap=True)
+        if conflict:raise HTTPException(409,conflict)
+        saved=db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,request.job_key)).fetchone()
+        existing=db.execute("SELECT * FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                            (USER,request.job_key,resume_id)).fetchone()
+        if not saved or not existing:raise HTTPException(404,"The selected failed match is no longer available.")
+        if (not saved["active"] or saved["availability_status"]!="current" or
+                (saved["content_fingerprint"] and saved["content_fingerprint"]!=job.get("content_fingerprint"))):
+            raise HTTPException(409,"The saved posting changed or is no longer current. Refresh it before retrying matching.")
+        if existing["status"]!="failed":
+            if existing["status"]=="completed" and existing["freshness_status"]=="current":
+                raise HTTPException(409,"This job already has a current completed match. No duplicate analysis was started.")
+            raise HTTPException(409,"Only a failed job can use this retry action. Refresh the shortlist to choose the current action.")
+        _archive_match_result(db,existing,"explicit_targeted_failed_match_retry",stamp)
+        db.execute("UPDATE job_match_results SET status='queued',classification=NULL,match_score=NULL,result_json=NULL,error=NULL,updated_at=? WHERE user_id=? AND job_key=? AND resume_id=?",
+                   (stamp,USER,request.job_key,resume_id))
+        session_id=str(uuid.uuid4())
+        db.execute("""INSERT INTO job_match_sessions
+            (session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,workflow_id,
+             owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at,provider,provider_model)
+            VALUES(?,?,?,'queued',?,1,1,'',?,?,?,?,?,?,?,?,?)""",
+            (session_id,USER,resume_id,json.dumps([request.job_key]),token,os.getpid(),socket.gethostname(),
+             stamp,_match_lease_expiry(),stamp,stamp,provider,model))
+    try:executor.submit(_session_worker,session_id,resume_id,latest_status,latest_profile,token,provider,model)
+    except Exception as error:
+        with database() as db:
+            _release_match_owner(db,session_id,token,status="interrupted",
+                                 error="Matching worker could not start; the selected failed job remains recoverable.")
+        raise HTTPException(503,"The selected-job retry could not start. Its checkpoint was preserved.") from error
+    return _progress(session_id)
 
 
 @router.post("/api/jobs/analyze-matches", status_code=202)
@@ -2138,4 +2613,7 @@ def get_matches(job_keys: str = Query(default="", max_length=10000)):
     public_rows = [{key: value for key, value in item.items()
                     if key not in {"resume_id", "job_key", "created_at", "updated_at"}}
                    for item in rows]
+    for item in public_rows:
+        if item.get("status")=="failed" and item.get("error"):
+            item["error"]=_public_match_error(item["error"])
     return {"results": public_rows}

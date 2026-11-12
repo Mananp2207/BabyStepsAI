@@ -44,6 +44,20 @@ DEFAULT_SETTINGS = {
     "allow_ai_drafting": False,
     "require_review_uncertain_answers": True,
     "max_applications_per_24_hours": 20,
+    "standing_policy_enabled": False,
+    "standing_policy_categories": [],
+    "standing_policy_employment_types": [],
+    "standing_policy_countries": [],
+    "standing_policy_locations": [],
+    "standing_policy_work_arrangements": [],
+    "standing_policy_experience_levels": [],
+    "standing_policy_excluded_employers": [],
+    "standing_policy_daily_limit": 3,
+    "standing_policy_field_keys": [],
+    "standing_policy_document_types": ["resume"],
+    "standing_policy_reuse_confirmed_answers": False,
+    "standing_policy_allow_ai_answers": False,
+    "standing_policy_allow_cloud_ai": False,
     "live_submission_enabled": False,
 }
 
@@ -110,6 +124,20 @@ class AuthorizationUpdate(BaseModel):
     allow_ai_drafting: bool = False
     require_review_uncertain_answers: bool = True
     max_applications_per_24_hours: int = Field(default=20, ge=1, le=200)
+    standing_policy_enabled: bool = False
+    standing_policy_categories: list[str] = Field(default_factory=list, max_length=20)
+    standing_policy_employment_types: list[str] = Field(default_factory=list, max_length=10)
+    standing_policy_countries: list[str] = Field(default_factory=list, max_length=30)
+    standing_policy_locations: list[str] = Field(default_factory=list, max_length=50)
+    standing_policy_work_arrangements: list[str] = Field(default_factory=list, max_length=5)
+    standing_policy_experience_levels: list[str] = Field(default_factory=list, max_length=10)
+    standing_policy_excluded_employers: list[str] = Field(default_factory=list, max_length=100)
+    standing_policy_daily_limit: int = Field(default=3, ge=1, le=20)
+    standing_policy_field_keys: list[str] = Field(default_factory=list, max_length=40)
+    standing_policy_document_types: list[str] = Field(default_factory=lambda:["resume"], max_length=10)
+    standing_policy_reuse_confirmed_answers: bool = False
+    standing_policy_allow_ai_answers: bool = False
+    standing_policy_allow_cloud_ai: bool = False
 
 
 @router.get("/api/application-authorization")
@@ -120,6 +148,49 @@ def authorization_status():
 @router.put("/api/application-authorization")
 def update_authorization(payload: AuthorizationUpdate):
     settings = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    ordinary_fields={"full_name","preferred_name","email","phone","phone_country_code","location","city",
+        "state_province","country","postal_code","linkedin","github","portfolio","website","university",
+        "education","degree","major","graduation_date","graduation_month","graduation_year","work_experience",
+        "internships","technical_skills","projects","certifications","availability","earliest_available_date",
+        "reusable_confirmed_answers"}
+    if set(settings["standing_policy_field_keys"])-ordinary_fields:
+        raise HTTPException(422,"The standing policy includes a field that requires job-specific or human approval.")
+    if set(settings["standing_policy_document_types"])-{"resume","transcript","certificate","cover_letter","portfolio"}:
+        raise HTTPException(422,"The standing policy includes an unsupported document type.")
+    for key in ("standing_policy_categories","standing_policy_employment_types","standing_policy_countries","standing_policy_locations",
+                "standing_policy_work_arrangements","standing_policy_experience_levels","standing_policy_excluded_employers"):
+        settings[key]=list(dict.fromkeys(str(item).strip()[:120] for item in settings[key] if str(item).strip()))
+    if settings["standing_policy_enabled"]:
+        required_scope=("standing_policy_categories","standing_policy_employment_types","standing_policy_countries",
+                        "standing_policy_locations","standing_policy_work_arrangements","standing_policy_experience_levels","standing_policy_field_keys",
+                        "standing_policy_document_types")
+        if any(not settings.get(key) for key in required_scope):
+            raise HTTPException(422,"Enable the standing policy only after choosing job scope, fields, and documents.")
+        # One explicit Auto Apply approval enables the internal workflow
+        # permissions; the UI does not ask users to approve each routine stage.
+        settings["allow_automatic_discovery"]=True
+        settings["allow_ai_matching"]=True
+        settings["allow_automated_form_preparation"]=True
+        settings["allow_auto_use_confirmed_answers"]=bool(settings["standing_policy_reuse_confirmed_answers"])
+        settings["allow_ai_drafting"]=bool(settings["standing_policy_allow_ai_answers"])
+        if settings["standing_policy_allow_ai_answers"] and not settings["allow_ai_drafting"]:
+            raise HTTPException(422,"Enable AI drafting before allowing policy-scoped AI answers.")
+        if settings["standing_policy_allow_cloud_ai"] and (not settings["standing_policy_allow_ai_answers"] or
+                settings["matching_provider"]!="gemini" or not os.getenv("GEMINI_API_KEY","" ).strip()):
+            raise HTTPException(422,"Cloud AI requires a separate policy choice, Gemini selection, and a configured key.")
+        try:
+            from career_preferences import get_preferences
+            prefs=get_preferences() or {}
+            if not prefs.get("categories") and not prefs.get("roles"):
+                raise HTTPException(409,"Save career preferences before approving automatic preparation.")
+            settings["standing_policy_preferences_fingerprint"]=hashlib.sha256(
+                json.dumps(prefs,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+        except HTTPException:
+            raise
+        except Exception as error:
+            raise HTTPException(409,"Career preferences could not be verified; the standing policy was not saved.") from error
+    else:
+        settings["standing_policy_preferences_fingerprint"]=""
     settings["live_submission_enabled"] = False
     stamp = now()
     with connect() as db:
@@ -446,7 +517,18 @@ def onboarding_page():
 
 @router.get("/application-settings", response_class=HTMLResponse)
 def application_settings_page():
-    return HTMLResponse(apply_ui_theme(SETTINGS_PAGE))
+    page=SETTINGS_PAGE
+    # Discovery, matching, and preparation are routine stages under the single
+    # explicitly approved Auto Apply policy, not separate user-facing modes.
+    for fragment in (
+        '<label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label>',
+        '<label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label>',
+        '<label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label>',
+        '<label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label>',
+        '<label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label>',
+    ):
+        page=page.replace(fragment,"")
+    return HTMLResponse(apply_ui_theme(page))
 
 
 ONBOARDING_PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BabyStepsAI onboarding</title>
@@ -462,4 +544,4 @@ ONBOARDING_PAGE = ONBOARDING_PAGE.replace(
 
 
 SETTINGS_PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Application settings — BabyStepsAI</title>
-<style>body{margin:0;background:#f4f7fb;color:#17263b;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:36px auto;padding:0 18px}.panel{background:white;border:1px solid #dfe7f1;border-radius:15px;padding:22px;margin:16px 0}label{display:block;padding:9px 0}input[type=checkbox]{margin-right:9px}input[type=number]{font:inherit;padding:8px;border:1px solid #cbd6e4;border-radius:7px}button{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #cbd6e4;background:#2563eb;color:white;cursor:pointer}a{color:#2455a5}#status{min-height:25px}.warning{background:#fff7e7;padding:12px;border-radius:8px}</style><main class="wrap"><nav><a href="/onboarding">Onboarding</a> · <a href="/candidate-profile">Candidate profile</a> · <a href="/applications">Applications</a></nav><h1>Application authorization</h1><p>Permissions are versioned and can be changed or revoked at any time. Employer requirements still apply.</p><section class="panel"><form id="settings"><label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label><label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label><label for="matching-provider">Matching provider<select id="matching-provider" name="matching_provider"><option value="ollama">Ollama (local)</option><option value="gemini">Google Gemini (API key required)</option></select></label><p id="provider-status" class="muted">Ollama runs locally.</p><label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label><label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label><label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label><label><input type="checkbox" name="require_review_uncertain_answers">Require review for uncertain answers</label><label>Maximum applications per rolling 24 hours <input name="max_applications_per_24_hours" type="number" min="1" max="200"></label><p class="warning"><strong>Live submission is disabled.</strong> These permissions do not override legal declarations, employer restrictions, CAPTCHA, login challenges, or human verification.</p><button>Save permissions</button></form><p id="status" role="status" aria-live="polite"></p></section></main><script>async function req(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}const form=document.querySelector('#settings'),status=document.querySelector('#status'),providerStatus=document.querySelector('#provider-status'),provider=form.elements.matching_provider;function updateProviderStatus(configured){providerStatus.textContent=provider.value==='gemini'?(configured?'Google Gemini selected: confirmed profile and job text are sent to Google. GEMINI_API_KEY remains on this server.':'Google Gemini sends confirmed profile and job text to Google and requires GEMINI_API_KEY on this server; the key is never stored in settings.'):'Matching requests will use the local Ollama service.'}provider.onchange=()=>updateProviderStatus(window.geminiConfigured);async function load(){const d=await req('/api/application-authorization');window.geminiConfigured=!!d.settings.gemini_configured;for(const [k,v] of Object.entries(d.settings)){const el=form.elements[k];if(el)el.type==='checkbox'?el.checked=!!v:el.value=v}updateProviderStatus(window.geminiConfigured);status.textContent='Authorization version '+d.version+' · updated '+(d.updated_at||'not yet')};form.onsubmit=async e=>{e.preventDefault();try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):el.value);const d=await req('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});window.geminiConfigured=!!d.settings.gemini_configured;updateProviderStatus(window.geminiConfigured);status.textContent='Saved. Authorization version '+d.version+'. Live submission remains disabled.'}catch(e){status.textContent=e.message}};load().catch(e=>status.textContent=e.message)</script></html>'''
+<style>body{margin:0;background:#f4f7fb;color:#17263b;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:36px auto;padding:0 18px}.panel{background:white;border:1px solid #dfe7f1;border-radius:15px;padding:22px;margin:16px 0}label{display:block;padding:9px 0}input[type=checkbox]{margin-right:9px}input[type=number]{font:inherit;padding:8px;border:1px solid #cbd6e4;border-radius:7px}button{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #cbd6e4;background:#2563eb;color:white;cursor:pointer}a{color:#2455a5}#status{min-height:25px}.warning{background:#fff7e7;padding:12px;border-radius:8px}</style><main class="wrap"><nav><a href="/onboarding">Onboarding</a> · <a href="/candidate-profile">Candidate profile</a> · <a href="/applications">Applications</a></nav><h1>Application authorization</h1><p>Permissions are versioned and can be changed or revoked at any time. Employer requirements still apply.</p><section class="panel"><form id="settings"><label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label><label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label><label for="matching-provider">Matching provider<select id="matching-provider" name="matching_provider"><option value="ollama">Ollama (local)</option><option value="gemini">Google Gemini (API key required)</option></select></label><p id="provider-status" class="muted">Ollama runs locally.</p><label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label><label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label><label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label><label><input type="checkbox" name="require_review_uncertain_answers">Require review for uncertain answers</label><label>Maximum applications per rolling 24 hours <input name="max_applications_per_24_hours" type="number" min="1" max="200"></label><h2>Standing preparation policy</h2><p class="muted">Approve a bounded policy once. Jobs outside this scope stay untouched. Preference edits invalidate policy grants until you save again.</p><label>Job categories <input name="standing_policy_categories" placeholder="software engineering"></label><label>Employment types <input name="standing_policy_employment_types" placeholder="full-time"></label><label>Allowed countries <input name="standing_policy_countries" placeholder="United States"></label><label>Allowed cities or regions <input name="standing_policy_locations" placeholder="San Francisco, California"></label><label>Work arrangements <input name="standing_policy_work_arrangements" placeholder="remote, hybrid, onsite"></label><label>Experience levels <input name="standing_policy_experience_levels" placeholder="new graduate, entry level, junior"></label><label>Excluded employers <input name="standing_policy_excluded_employers" placeholder="comma-separated names"></label><label>Maximum automatic preparations per day <input name="standing_policy_daily_limit" type="number" min="1" max="20"></label><label>Allowed candidate field keys <input name="standing_policy_field_keys" placeholder="full_name, email, education, projects"></label><label>Allowed document types <input name="standing_policy_document_types" placeholder="resume"></label><label><input type="checkbox" name="standing_policy_reuse_confirmed_answers">Reuse only individually confirmed, reusable ordinary answers</label><label><input type="checkbox" name="standing_policy_allow_ai_answers">Allow AI answers within this policy</label><label><input type="checkbox" name="standing_policy_allow_cloud_ai">Separately allow cloud AI processing (Gemini)</label><label><input type="checkbox" name="standing_policy_enabled">Approve and enable this standing policy</label><p class="muted">This policy cannot authorize legal declarations, work authorization, sponsorship, salary, demographics, terms, CAPTCHA, unspecified documents, or final submission.</p><p class="warning"><strong>Live submission is disabled.</strong> These permissions do not override legal declarations, employer restrictions, CAPTCHA, login challenges, or human verification.</p><button>Save permissions</button></form><p id="status" role="status" aria-live="polite"></p></section></main><script>async function req(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}const form=document.querySelector('#settings'),status=document.querySelector('#status'),providerStatus=document.querySelector('#provider-status'),provider=form.elements.matching_provider;function updateProviderStatus(configured){providerStatus.textContent=provider.value==='gemini'?(configured?'Google Gemini selected: confirmed profile and job text are sent to Google. GEMINI_API_KEY remains on this server.':'Google Gemini sends confirmed profile and job text to Google and requires GEMINI_API_KEY on this server; the key is never stored in settings.'):'Matching requests will use the local Ollama service.'}provider.onchange=()=>updateProviderStatus(window.geminiConfigured);async function load(){const d=await req('/api/application-authorization');window.geminiConfigured=!!d.settings.gemini_configured;for(const [k,v] of Object.entries(d.settings)){const el=form.elements[k];if(el)el.type==='checkbox'?el.checked=!!v:el.value=Array.isArray(v)?v.join(', '):v}updateProviderStatus(window.geminiConfigured);status.textContent='Authorization version '+d.version+' · updated '+(d.updated_at||'not yet')};form.onsubmit=async e=>{e.preventDefault();try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):(['standing_policy_categories','standing_policy_employment_types','standing_policy_countries','standing_policy_locations','standing_policy_work_arrangements','standing_policy_experience_levels','standing_policy_excluded_employers','standing_policy_field_keys','standing_policy_document_types'].includes(el.name)?el.value.split(',').map(x=>x.trim()).filter(Boolean):el.value));const d=await req('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});window.geminiConfigured=!!d.settings.gemini_configured;updateProviderStatus(window.geminiConfigured);status.textContent='Saved. Authorization version '+d.version+'. Live submission remains disabled.'}catch(e){status.textContent=e.message}};load().catch(e=>status.textContent=e.message)</script></html>'''

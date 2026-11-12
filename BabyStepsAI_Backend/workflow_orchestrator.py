@@ -35,6 +35,8 @@ USER = job_search_agent.USER
 POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="user-job-workflow")
 _worker_lock = threading.Lock()
 _running_workflows=set()
+_auto_apply_stop=threading.Event()
+_auto_apply_thread=None
 
 
 def now():
@@ -95,6 +97,8 @@ def initialize():
                             db.execute("UPDATE job_discovery_runs SET workflow_id=? WHERE run_id=? AND workflow_id=''",
                                        (row["workflow_id"],run_id))
         db.execute("CREATE INDEX IF NOT EXISTS idx_user_workflows_user_updated ON user_workflows(user_id,updated_at DESC)")
+        db.execute("""CREATE TABLE IF NOT EXISTS auto_apply_scheduler_state(
+            user_id TEXT PRIMARY KEY,last_started_at TEXT NOT NULL DEFAULT '',last_result TEXT NOT NULL DEFAULT '')""")
         db.execute("""CREATE TABLE IF NOT EXISTS eligibility_review_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL,workflow_id TEXT NOT NULL,
             job_key TEXT NOT NULL,action TEXT NOT NULL,classification TEXT NOT NULL DEFAULT '',
@@ -109,6 +113,66 @@ def initialize():
 
 
 initialize()
+
+def run_auto_apply_scheduler_cycle():
+    """Execute one idempotent scheduler pass; exposed for isolated integration tests."""
+    cooldown=12*60*60
+    try:
+        settings=application_answer_assistant.get_authorization()["settings"]
+        if not settings.get("standing_policy_enabled") or not _standing_policy_current():return "disabled_or_stale"
+        with database() as db:
+            active=db.execute("SELECT 1 FROM user_workflows WHERE user_id=? AND status IN ('queued','running','paused','needs_clarification') LIMIT 1",(USER,)).fetchone()
+            state=db.execute("SELECT last_started_at FROM auto_apply_scheduler_state WHERE user_id=?",(USER,)).fetchone()
+        if active:return "active_workflow_preserved"
+        if state and state["last_started_at"]:
+            try:age=(datetime.now(timezone.utc)-datetime.fromisoformat(state["last_started_at"].replace("Z","+00:00"))).total_seconds()
+            except (ValueError,TypeError):age=0
+            if age<cooldown:return "cooldown"
+        prefs=career_preferences.get_preferences() or {}
+        parts=(prefs.get("roles") or [])+(prefs.get("categories") or [])
+        prompt="Find current openings matching my saved career preferences: "+", ".join(str(item)[:100] for item in parts[:12])
+        scope={"type":"http","asgi":{"version":"3.0","spec_version":"2.3"},"http_version":"1.1","method":"POST","scheme":"http","path":"/api/workflows","raw_path":b"/api/workflows","query_string":b"","headers":[],"client":("127.0.0.1",0),"server":("127.0.0.1",8000)}
+        result=start_workflow(WorkflowStart(prompt=prompt),Request(scope))
+        workflow_id=result.get("workflow_id")
+        with database() as db:
+            db.execute("INSERT INTO auto_apply_scheduler_state(user_id,last_started_at,last_result) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_started_at=excluded.last_started_at,last_result=excluded.last_result",
+                (USER,now(),"started" if workflow_id else "no_workflow_id"))
+            if workflow_id:
+                row=db.execute("SELECT diagnostics_json FROM user_workflows WHERE workflow_id=? AND user_id=?",(workflow_id,USER)).fetchone()
+                diagnostics=json.loads(row["diagnostics_json"] or "{}") if row else {}
+                diagnostics["trigger"]="approved_auto_apply_scheduler"
+                db.execute("UPDATE user_workflows SET diagnostics_json=? WHERE workflow_id=? AND user_id=?",(json.dumps(diagnostics),workflow_id,USER))
+        return "started" if workflow_id else "no_workflow_id"
+    except HTTPException as error:
+        result=f"blocked_http_{int(error.status_code)}"
+    except Exception:
+        # A bounded scheduler pass must not crash the local app or log user data.
+        result="worker_error"
+    with database() as db:
+        db.execute("INSERT INTO auto_apply_scheduler_state(user_id,last_started_at,last_result) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_started_at=excluded.last_started_at,last_result=excluded.last_result",
+            (USER,now(),result))
+    return result
+
+def _auto_apply_scheduler():
+    """Run bounded discovery only while the explicitly approved local policy is active."""
+    while not _auto_apply_stop.wait(30):run_auto_apply_scheduler_cycle()
+
+def _standing_policy_current():
+    settings=application_answer_assistant.get_authorization()["settings"]
+    return bool(settings.get("standing_policy_enabled") and application_agent._standing_policy_still_current())
+
+@router.on_event("startup")
+def start_auto_apply_scheduler():
+    global _auto_apply_thread
+    if _auto_apply_thread and _auto_apply_thread.is_alive():return
+    _auto_apply_stop.clear()
+    _auto_apply_thread=threading.Thread(target=_auto_apply_scheduler,name="baby-steps-auto-apply",daemon=True)
+    _auto_apply_thread.start()
+
+@router.on_event("shutdown")
+def stop_auto_apply_scheduler():
+    _auto_apply_stop.set()
+    if _auto_apply_thread and _auto_apply_thread.is_alive():_auto_apply_thread.join(timeout=2)
 
 
 class WorkflowStart(BaseModel):
