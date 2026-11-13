@@ -4,6 +4,9 @@ from resume_job_matcher import router as match_router
 from candidate_verification import router as verification_router
 from application_agent import router as application_router
 from application_answer_assistant import router as answer_assistant_router
+from workflow_orchestrator import router as workflow_router
+from onboarding import router as onboarding_router
+from job_description_enricher import router as enrichment_router
 from ollama_runtime import OLLAMA_LOCK
 from ui_theme import apply_ui_theme
 from pathlib import Path
@@ -39,6 +42,9 @@ app.include_router(match_router)
 app.include_router(verification_router)
 app.include_router(application_router)
 app.include_router(answer_assistant_router)
+app.include_router(onboarding_router)
+app.include_router(enrichment_router)
+app.include_router(workflow_router)
 
 PROFILE_FIELDS = [
     "education",
@@ -559,7 +565,7 @@ def home():
 <meta name="viewport"
       content="width=device-width, initial-scale=1">
 
-<title>BabyStepsAI</title>
+<title>Dashboard · BabyStepsAI</title>
 
 <style>
 body {
@@ -588,6 +594,7 @@ textarea {
     box-sizing: border-box;
     font: 13px monospace;
 }
+textarea[aria-invalid="true"]{border:2px solid #b42318;box-shadow:0 0 0 3px #b4231822}.save-success{color:#137451}.save-error{color:#a3261d}
 li {
     margin: 12px 0;
 }
@@ -599,14 +606,12 @@ li {
 
 <body>
 
-<h1>BabyStepsAI</h1>
-<p><a href="/candidate-profile">Verify candidate profile</a> · <a href="/applications">Applications dashboard</a> · <a href="/find-jobs">Find jobs</a></p>
-<p class="muted">
-    AI-powered resume management prototype
-</p>
+<h1>Your job search, in one place</h1>
+<p class="muted">Manage your resume, review verified candidate information, and move toward suitable opportunities at your pace.</p>
+<p><a href="/candidate-profile">Review candidate profile</a> · <a href="/find-jobs">Find suitable jobs</a> · <a href="/applications">View applications</a></p>
 
 <div class="panel">
-    <h2>Upload Your Resume</h2>
+    <h2>Resume</h2>
 
     <p class="muted">
         A replacement becomes active while previous resume
@@ -621,7 +626,7 @@ li {
             required
         >
         <button type="submit">
-            Upload & Replace Resume
+            Upload resume
         </button>
     </form>
 
@@ -629,30 +634,30 @@ li {
 </div>
 
 <div class="panel">
-    <h2>My Resume</h2>
+    <h2>Saved resume versions</h2>
     <ul id="resumes"></ul>
 </div>
 
 <div class="panel">
-    <h2>AI Candidate Profile</h2>
+    <h2>AI extracted profile</h2>
 
-    <p id="profile-status" role="status">
+    <p id="profile-status" role="status" aria-live="polite">
         Upload a resume to get started.
     </p>
 
     <textarea
         id="profile-json"
-        rows="20"
+        rows="8"
         spellcheck="false"
     ></textarea>
 
     <p>
         <button id="save" disabled>
-            Save Corrections
+            Save reviewed changes
         </button>
 
         <button id="analyze" disabled>
-            Re-analyze with AI
+            Re-analyze resume
         </button>
     </p>
 
@@ -801,10 +806,11 @@ document.getElementById("upload").onsubmit = async event => {
 };
 
 save.onclick = async () => {
+    save.disabled=true;save.setAttribute("aria-busy","true");editor.removeAttribute("aria-invalid");pstatus.className="";
     try {
         const profile = JSON.parse(editor.value);
 
-        await request(
+        const saved=await request(
             "/resumes/" + encodeURIComponent(selected)
             + "/profile",
             {
@@ -815,14 +821,21 @@ save.onclick = async () => {
                 body: JSON.stringify(profile)
             }
         );
-
-        await loadProfile();
-        pstatus.textContent = "Corrections saved.";
+        if(saved.status!=="user_reviewed")throw new Error("The server did not confirm the profile save.");
+        const persisted=await request("/resumes/"+encodeURIComponent(selected)+"/profile");
+        const canonical=value=>Array.isArray(value)?"["+value.map(canonical).join(",")+"]":value&&typeof value==="object"?"{"+Object.keys(value).sort().map(k=>JSON.stringify(k)+":"+canonical(value[k])).join(",")+"}":JSON.stringify(value);
+        if(persisted.status!=="user_reviewed"||canonical(persisted.profile)!==canonical(profile))throw new Error("The saved profile could not be verified. No success confirmation was shown.");
+        editor.value=JSON.stringify(persisted.profile,null,2);
+        pstatus.className="save-success";pstatus.textContent="Profile corrections saved and verified.";
         await refresh();
+        pstatus.className="save-success";pstatus.textContent="Profile corrections saved and verified.";
 
     } catch (error) {
-        pstatus.textContent =
+        pstatus.className="save-error";pstatus.textContent =
             "Save failed: " + error.message;
+        editor.setAttribute("aria-invalid","true");editor.focus();
+    } finally {
+        save.disabled=false;save.removeAttribute("aria-busy");
     }
 };
 

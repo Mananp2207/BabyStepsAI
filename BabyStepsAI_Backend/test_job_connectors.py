@@ -23,6 +23,10 @@ class ConnectorTests(unittest.TestCase):
                 "roles": ["Software Engineer"], "categories": [], "levels": [], "employment_types": [],
                 "location": "United States", "work_arrangement": "Any", "instructions": ""})))
             db.execute("INSERT INTO application_authorizations VALUES(?,?)", (discovery.USER, json.dumps({"allow_automatic_discovery": True})))
+            stamp=discovery.datetime.now(discovery.timezone.utc).isoformat()
+            db.execute("UPDATE employers SET active=1,connector_status='healthy',discovery_status='verified',last_success_at=? WHERE source_type='greenhouse'",(stamp,))
+            for row in db.execute("SELECT * FROM employers WHERE source_type='greenhouse'").fetchall():
+                db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",(discovery._source_fingerprint(dict(row)),row["employer_id"]))
         connectors.clear_cache()
 
     @staticmethod
@@ -32,7 +36,10 @@ class ConnectorTests(unittest.TestCase):
     def register_and_activate(self, sources):
         discovery.import_employers(discovery.EmployerImportRequest(sources=sources), self.local_request())
         with discovery.database() as db:
-            db.execute("UPDATE employers SET active=1,connector_status='healthy' WHERE active=0 AND source_type!='workday'")
+            stamp=discovery.datetime.now(discovery.timezone.utc).isoformat()
+            db.execute("UPDATE employers SET active=1,connector_status='healthy',discovery_status='verified',last_success_at=? WHERE source_type!='workday'",(stamp,))
+            for row in db.execute("SELECT * FROM employers WHERE source_type!='workday'").fetchall():
+                db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",(discovery._source_fingerprint(dict(row)),row["employer_id"]))
 
     def tearDown(self):
         discovery.DB = self.old_db
@@ -52,6 +59,16 @@ class ConnectorTests(unittest.TestCase):
             self.assertEqual(record["title"], "Software Engineer")
             self.assertTrue(record["job_key"].startswith(kind + ":"))
             self.assertIn("active", record)
+            self.assertEqual(record["availability_status"], "current")
+
+    def test_job_availability_requires_present_active_record_or_explicit_closure(self):
+        source=connectors.EmployerSource("Example","career_page","careers","https://example.org/jobs")
+        active=connectors.normalize_job("career_page",source,{"id":"1","title":"Software Engineer","url":"https://example.org/jobs/1"})
+        closed=connectors.normalize_job("career_page",source,{"id":"2","title":"Software Engineer","url":"https://example.org/jobs/2","status":"closed"})
+        unknown=connectors.normalize_job("career_page",source,{"id":"3","title":"Software Engineer","url":"https://example.org/jobs/3","status":None})
+        self.assertEqual(active["availability_status"],"current")
+        self.assertEqual(closed["availability_status"],"expired")
+        self.assertEqual(unknown["availability_status"],"current")
 
     def test_fetch_adapters_use_documented_read_only_urls_and_payloads(self):
         fixtures = {
@@ -77,6 +94,173 @@ class ConnectorTests(unittest.TestCase):
         records, error = connectors.fetch_source(connectors.EmployerSource("Tenant", "workday", "tenant"))
         self.assertEqual(records, [])
         self.assertIn("universal", error)
+
+    def test_direct_public_job_import_supports_structured_provider_pages(self):
+        cases = [
+            ("https://boards.greenhouse.io/acme/jobs/123", "greenhouse", "acme", "123"),
+            ("https://jobs.lever.co/acme/abc-123", "lever", "acme", "abc-123"),
+            ("https://jobs.ashbyhq.com/acme/abc-123", "ashby", "acme", "abc-123"),
+            ("https://careers.smartrecruiters.com/acme/123", "smartrecruiters", "acme", "123"),
+            ("https://jobs.smartrecruiters.com/Acme/123/SoftwareEngineer", "smartrecruiters", "Acme", "SoftwareEngineer"),
+            ("https://acme.wd5.myworkdayjobs.com/External/job/Remote/Software-Engineer_R123", "workday", "acme.wd5.myworkdayjobs.com", "R123"),
+            ("https://careers.acme.example/jobs/abc", "public_html", "careers.acme.example", "https://careers.acme.example/jobs/abc"),
+        ]
+        for url, provider, token, identity in cases:
+            with self.subTest(provider=provider):
+                html = '''<script type="application/ld+json">{"@type":"JobPosting","title":"New Graduate Software Engineer","identifier":{"value":"R123"},"description":"Requirements: Bachelor's degree and 0 years of professional experience.","hiringOrganization":{"@type":"Organization","name":"Acme Systems"},"jobLocation":{"address":{"addressLocality":"Seattle","addressRegion":"WA","addressCountry":"US"}},"employmentType":"FULL_TIME","datePosted":"2026-10-01","url":"%s","applicationUrl":"%s","validThrough":"2027-10-01"}</script>''' % (url, url)
+                def getter(target, **_kwargs):
+                    return SimpleNamespace(status_code=404, headers={}, content=b"", text="", url=target,
+                                           raise_for_status=lambda: None) if target.endswith("/robots.txt") else SimpleNamespace(
+                        status_code=200, headers={}, content=html.encode(), text=html, url=target,
+                        raise_for_status=lambda: None)
+                with patch.object(connectors, "validate_public_https_url", side_effect=lambda value, **_kwargs: value):
+                    detail, error = connectors.fetch_public_job_url(url, getter=getter)
+                self.assertIsNone(error)
+                self.assertEqual(detail["provider"], provider)
+                self.assertEqual(detail["source_token"], token)
+                self.assertEqual(detail["employer"], "Acme Systems")
+                self.assertEqual(detail["title"], "New Graduate Software Engineer")
+                self.assertEqual(detail["employment_type"], "FULL_TIME")
+                self.assertEqual(detail["country"], "US")
+                self.assertTrue(detail["description"])
+                if provider in {"greenhouse", "lever", "ashby", "workday"}:
+                    self.assertEqual(detail["id"], identity)
+                if provider == "smartrecruiters":
+                    self.assertEqual(detail["id"], "R123")
+
+    def test_direct_job_import_rejects_private_url_and_unsafe_redirect(self):
+        with self.assertRaises(ValueError):
+            connectors.validate_public_https_url("https://127.0.0.1/jobs/1", resolve=False)
+        redirect = SimpleNamespace(status_code=302, headers={"Location": "http://127.0.0.1/private"})
+        with self.assertRaises(ValueError):
+            connectors._safe_get("https://careers.example/jobs/1", getter=Mock(return_value=redirect), trusted_initial=True)
+
+    def test_direct_workday_import_is_limited_to_public_structured_postings(self):
+        url="https://tenant.wd1.myworkdayjobs.com/en-US/External/job/Seattle/Engineer_R42"
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(result)
+        self.assertIn("Unsupported Workday public page layout",error)
+
+    def test_workday_public_metadata_identifies_explicit_employer_without_jsonld(self):
+        url="https://tenant.wd5.myworkdayjobs.com/External/job/Seattle/Engineer_R884"
+        page='''<meta property="og:site_name" content="Adobe Careers"><meta property="og:title" content="Software Engineer I | Adobe Careers"><div data-automation-id="jobPostingHeader">Software Engineer I</div><div data-automation-id="jobPostingLocation">Seattle, WA</div><div data-automation-id="jobPostingDescription">Build reliable software. Required: Computer Science degree.</div>'''
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["provider"],"workday")
+        self.assertEqual(result["id"],"R884")
+        self.assertEqual(result["employer"],"Adobe Careers")
+        self.assertEqual(result["employer_identity_source"],"workday_og_site_name")
+        self.assertEqual(result["title"],"Software Engineer I")
+        self.assertIn("Required",result["description"])
+
+    def test_workday_missing_employer_metadata_stays_unresolved(self):
+        url="https://tenant.wd5.myworkdayjobs.com/External/job/Remote/Engineer_R885"
+        page='''<script type="application/ld+json">{"@type":"JobPosting","title":"Software Engineer","description":"Build software"}</script>'''
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["employer"],"")
+        self.assertEqual(result["employer_identity_source"],"unavailable")
+
+    def test_public_job_import_reports_expired_posting(self):
+        url="https://jobs.lever.co/acme/expired"
+        page='''<script type="application/ld+json">{"@type":"JobPosting","title":"Software Engineer","description":"Build software","hiringOrganization":{"name":"Acme"},"validThrough":"2000-01-01","url":"%s"}</script>''' % url
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(result)
+        self.assertIn("expired",error)
+
+    def test_greenhouse_direct_import_uses_public_detail_api_without_jsonld(self):
+        url="https://job-boards.greenhouse.io/cssmerge/jobs/8687930002"
+        description="Responsibilities include building reliable products. Qualifications include Python and a related degree. "*5
+        payload={"id":8687930002,"title":"Software Engineer","absolute_url":"https://boards.greenhouse.io/cssmerge/jobs/8687930002",
+            "location":{"name":"New York, NY"},"content":description,"departments":[{"name":"Engineering"}],"metadata":[]}
+        calls=[]
+        def getter(target,**kwargs):
+            calls.append(target)
+            if target.endswith("/robots.txt"):
+                return SimpleNamespace(status_code=404,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+            if target.endswith("/jobs/8687930002"):
+                body=json.dumps(payload).encode()
+                return SimpleNamespace(status_code=200,headers={},content=body,text="",url=target,
+                    json=lambda:payload,raise_for_status=lambda:None)
+            page="<html><h1>Software Engineer</h1></html>"
+            return SimpleNamespace(status_code=200,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["id"],"8687930002")
+        self.assertEqual(result["provider"],"greenhouse")
+        self.assertEqual(result["url"],payload["absolute_url"])
+        self.assertEqual(result["application_url"],payload["absolute_url"])
+        self.assertEqual(result["department"],"Engineering")
+        self.assertIn("Responsibilities",result["description"])
+        self.assertTrue(result["retrieved_at"])
+        self.assertTrue(any("boards-api.greenhouse.io" in target for target in calls))
+
+    def test_greenhouse_direct_import_rejects_invalid_board_and_job_identifiers(self):
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            detail,error=connectors._greenhouse_job_detail("bad/token","123")
+            self.assertIsNone(detail)
+            self.assertIn("board token",error)
+            detail,error=connectors._greenhouse_job_detail("valid-board","1%2F2")
+            self.assertIsNone(detail)
+            self.assertIn("job ID",error)
+
+    def test_greenhouse_direct_import_reports_missing_description_and_expired_api_record(self):
+        base={"id":123,"title":"Software Engineer","absolute_url":"https://boards.greenhouse.io/example/jobs/123"}
+        def getter_for(status,payload=None):
+            def getter(target,**_kwargs):
+                if target.endswith("/robots.txt"):
+                    return SimpleNamespace(status_code=404,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+                return SimpleNamespace(status_code=status,headers={},content=json.dumps(payload or {}).encode(),text="",url=target,
+                    json=lambda:payload or {},raise_for_status=lambda:None)
+            return getter
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            detail,error=connectors._greenhouse_job_detail("example","123",getter=getter_for(200,base))
+            self.assertIsNone(detail)
+            self.assertIn("no usable public job description",error)
+            detail,error=connectors._greenhouse_job_detail("example","123",getter=getter_for(404))
+        self.assertIsNone(detail)
+        self.assertIn("unavailable or expired",error)
+
+    def test_direct_public_import_reports_unsupported_provider_layout(self):
+        url="https://tenant.wd5.myworkdayjobs.com/External/job/Remote/Engineering"
+        page="<html><body>Careers</body></html>"
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(result)
+        self.assertIn("Unsupported Workday public page layout",error)
+        self.assertIn("JavaScript rendering is not attempted",error)
+
+    def test_direct_import_uses_official_posting_page_as_entry_when_no_apply_url_is_published(self):
+        url="https://careers.acme.example/jobs/entry-7"
+        page='''<script type="application/ld+json">{"@type":"https://schema.org/JobPosting","title":"Software Engineer I","identifier":{"value":"entry-7"},"description":"Build software with a team.","hiringOrganization":{"name":"Acme Systems"},"url":"%s"}</script>''' % url
+        def getter(target,**_kwargs):
+            status=404 if target.endswith("/robots.txt") else 200
+            return SimpleNamespace(status_code=status,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            detail,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(detail["application_url"],url)
+        self.assertEqual(detail["application_url_source"],"official_posting_page")
 
     def test_live_source_registration_requires_successful_validation_before_activation(self):
         response = discovery.import_employers(discovery.EmployerImportRequest(sources=[
@@ -211,7 +395,7 @@ class ConnectorTests(unittest.TestCase):
             status = db.execute("SELECT connector_status,last_success_at FROM employers WHERE source_token='cloudflare'").fetchone()
         self.assertEqual(active,1)
         self.assertEqual(status["connector_status"],"temporarily_unavailable")
-        self.assertIsNone(status["last_success_at"])
+        self.assertTrue(status["last_success_at"],"A transient failure must retain the prior successful verification timestamp.")
 
     def test_server_error_gets_bounded_retry_and_recovers(self):
         import requests
@@ -297,6 +481,20 @@ class ConnectorTests(unittest.TestCase):
             jobs,error=connectors.fetch_public_career_page(source,getter=getter)
         self.assertIsNone(error)
         self.assertEqual({job["title"] for job in jobs},{"Software Engineer","Data Engineer"})
+        self.assertEqual(getter.call_count,4)
+
+    def test_public_html_pagination_handles_boolean_accessibility_attributes(self):
+        robots=Mock(status_code=404,content=b"",text="")
+        first_text='<a href="/jobs/1">Software Engineer</a><a rel="next" aria-label href="/careers?page=2">Next</a>'
+        second_text='<a href="/jobs/2">Backend Engineer</a>'
+        first=Mock(status_code=200,content=first_text.encode(),text=first_text);first.raise_for_status.return_value=None
+        second=Mock(status_code=200,content=second_text.encode(),text=second_text);second.raise_for_status.return_value=None
+        source=connectors.EmployerSource("Example","public_html","", "https://example.org/careers")
+        getter=Mock(side_effect=[robots,first,robots,second])
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            jobs,error=connectors.fetch_public_career_page(source,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual({job["title"] for job in jobs},{"Software Engineer","Backend Engineer"})
         self.assertEqual(getter.call_count,4)
 
     def test_employer_source_discovery_uses_explicit_ats_links_without_guessing(self):
@@ -400,6 +598,10 @@ class ConnectorTests(unittest.TestCase):
         self.assertIn("ashby", result["diagnostics"]["source_platforms"])
         self.assertEqual({job["source_platform"] for job in result["results"]}, {"lever", "ashby"})
         self.assertTrue(all(job["description"] for job in result["results"]))
+        with discovery.database() as db:
+            saved=db.execute("SELECT job_key,availability_status,last_verified_at FROM discovered_openings WHERE job_key IN ('lever:demo:l1','ashby:demo:a1') ORDER BY job_key").fetchall()
+        self.assertEqual({row["availability_status"] for row in saved},{"current"})
+        self.assertTrue(all(row["last_verified_at"] for row in saved))
 
     def test_same_canonical_url_is_deduplicated_and_provenance_retained(self):
         self.register_and_activate([
@@ -467,9 +669,33 @@ class ConnectorTests(unittest.TestCase):
             start=next(item for item in sent if item["type"]=="http.response.start")
             body=b"".join(item.get("body",b"") for item in sent if item["type"]=="http.response.body")
             return start["status"],body
+        with discovery.database() as db:
+            source=db.execute("SELECT name,source_token FROM employers WHERE source_type='greenhouse' AND active=1 LIMIT 1").fetchone()
+            stamp=discovery.datetime.now(discovery.timezone.utc).isoformat()
+            desc=("New graduate software engineer responsibilities include building reliable services, writing tested code, "
+                  "collaborating with product teams, reviewing changes, and improving system performance. "*4)
+            db.execute("""INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,
+                employment_type,source_platform,source_id,description,last_verified_at,active,experience_level)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,'New Graduate')""",
+                (discovery.USER,f"greenhouse:{source['source_token']}:early-integration",source["name"],
+                 "Software Engineer - New Grad","Austin, TX","https://boards.greenhouse.io/test/jobs/early",
+                 stamp,"Full-time","greenhouse","early-integration",desc,stamp))
+            db.execute("""INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,
+                employment_type,source_platform,source_id,description,last_verified_at,active)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                (discovery.USER,f"greenhouse:{source['source_token']}:missing-description",source["name"],
+                 "Software Engineer","Austin, TX","https://boards.greenhouse.io/test/jobs/missing",
+                 stamp,"Full-time","greenhouse","missing-description","Apply online.",stamp))
         status,body=asyncio.run(request("GET","/api/employers"))
         self.assertEqual(status,200,body)
-        self.assertEqual(json.loads(body)["count"],3)
+        employers=json.loads(body)
+        self.assertEqual(employers["count"],3)
+        self.assertEqual(employers["summary"]["sources"],3)
+        self.assertEqual(employers["summary"]["eligible_discovery_sources"],3)
+        self.assertEqual(employers["summary"]["current_verified_openings"],2)
+        self.assertEqual(employers["summary"]["current_early_career_openings"],1)
+        self.assertEqual(employers["summary"]["current_missing_descriptions"],1)
+        self.assertEqual(employers["results"][0]["saved_openings_count"],2)
         import_body=json.dumps({"sources":[{"name":"ASGI Source","source_type":"ashby","source_token":"asgi-demo"}]}).encode()
         status,body=asyncio.run(request("POST","/api/employers/import",import_body))
         self.assertEqual(status,200,body)
@@ -557,6 +783,17 @@ class ConnectorTests(unittest.TestCase):
             applications.review_saved_job_eligibility(found["results"][0]["job_key"],
                 applications.EligibilityReviewRequest(reviewed=True))
             with patch.object(applications,"validate_application_url",side_effect=lambda url:url),patch.object(applications,"_schedule_application_queue",return_value=False):
+                job=applications._get_job(applications.DryRunRequest(job_key=found["results"][0]["job_key"]))
+                form_report={"provider":{"provider":"ashby"},"form_detected":True,"page_classification":"application_form",
+                    "inspection_outcome":"compatible","robots_policy":"verified_allow","required_fields":[],
+                    "unsupported_fields":[],"fields":[],"human_actions_required":[],
+                    "submission_control_detected":True,"submission_control_status":"detected_visible",
+                    "submission_controls":[{"action":"final_submission","label":"Submit application","visible":True}]}
+                applications._save_form_inspection(job,form_report)
+                plan=applications.preparation_authorization_plan(found["results"][0]["job_key"])
+                applications.authorize_saved_job_preparation(found["results"][0]["job_key"],applications.PreparationAuthorizationRequest(
+                    confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                    confirmed_application_url=plan["application_url"],field_keys=["full_name"],document_types=["resume"]))
                 queue=applications.enqueue_saved_jobs(applications.ApplicationQueueRequest(job_keys=[found["results"][0]["job_key"]]))
             self.assertEqual(queue["queued"],1)
             self.assertFalse(queue["submission_enabled"])

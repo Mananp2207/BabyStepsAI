@@ -1,5 +1,8 @@
 import json
+import multiprocessing
+import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -7,6 +10,8 @@ from unittest.mock import Mock, patch
 
 import job_search_agent as jobs
 import resume_job_matcher as matcher
+import workflow_orchestrator as workflow
+from job_relevance import extract_technical_qualification_requirements
 
 
 def valid_result(**changes):
@@ -29,18 +34,50 @@ def valid_result(**changes):
     return matcher.MatchResult.model_validate(data)
 
 
+def _process_match_claim(db_path,barrier,result_queue):
+    jobs.DB=Path(db_path)
+    barrier.wait()
+    try:
+        response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        result_queue.put(("ok",response.get("session_id")))
+    except Exception as error:
+        result_queue.put(("error",getattr(error,"detail",type(error).__name__)))
+
+
+def _simulate_process_shutdown_match_start(db_path,workflow_id,keys,result_queue):
+    import concurrent.futures.thread as futures_thread
+    jobs.DB=Path(db_path)
+    futures_thread._shutdown=True
+    try:
+        matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3,stop_after_batch=True),workflow_id=workflow_id)
+        result_queue.put(("unexpected_success",None,None))
+    except Exception as error:
+        with jobs.database() as db:
+            session=db.execute("SELECT session_id,status,error FROM job_match_sessions WHERE user_id=? AND workflow_id=? ORDER BY updated_at DESC LIMIT 1",
+                               (jobs.USER,workflow_id)).fetchone()
+            try:diagnostics=json.loads(db.execute("SELECT diagnostics_json FROM user_workflows WHERE workflow_id=?",(workflow_id,)).fetchone()[0] or "{}")
+            except (TypeError,IndexError,json.JSONDecodeError):diagnostics={}
+            diagnostics["failure"]="The matching worker could not start. Its checkpoint is saved; resume matching to retry."
+            db.execute("UPDATE user_workflows SET status='failed',current_stage='failed',diagnostics_json=? WHERE workflow_id=?",
+                       (json.dumps(diagnostics),workflow_id))
+        result_queue.put((type(error).__name__,session["session_id"] if session else None,
+                          session["error"] if session else None))
+
+
 class ResumeJobMatcherTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.old_db = jobs.DB
         jobs.DB = Path(self.tempdir.name) / "matcher.sqlite3"
+        with matcher._groq_rate_lock:matcher._groq_rate_state.clear()
         with jobs.database() as db:
             db.executescript("""
                 CREATE TABLE resumes (id TEXT PRIMARY KEY, user_id TEXT, created_at TEXT, active INTEGER);
                 CREATE TABLE resume_profiles (resume_id TEXT PRIMARY KEY, status TEXT, profile_json TEXT);
                 CREATE TABLE candidate_verifications (resume_id TEXT PRIMARY KEY,user_id TEXT,values_json TEXT,confirmed_json TEXT,updated_at TEXT);
+                CREATE TABLE application_answers(user_id TEXT,resume_id TEXT,question_key TEXT,answer TEXT,sensitive INTEGER,confirmed INTEGER,revoked_at TEXT,auto_reuse INTEGER);
                 CREATE TABLE career_preferences (user_id TEXT PRIMARY KEY, preferences_json TEXT NOT NULL);
-                CREATE TABLE discovered_openings (user_id TEXT, job_key TEXT, company TEXT, title TEXT, location TEXT, url TEXT, discovered_at TEXT, employment_type TEXT DEFAULT '', location_status TEXT DEFAULT 'unknown', location_reason TEXT DEFAULT '', search_prompt TEXT DEFAULT '', PRIMARY KEY(user_id,job_key));
+                CREATE TABLE discovered_openings (user_id TEXT, job_key TEXT, company TEXT, title TEXT, location TEXT, url TEXT, discovered_at TEXT, employment_type TEXT DEFAULT '', location_status TEXT DEFAULT 'unknown', location_reason TEXT DEFAULT '', search_prompt TEXT DEFAULT '',source_platform TEXT DEFAULT 'greenhouse',source_id TEXT DEFAULT '',country TEXT DEFAULT '',work_arrangement TEXT DEFAULT '',description TEXT DEFAULT '',last_verified_at TEXT,active INTEGER DEFAULT 1,availability_status TEXT DEFAULT 'current',content_fingerprint TEXT DEFAULT '',PRIMARY KEY(user_id,job_key));
                 CREATE TABLE application_authorizations (user_id TEXT PRIMARY KEY, version INTEGER NOT NULL, settings_json TEXT NOT NULL, updated_at TEXT NOT NULL);
             """)
             db.execute("INSERT INTO application_authorizations VALUES(?,1,?,?)",(jobs.USER,json.dumps({"allow_ai_matching":True}),"2026-01-01"))
@@ -60,11 +97,223 @@ class ResumeJobMatcherTests(unittest.TestCase):
         jobs.DB = self.old_db
         self.tempdir.cleanup()
 
+    def _seed_retryable_failure(self,status="failed"):
+        description="Software Engineer work includes building backend services and web applications. "*12
+        stamp=matcher.now()
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET description=?,source_platform='greenhouse',source_id='42',active=1,availability_status='current',content_fingerprint='same-content' WHERE user_id=? AND job_key=?",
+                       (description,jobs.USER,"greenhouse:cloudflare:42"))
+            db.execute("INSERT OR REPLACE INTO employers(employer_id,name,source_type,source_token,careers_url,geographic_coverage,connector_status,discovery_status,active,source_fingerprint,created_at,updated_at) VALUES('retry-cloudflare','Cloudflare','greenhouse','cloudflare','https://careers.example.com','United States','healthy','verified',1,'verified-source',?,?)",(stamp,stamp))
+            db.execute("""INSERT OR REPLACE INTO job_match_results(user_id,job_key,resume_id,status,error,created_at,updated_at,freshness_status)
+                VALUES(?,?,?,?,'Local model read timeout',?,?,?)""",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1",status,stamp,stamp,"legacy"))
+        return {"id":"42","title":"Software Engineer","content":description,
+            "content_fingerprint":"same-content",
+            "absolute_url":"https://job-boards.greenhouse.io/cloudflare/jobs/42",
+            "location":{"name":"San Francisco, CA, United States"},"company_name":"Cloudflare",
+            "_source_platform":"greenhouse","_search_prompt":"software engineer jobs"}
+
     def test_active_candidate_reads_active_profile_version(self):
         resume_id, status, profile = matcher.active_candidate()
         self.assertEqual(resume_id, "resume-v1")
         self.assertEqual(status, "user_reviewed")
         self.assertEqual(profile["technical_skills"], ["Python"])
+
+    def test_technical_requirements_respect_required_and_preferred_sections(self):
+        extracted=extract_technical_qualification_requirements("""<p><strong>Requirements</strong></p><ul>
+        <li>Experience building web applications</li><li>Comfort working across the stack, frontend and backend</li>
+        <li>Strong fundamentals in data structures, algorithms, and software design</li></ul>
+        <p><strong>Nice to Haves</strong></p><ul><li>Experience with cloud platforms</li></ul>""")
+        self.assertEqual([item["requiredness"] for item in extracted],["required"]*3+["preferred"])
+        self.assertEqual(extracted[0]["category"],"web_application_experience")
+        self.assertEqual(extracted[1]["category"],"frontend_backend")
+        self.assertEqual(extracted[2]["category"],"data_structures_algorithms_design")
+        self.assertEqual(extracted[3]["category"],"cloud_infrastructure")
+
+    def test_verified_projects_support_web_app_and_frontend_backend_across_projects(self):
+        description=("Requirements: Experience building web applications. "
+            "Comfort working across the stack; curious about both frontend and backend.")
+        profile={"projects":[{"description":"Developed a web application and implemented its frontend user interface."},
+                              {"description":"Built backend API services and server-side request handling."}]}
+        assessments=matcher._technical_qualification_assessments(description,profile)
+        self.assertEqual([item["status"] for item in assessments],["met","met"])
+        self.assertTrue(all(item["candidate_evidence"] for item in assessments))
+        self.assertTrue(all(item["candidate_evidence"][0]["confirmation_status"]=="confirmed" for item in assessments))
+
+    def test_technology_list_without_project_narrative_is_not_implementation_evidence(self):
+        assessment=matcher._technical_qualification_assessments(
+            "Requirements: Comfort working across the stack, frontend and backend.",
+            {"projects":[{"description":"Completed a software project.","technologies":["React","Python","FastAPI"]}]})
+        self.assertEqual(assessment[0]["status"],"needs_review")
+        self.assertEqual(assessment[0]["candidate_evidence"],[])
+
+    def test_multi_option_preferred_stack_is_not_mislabeled_as_database_requirement(self):
+        extracted=extract_technical_qualification_requirements(
+            "Nice to Haves: Experience with React, Python, FastAPI, or PostgreSQL.")
+        self.assertEqual(extracted[0]["category"],"technical_stack")
+        self.assertEqual(extracted[0]["requiredness"],"preferred")
+        assessment=matcher._technical_qualification_assessments(
+            "Nice to Haves: Experience with React, Python, FastAPI, or PostgreSQL.",
+            {"projects":[{"description":"Built a service for a personal project.","technologies":["Python","FastAPI"]}]})
+        self.assertEqual(assessment[0]["status"],"not_applicable")
+        self.assertEqual(assessment[0]["candidate_evidence"],[])
+
+    def test_frontend_only_or_backend_only_does_not_satisfy_both(self):
+        description="Requirements: Comfort working across the stack, frontend and backend."
+        for project in ({"description":"Developed the frontend user interface using React."},
+                        {"description":"Implemented backend API services using Python."}):
+            with self.subTest(project=bool("frontend" in project["description"])):
+                assessment=matcher._technical_qualification_assessments(description,{"projects":[project]})
+                self.assertEqual(assessment[0]["status"],"needs_review")
+
+    def test_verified_api_implementation_supports_api_requirement(self):
+        assessment=matcher._technical_qualification_assessments("Requirements: Implement APIs and services.",
+            {"projects":[{"description":"Implemented REST API endpoints and service tests."}]})
+        self.assertEqual(assessment[0]["category"],"api_services")
+        self.assertEqual(assessment[0]["status"],"met")
+
+    def test_confirmed_coursework_can_support_dsa_and_software_design_fundamentals(self):
+        from candidate_verification import canonical_verified_candidate_facts
+        facts=canonical_verified_candidate_facts({"education":[{"degree":"B.S.","coursework":["Data Structures and Algorithms","Software Design"]}]})
+        assessment=matcher._technical_qualification_assessments(
+            "Requirements: Strong fundamentals in data structures, algorithms, and software design.",facts)
+        self.assertEqual(facts["education"][0]["coursework"],["Data Structures and Algorithms","Software Design"])
+        self.assertEqual(assessment[0]["status"],"met")
+        self.assertEqual({ev["source_type"] for ev in assessment[0]["candidate_evidence"]},{"verified_coursework"})
+
+    def test_partial_algorithm_project_does_not_claim_all_fundamentals(self):
+        assessment=matcher._technical_qualification_assessments(
+            "Requirements: Strong fundamentals in data structures, algorithms, and software design.",
+            {"projects":[{"description":"Implemented graph algorithms and evaluated their time complexity."}]})
+        self.assertEqual(assessment[0]["status"],"needs_review")
+        self.assertTrue(assessment[0]["candidate_evidence"])
+        self.assertIn("data structures",assessment[0]["explanation"])
+
+    def test_preferred_technical_gap_never_blocks(self):
+        result=matcher.apply_safety_rules(valid_result(),{"technical_skills":["Python"],"projects":[]},"user_reviewed",
+            {"roles":["Software Engineer"],"location":"United States","relocation_preference":"anywhere","employment_types":["Full-time"]},
+            {"title":"Software Engineer","location":"San Francisco, United States","employment_type":"Full-time",
+             "content":"Nice to Haves: Experience with cloud infrastructure."})
+        self.assertNotEqual(result.classification,"not_eligible")
+        self.assertTrue(result.technical_qualifications)
+        self.assertEqual(result.technical_qualifications[0].requiredness,"preferred")
+        self.assertEqual(result.technical_qualifications[0].status,"not_applicable")
+        self.assertFalse(any("cloud infrastructure" in value.casefold() for value in result.gaps+result.missing_information))
+
+    def test_missing_required_technical_evidence_is_review_not_mismatch(self):
+        result=matcher.apply_safety_rules(valid_result(),{"projects":[]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Requirements: Experience building web applications."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.technical_qualifications[0].status,"needs_review")
+        self.assertNotEqual(result.technical_qualifications[0].status,"confirmed_mismatch")
+        self.assertTrue(any("web application" in question.casefold() for question in result.missing_information))
+
+    def test_ashby_new_grad_what_you_bring_maps_only_six_requirements_and_keeps_unknowns_open(self):
+        description=("What You'll Bring\n"
+            "Proven product builder: Ability to deliver user-facing software at scale; carried features through multiple release cycles.\n"
+            "Full-stack fluency: Comfortable with React, TypeScript, Python; experience with databases and cloud infrastructure.\n"
+            "AI experience (nice-to-have): Hands-on with LLM APIs, embeddings, or RAG patterns.\n"
+            "Customer empathy: Track record of translating stakeholder goals into technical specs and products.\n"
+            "Founder-level ownership: Run toward ambiguity and learn from failures.\n"
+            "Excellent communicator: Explain architectural trade-offs and business outcomes.\n"
+            "Our values\nBe kind and curious.\nEqual opportunity employer")
+        items=matcher._what_you_bring_items(description)
+        self.assertEqual(len(items),6)
+        assessments=matcher._technical_qualification_assessments(description,{
+            "projects":[{"description":"Worked in a four-person Agile team to plan, build, test, and iterate a product. Owned three features end-to-end through design, debugging, code review, and integration. Authored technical documentation and test plans."}]})
+        by_category={item["category"]:item for item in assessments}
+        self.assertEqual(len(assessments),6)
+        self.assertEqual(by_category["ai_experience"]["status"],"not_applicable")
+        self.assertEqual(by_category["product_release_cycles"]["status"],"needs_review")
+        self.assertTrue(by_category["product_release_cycles"]["candidate_evidence"])
+        self.assertEqual(by_category["customer_product_translation"]["status"],"needs_review")
+        self.assertEqual(by_category["founder_level_ownership"]["status"],"needs_review")
+        self.assertTrue(by_category["founder_level_ownership"]["candidate_evidence"])
+        self.assertEqual(by_category["technical_business_communication"]["status"],"needs_review")
+        self.assertTrue(by_category["technical_business_communication"]["candidate_evidence"])
+
+    def test_start_availability_is_separate_from_confirmed_graduation(self):
+        description=("We need to hire new graduates available to start between winter of 2026 and summer of 2027.")
+        assessment=matcher._start_window_assessment(description,{"graduation_date":"2026-12"})
+        self.assertEqual(assessment["status"],"needs_review")
+        self.assertIn("not employment availability",assessment["explanation"].casefold())
+        self.assertIn("earliest available full-time start date",assessment["missing_question"])
+        met=matcher._start_window_assessment(description,{"earliest_available_date":"2027-05-15"})
+        self.assertEqual(met["status"],"met")
+        conflict=matcher._start_window_assessment(description,{"earliest_available_date":"2027-09-01"})
+        self.assertEqual(conflict["status"],"confirmed_mismatch")
+
+    def test_missing_start_availability_keeps_new_grad_match_in_review(self):
+        result=matcher.apply_safety_rules(valid_result(),{"education":[{"degree":"B.S.","graduation_date":"2026-12"}]},
+            "user_reviewed",{}, {"title":"Full-Stack Software Engineer (Product) - New Grad 2026-2027",
+                "description":"We need to hire multiple new graduate engineers available to start between winter of 2026 and summer of 2027."})
+        self.assertEqual(result.availability_assessment["status"],"needs_review")
+        self.assertEqual(result.classification,"needs_review")
+        self.assertTrue(any("earliest available full-time start date" in value.casefold() for value in result.missing_information))
+        self.assertFalse(any("availability falls outside" in value.casefold() for value in result.gaps))
+
+    def test_current_engine_result_is_not_repeatedly_staled_on_initialize(self):
+        stamp="2026-10-27T00:00:00+00:00"
+        with jobs.database() as db:
+            for key,version in (("current-v13",matcher.MATCHING_ENGINE_VERSION),
+                                ("old-v12","ollama:qwen2.5:3b/job-match-v12-relocation-preferences")):
+                db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,
+                    result_json,created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,
+                    matching_model_version,freshness_status) VALUES(?,?,?,'completed','needs_review',70,'{}',?,?,?,?,?,?, 'current')""",
+                    (jobs.USER,key,"resume-v1",stamp,stamp,"a"*64,"b"*64,"c"*64,version))
+        matcher.initialize()
+        with jobs.database() as db:
+            current=db.execute("SELECT freshness_status FROM job_match_results WHERE job_key='current-v13'").fetchone()[0]
+            old=db.execute("SELECT freshness_status FROM job_match_results WHERE job_key='old-v12'").fetchone()[0]
+        self.assertEqual(current,"current")
+        self.assertEqual(old,"stale")
+
+    def test_matching_uses_confirmed_ordinary_answer_bank_facts_only(self):
+        with jobs.database() as db:
+            db.executemany("INSERT INTO application_answers VALUES(?,?,?,?,?,?,?,?)",[
+                (jobs.USER,"resume-v1","custom:graduation_date","2026-06",0,1,None,1),
+                (jobs.USER,"resume-v1","custom:technical_skills","Python, Rust",0,1,None,1),
+                (jobs.USER,"resume-v1","custom:professional_experience","Built verified production APIs",0,1,None,1),
+                (jobs.USER,"resume-v1","custom:work_authorization","Sensitive answer",1,1,None,0),
+                (jobs.USER,"resume-v1","custom:location","Old answer",0,0,None,1),
+                (jobs.USER,"resume-v1","custom:location","yes",0,1,None,1)])
+        _,_,profile=matcher.active_candidate()
+        self.assertEqual(profile["graduation_year"],"2026")
+        self.assertIn("Rust",profile["technical_skills"])
+        self.assertEqual(profile["work_experience"][-1]["responsibilities"],["Built verified production APIs"])
+        self.assertNotIn("work_authorization",profile)
+        self.assertNotIn("Old answer",str(profile))
+        self.assertNotIn("yes",str(profile))
+
+    def test_match_freshness_detects_engine_profile_preference_and_job_changes(self):
+        resume_id,status,profile=matcher.active_candidate()
+        self.assertEqual(status,"user_reviewed")
+        saved_prefs=jobs.preferences()
+        with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key='greenhouse:cloudflare:42'").fetchone())
+            stamp=matcher.now()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','potential_match',84,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,"greenhouse:cloudflare:42",resume_id,valid_result().model_dump_json(),stamp,stamp,
+                 matcher.profile_fingerprint(profile,resume_id),matcher.stable_fingerprint(saved_prefs),
+                 matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
+        current=matcher._match_rows(["greenhouse:cloudflare:42"],resume_id)[0]
+        self.assertFalse(current["stale"])
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET title='Changed Software Engineer' WHERE job_key='greenhouse:cloudflare:42'")
+        changed=matcher._match_rows(["greenhouse:cloudflare:42"],resume_id)[0]
+        self.assertTrue(changed["stale"])
+        self.assertEqual(changed["freshness_status"],"stale")
+
+    def test_legacy_match_without_version_fingerprints_is_stale(self):
+        with jobs.database() as db:
+            stamp=matcher.now()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at)
+                VALUES(?,?,'resume-v1','completed','potential_match',80,?,?,?)""",
+                (jobs.USER,"greenhouse:cloudflare:42",valid_result().model_dump_json(),stamp,stamp))
+        result=matcher._match_rows(["greenhouse:cloudflare:42"],"resume-v1")[0]
+        self.assertTrue(result["stale"])
 
     def test_confirmed_graduation_date_is_merged_for_job_matching(self):
         with jobs.database() as db:
@@ -100,7 +349,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
     def test_missing_candidate_information_is_needs_review(self):
         result = matcher.apply_safety_rules(valid_result(), {}, "user_reviewed", {}, {"title": "Software Engineer"})
         self.assertEqual(result.classification, "needs_review")
-        self.assertTrue(any("no verified qualifications" in value for value in result.missing_information))
+        self.assertTrue(any("No verified qualifications" in value for value in result.missing_information))
 
     def test_unverified_profile_is_never_a_potential_match(self):
         profile = {"technical_skills": ["Python"]}
@@ -114,6 +363,19 @@ class ResumeJobMatcherTests(unittest.TestCase):
         result = matcher.apply_safety_rules(valid_result(), {"technical_skills": ["Python"]}, "user_reviewed", prefs, job)
         self.assertEqual(result.classification, "not_eligible")
         self.assertTrue(any("location preference" in gap for gap in result.gaps))
+
+    def test_relocation_anywhere_does_not_establish_foreign_work_authorization(self):
+        profile={"country":"US","work_authorization":"United States"}
+        prefs={"roles":["Software Engineer"],"levels":["Junior"],"employment_types":["Full-time"],
+            "location":"United States","relocation_preference":"anywhere","work_arrangement":"Any"}
+        job={"title":"Junior Software Engineer","country":"GB","location":"London","employment_type":"Full-time",
+            "work_arrangement":"Hybrid","description":"Build software for the product team."}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",prefs,job)
+        self.assertEqual(result.classification,"needs_review")
+        self.assertTrue(any("Work authorization for United Kingdom is not confirmed" in item
+            for item in result.missing_information))
+        self.assertTrue(matcher._confirmed_work_authorization_for_country(profile,"US"))
+        self.assertFalse(matcher._confirmed_work_authorization_for_country(profile,"GB"))
 
     def test_geo_conflict_is_prechecked_without_ollama(self):
         foreign = {"id": 42, "title": "Software Engineer", "content": "Python required.",
@@ -132,12 +394,17 @@ class ResumeJobMatcherTests(unittest.TestCase):
 
     def test_completed_result_is_not_overwritten_or_analyzed_again(self):
         existing = valid_result()
+        resume_id,_,profile=matcher.active_candidate()
+        prefs=jobs.preferences()
         with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key='greenhouse:cloudflare:42'").fetchone())
             db.execute("""INSERT INTO job_match_results
-                (user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at)
-                VALUES(?,?,?,'completed',?,?,?,'2026-01-01','2026-01-01')""",
-                       (jobs.USER, "greenhouse:cloudflare:42", "resume-v1", existing.classification,
-                        existing.match_score, existing.model_dump_json()))
+                (user_id,job_key,resume_id,status,classification,match_score,result_json,created_at,updated_at,
+                 candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed',?,?,?,'2026-01-01','2026-01-01',?,?,?,?,'current')""",
+                       (jobs.USER, "greenhouse:cloudflare:42", resume_id, existing.classification,
+                        existing.match_score, existing.model_dump_json(),matcher.profile_fingerprint(profile,resume_id),
+                        matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),matcher.MATCHING_ENGINE_VERSION))
         fake = {"id": 42, "title": "Software Engineer", "content": "Python required.",
                 "location": {"name": "Austin, Texas"}}
         with patch.object(matcher, "fetch_board", return_value=([fake], None)), \
@@ -152,6 +419,21 @@ class ResumeJobMatcherTests(unittest.TestCase):
         model.assert_not_called()
         self.assertEqual(rows[0]["match_score"], 84)
         self.assertEqual(rows[0]["match"]["explanation"], existing.explanation)
+
+    def test_provider_change_marks_saved_match_stale(self):
+        resume_id,status,profile=matcher.active_candidate()
+        prefs=jobs.preferences();key="greenhouse:cloudflare:42"
+        with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key=?",(key,)).fetchone())
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','potential_match',84,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,key,resume_id,valid_result().model_dump_json(),"2026-01-01","2026-01-01",
+                 matcher.profile_fingerprint(profile,resume_id),matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),
+                 matcher.matching_engine_version("ollama",matcher.MODEL)))
+        with patch.object(matcher,"current_provider_config",return_value=("gemini",matcher.GEMINI_MODEL)):
+            rows=matcher._match_rows([key],resume_id)
+        self.assertTrue(rows[0]["stale"])
 
     def test_senior_experience_requirement_is_sent_to_ollama(self):
         response = Mock()
@@ -173,19 +455,469 @@ class ResumeJobMatcherTests(unittest.TestCase):
             requirement="3 years professional experience", status="gap", candidate_evidence=[])])
         preferred_gap = valid_result(preferred_experience=[matcher.SkillEvidence(
             requirement="Experience with Kubernetes preferred", status="preferred", candidate_evidence=[])])
-        required = matcher.apply_safety_rules(required_gap, profile, "user_reviewed", {}, {"title": "Software Engineer"})
-        preferred = matcher.apply_safety_rules(preferred_gap, profile, "user_reviewed", {}, {"title": "Software Engineer"})
+        required = matcher.apply_safety_rules(required_gap, profile, "user_reviewed", {}, {"title": "Software Engineer", "content":"Must have 3 years professional experience."})
+        preferred = matcher.apply_safety_rules(preferred_gap, profile, "user_reviewed", {"roles":["Software Engineer"]}, {"title": "Software Engineer", "content":"Python required. Kubernetes experience preferred."})
         self.assertEqual(required.classification, "needs_review")
-        self.assertEqual(preferred.classification, "potential_match")
+        self.assertEqual(preferred.classification, "needs_review")
+        self.assertTrue(any("Experience level is not clear" in item for item in preferred.missing_information))
+        self.assertEqual(preferred.preferred_experience[0].status,"preferred")
 
-    def test_verified_required_conflict_overrides_high_score(self):
+    def test_unverified_year_claim_does_not_create_hard_experience_mismatch(self):
         mismatch = valid_result(match_score=99, required_experience=[matcher.SkillEvidence(
             requirement="8 years professional experience", status="confirmed_mismatch",
             candidate_evidence=["profile states 2 years"] )])
-        checked = matcher.apply_safety_rules(mismatch, {"work_experience": ["2 years"]}, "user_reviewed", {},
-                                             {"title": "Software Engineer"})
-        self.assertEqual(checked.classification, "not_eligible")
-        self.assertEqual(checked.match_score, 99)
+        checked = matcher.apply_safety_rules(mismatch, {"work_experience": [{"job_title":"Tutor","start_date":"2022-01","end_date":"2024-01"}]}, "user_reviewed", {},
+                                             {"title": "Software Engineer", "content":"Must have 8 years of professional experience."})
+        self.assertEqual(checked.classification, "needs_review")
+        self.assertEqual(checked.required_experience[0].status, "unclear")
+        self.assertIn("8 years", checked.experience_assessment)
+
+    def test_dated_software_experience_shortfall_is_a_mandatory_conflict(self):
+        profile={"technical_skills":["Python"],"work_experience":[{
+            "job_title":"Software Engineer","start_date":"2024-01","end_date":"2025-01",
+            "responsibilities":["Built production software"]}]}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
+            {"title":"Software Engineer","content":"Minimum of 3 years of professional software engineering experience required."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertEqual(result.required_experience[0].status,"confirmed_mismatch")
+        self.assertIn("below the posting's 3-year minimum",result.required_experience[0].candidate_evidence[0])
+
+    def test_tutoring_internships_and_graduation_year_do_not_become_software_experience(self):
+        profile={"graduation_year":"2024","work_experience":[{
+            "job_title":"Software Engineering Intern","employment_type":"Internship",
+            "start_date":"2022-01","end_date":"2024-01"}],
+            "teaching_experience":[{"job_title":"Computer Science Tutor",
+                "start_date":"2021-01","end_date":"2024-01"}]}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
+            {"title":"Software Engineer","content":"Must have 2 years of professional software experience."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.required_experience[0].status,"unclear")
+
+    def test_redacted_regression_fixture_corrects_degree_location_and_placeholder_conflicts(self):
+        # Sanitized representation of the supplied contradictory provider output.
+        bad = valid_result(classification="not_eligible", match_score=93,
+            explanation="The candidate does not have a Bachelor's in Computer Science and the preferred location of California is a mismatch.",
+            education_requirements=[matcher.SkillEvidence(requirement="Bachelor's in Computer Science",status="confirmed_mismatch")],
+            preferred_skills=[matcher.SkillEvidence(requirement="Preferred location: California, United States",status="confirmed_mismatch"),
+                              matcher.SkillEvidence(requirement="required",status="gap")],
+            preferred_experience=[matcher.SkillEvidence(requirement="preferred",status="gap")],
+            location_assessment="California is outside the candidate's location preference.")
+        profile={"education":[{"degree":"B.S.","major":"Comp Sci"}],"location":"California, United States","graduation_year":"2026"}
+        job={"title":"Software Engineer I","location":"San Francisco, CA, United States",
+             "content":"Required qualifications: Bachelor's degree in Computer Science. Full-time role."}
+        result=matcher.apply_safety_rules(bad,profile,"user_reviewed",{"location":"California"},job)
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.education_requirements[0].status,"met")
+        self.assertEqual(result.location_assessment,"Explicit posting location matches California.")
+        self.assertFalse(any(x.requirement.casefold() in {"required","preferred"} for x in result.preferred_skills+result.preferred_experience))
+        self.assertTrue(result.evidence_consistency)
+        self.assertNotIn("does not have a Bachelor's",result.explanation)
+
+    def test_graduation_suggestion_is_not_confirmed_eligibility_evidence(self):
+        profile={"graduation_year_suggestion":"2025","education":[{"degree":"B.S.","graduation_year_suggestion":"2025"}]}
+        result=matcher.apply_safety_rules(valid_result(),profile,"user_reviewed",{},
+            {"title":"New Graduate Software Engineer","content":"Applicants must be Class of 2026."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertTrue(any("graduation" in x.casefold() and "missing" in x.casefold() for x in result.missing_information))
+
+    def test_atoms_saved_posting_extracts_required_gpa_and_seasonal_graduation(self):
+        from job_relevance import extract_gpa_requirements, extract_graduation_windows
+        description=("<h3>Basic Qualifications</h3><p>Graduating in Winter 2026 or Spring/Summer 2027</p>"
+                     "<p>3.7 GPA Minimum</p><h3>Preferred Qualifications</h3><p>Docker experience</p>")
+        gpa=extract_gpa_requirements(description)
+        windows=extract_graduation_windows(description)
+        self.assertEqual([(x["minimum_score"],x["scale"],x["status"]) for x in gpa["required"]],[(3.7,None,"required")])
+        self.assertFalse(gpa["preferred"])
+        self.assertEqual({(x.get("season"),x["season_year"],x["status"]) for x in windows},
+                         {("winter",2026,"required"),("spring",2027,"required"),("summer",2027,"required")})
+
+    def test_missing_confirmed_gpa_keeps_atoms_job_in_review_and_confirms_graduation(self):
+        description=("Basic Qualifications: Graduating in Winter 2026 or Spring/Summer 2027; 3.7 GPA Minimum.")
+        result=matcher.apply_safety_rules(valid_result(),{"graduation_date":"2026-12",
+            "education":[{"degree":"Bachelor's","major":"Computer Science"}]},"user_reviewed",{},
+            {"title":"Software Engineer - New Grad","content":description})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertIn("3.7",result.gpa_assessment)
+        self.assertIn("no confirmed candidate GPA",result.gpa_assessment)
+        self.assertTrue(any("GPA" in x and "missing" in x for x in result.missing_information))
+        self.assertIn("met",result.graduation_assessment)
+        self.assertTrue(any("Graduation window" in x.requirement and x.status=="met" for x in result.education_requirements))
+
+    def test_confirmed_gpa_shortfall_and_out_of_window_graduation_are_ineligible(self):
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),{"graduation_date":"2025-12",
+            "education":[{"degree":"Bachelor's","gpa":"3.6","gpa_scale":"4.0"}]},"user_reviewed",{},
+            {"title":"Software Engineer - New Grad",
+             "content":"Basic Qualifications: Graduating in Winter 2026 or Spring/Summer 2027; GPA minimum 3.7/4.0."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertTrue(any("Confirmed candidate GPA is below" in x for x in result.gaps))
+        self.assertTrue(any("graduation falls outside" in x.casefold() for x in result.gaps))
+
+    def test_preferred_gpa_does_not_become_a_mandatory_cutoff(self):
+        result=matcher.apply_safety_rules(valid_result(),{"education":[{"degree":"Bachelor's","gpa":"3.2","gpa_scale":"4.0"}]},
+            "user_reviewed",{}, {"title":"Software Engineer","content":"Preferred Qualifications: 3.7 GPA minimum."})
+        self.assertEqual(result.classification,"needs_review" if result.missing_information else "potential_match")
+        self.assertIn("Preferred GPA",result.gpa_assessment)
+        self.assertFalse(any("mandatory threshold" in x.casefold() for x in result.gaps))
+
+    def test_ai_cannot_erase_or_override_deterministic_gpa_requirement(self):
+        result=valid_result(education_requirements=[matcher.SkillEvidence(requirement="3.7 GPA minimum",
+            status="met",candidate_evidence=["AI said GPA is sufficient"])])
+        checked=matcher.apply_safety_rules(result,{"education":[{"degree":"Bachelor's"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Basic Qualifications: GPA minimum 3.7/4.0."})
+        self.assertEqual(checked.classification,"needs_review")
+        gpa=next(item for item in checked.education_requirements if "GPA" in item.requirement)
+        self.assertEqual(gpa.status,"unclear")
+
+    def test_deterministic_experience_threshold_survives_ai_denial(self):
+        bad=valid_result(experience_assessment="The posting does not specify an experience requirement.",
+            explanation="No specific years of experience are required by this posting.")
+        result=matcher.apply_safety_rules(bad,{"education":[{"degree":"Bachelor's"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Minimum qualifications: 5 years of professional experience."})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertIn("5 years",result.experience_assessment)
+        self.assertTrue(any("AI said experience requirements were absent" in x for x in result.evidence_consistency))
+
+    def test_verified_location_state_and_degree_aliases(self):
+        profile={"education":[{"degree":"Bachelor of Science","major":"Computer Sciences"}],"location":"California"}
+        result=matcher.apply_safety_rules(valid_result(education_requirements=[matcher.SkillEvidence(
+            requirement="Bachelor's degree in Computer Science",status="confirmed_mismatch")]),profile,"user_reviewed",
+            {"location":"California"},{"title":"Engineer","location":"San Diego, CA, United States",
+             "content":"Requirements: Bachelor's degree in Computer Science."})
+        self.assertEqual(result.education_requirements[0].status,"met")
+        self.assertEqual(result.location_assessment,"Explicit posting location matches California.")
+
+    def test_matching_engine_v3_stales_v2_without_deleting_history(self):
+        resume_id,_,profile=matcher.active_candidate();prefs=jobs.preferences();key="greenhouse:cloudflare:42"
+        with jobs.database() as db:
+            opening=dict(db.execute("SELECT * FROM discovered_openings WHERE job_key=?",(key,)).fetchone())
+            stamp=matcher.now()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',60,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,key,resume_id,valid_result().model_dump_json(),stamp,stamp,matcher.profile_fingerprint(profile,resume_id),
+                 matcher.stable_fingerprint(prefs),matcher.job_fingerprint(opening),"qwen2.5:3b/job-match-v1"))
+        matcher.initialize()
+        with jobs.database() as db:
+            row=db.execute("SELECT freshness_status,result_json FROM job_match_results WHERE job_key=? AND resume_id=?",(key,resume_id)).fetchone()
+        self.assertEqual(row["freshness_status"],"stale")
+        self.assertIsNotNone(row["result_json"])
+        self.assertIn("job-match-v23-early-career-sponsorship-review",matcher.matching_engine_version("ollama","test-model"))
+
+    def test_affirmative_ai_consistency_statements_remain_diagnostics_not_review_blockers(self):
+        statements=["Bachelors degree in Computer Science, graduation date 2026-12",
+                    "Experience in software engineering through projects and team project"]
+        with patch.object(matcher,"assess_job",return_value=(True,"",[])):
+            result=matcher.apply_safety_rules(valid_result(evidence_consistency=statements),
+            {"technical_skills":["Python"]},"user_reviewed",{},
+            {"title":"Software Engineer","location":"New York, United States","employment_type":"Full-time","content":"Python required."})
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(result.evidence_consistency,[])
+        self.assertEqual(result.ai_evidence_diagnostics,statements)
+
+    def test_ai_diagnostics_do_not_override_a_deterministic_mandatory_conflict(self):
+        result=matcher.apply_safety_rules(valid_result(evidence_consistency=["Candidate is qualified."]),
+            {"education":[{"degree":"Bachelor's","major":"Computer Science"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Basic Qualifications: Master's degree in Computer Science required."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertTrue(result.ai_evidence_diagnostics)
+        self.assertTrue(any(item.status=="confirmed_mismatch" for item in result.education_requirements))
+
+    def test_fall_graduation_window_includes_confirmed_december_term(self):
+        self.assertTrue(matcher._graduation_window_matches({"season":"fall","season_year":2026,
+            "start_year":2026,"end_year":2026},"2026-12"))
+        from job_relevance import extract_education_requirements
+        requirements=extract_education_requirements(
+            "<h3>Requirements</h3><ul><li>B.S. or M.S. in Computer Science or a related field.</li>"
+            "</ul><h3>Preferred Qualifications</h3><ul><li>Ph.D. preferred.</li></ul>")
+        self.assertTrue(any("Bachelor's" in x and "Master's" in x and "Computer Science" in x
+                            for x in requirements["required"]))
+        self.assertTrue(any("doctoral" in x for x in requirements["preferred"]))
+
+    def test_preferred_internship_is_not_a_mandatory_eligibility_gap(self):
+        from job_relevance import extract_internship_requirements
+        description=("Requirements: Experience building web applications through personal projects, coursework, or internships. "
+                     "Nice to Haves: Prior internship experience in a fast-paced environment.")
+        extracted=extract_internship_requirements(description)
+        self.assertFalse(extracted["required"])
+        self.assertEqual(extracted["preferred"][0]["status"],"preferred")
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),{"education":[{"degree":"Bachelor's"}]},
+            "user_reviewed",{}, {"title":"New Grad Software Engineer","content":description})
+        self.assertFalse(any("internship" in x.casefold() for x in result.missing_information))
+        self.assertTrue(any("internship" in x.requirement.casefold() and x.status=="preferred"
+                            for x in result.preferred_experience))
+
+    def test_sanitized_authentic_qualification_evidence_is_grounded(self):
+        from job_relevance import extract_education_requirements, extract_internship_requirements
+        posting=("<p><strong>Responsibilities</strong></p><ul><li>Build and ship features across our React frontend and Python backend.</li>"
+                 "<li>Education includes mentoring teammates and participating in architecture discussions.</li></ul>"
+                 "<p><strong>Requirements</strong></p><ul><li>B.S. or M.S. in Computer Science or a related field "
+                 "(recently graduated or graduating Fall 2026/Spring 2027)</li>"
+                 "<li>Experience building web applications (personal projects, coursework, or internships)</li></ul>"
+                 "<p><strong>Nice to Haves</strong></p><ul><li>Prior internship experience in fast-paced environments</li></ul>")
+        education=extract_education_requirements(posting)
+        internships=extract_internship_requirements(posting)
+        self.assertEqual(len(education["required"]),1)
+        self.assertIn("Bachelor's",education["required"][0])
+        self.assertIn("Master's",education["required"][0])
+        self.assertFalse(any("Responsibilities" in item for bucket in education.values() for item in bucket))
+        self.assertEqual(internships["required"],[])
+        self.assertEqual(internships["preferred"][0]["status"],"preferred")
+
+        result=matcher.apply_safety_rules(valid_result(
+            education_assessment="Candidate education matches the required degree.",
+            explanation="Candidate education matches the required degree.",
+            education_requirements=[
+                matcher.SkillEvidence(requirement="or M.S",status="confirmed_mismatch"),
+                matcher.SkillEvidence(requirement="Responsibilities Build and ship features across our React frontend",status="confirmed_mismatch")]),
+            {"education":[{"degree":"B.S.","major":"Computer Science","graduation_date":"2026-12"}]},
+            "user_reviewed",{},
+            {"title":"New Grad Software Engineer","content":posting,"employment_type":""})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertEqual(result.education_requirements[0].status,"met")
+        self.assertFalse(any("internship" in item.casefold() for item in result.missing_information))
+        self.assertIn("does not specify employment type",result.employment_type_assessment)
+        self.assertTrue(result.evidence_consistency)
+
+    def test_complete_degree_alternatives_and_equivalent_experience_are_preserved(self):
+        from job_relevance import extract_education_requirements
+        variants=("B.S. or M.S. in Computer Science.",
+                  "Bachelor's or master's degree in Computer Science.",
+                  "Bachelor's degree or equivalent practical experience.")
+        for sentence in variants:
+            with self.subTest(sentence=sentence):
+                extracted=extract_education_requirements("Basic Qualifications: "+sentence)
+                self.assertEqual(len(extracted["required"]),1)
+                self.assertNotIn("or m s",matcher._qualification_text(extracted["required"][0]))
+
+    def test_confirmed_mandatory_masters_mismatch_remains_ineligible(self):
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),
+            {"education":[{"degree":"Bachelor's","major":"Computer Science"}]},"user_reviewed",{},
+            {"title":"Software Engineer","content":"Basic Qualifications: Master's degree in Computer Science required."})
+        self.assertEqual(result.classification,"not_eligible")
+        self.assertTrue(any(item.status=="confirmed_mismatch" for item in result.education_requirements))
+
+    def test_mandatory_internship_without_verified_record_needs_review(self):
+        from job_relevance import extract_internship_requirements
+        description="Basic Qualifications: Previous internship experience required."
+        self.assertEqual(extract_internship_requirements(description)["required"][0]["status"],"required")
+        result=matcher.apply_safety_rules(valid_result(required_skills=[]),{"education":[{"degree":"Bachelor's"}]},
+            "user_reviewed",{}, {"title":"Software Engineer","content":description})
+        self.assertEqual(result.classification,"needs_review")
+        self.assertTrue(any("internship" in x.casefold() for x in result.missing_information))
+
+    def test_ai_cannot_claim_unknown_employment_type_is_full_time(self):
+        result=valid_result(employment_type_assessment="Full-time is specified and matches the candidate preference.")
+        checked=matcher.apply_safety_rules(result,{"education":[{"degree":"Bachelor's"}]},"user_reviewed",
+            {"employment_types":["Full-time"]},{"title":"Software Engineer","employment_type":"",
+             "content":"Requirements: Bachelor's degree."})
+        self.assertIn("does not specify",checked.employment_type_assessment)
+        self.assertTrue(any("does not provide an employment type" in x for x in checked.evidence_consistency))
+        self.assertEqual(checked.classification,"needs_review")
+
+    def test_pre_ai_check_keeps_unknown_gpa_reviewable_and_detects_comparable_shortfall(self):
+        profile={"education":[{"degree":"Bachelor's","major":"Computer Science","gpa":"3.69","gpa_scale":"4.0"}]}
+        unknown={"title":"Software Engineer","content":"Basic Qualifications: Minimum GPA 3.7."}
+        comparable={"title":"Software Engineer","content":"Basic Qualifications: Minimum GPA 3.7/4.0."}
+        self.assertIsNone(matcher._pre_ai_mandatory_conflict(unknown,profile,"user_reviewed"))
+        self.assertIn("confirmed GPA is below",matcher._pre_ai_mandatory_conflict(comparable,profile,"user_reviewed"))
+
+    def test_pre_ai_check_accepts_december_fall_graduate_and_detects_outside_date(self):
+        description="Requirements: Bachelor's degree in Computer Science; graduation in Fall 2026 or Spring 2027."
+        profile={"graduation_date":"2026-12","education":[{"degree":"Bachelor's","major":"Computer Science"}]}
+        job={"title":"New Grad Software Engineer","content":description}
+        self.assertIsNone(matcher._pre_ai_mandatory_conflict(job,profile,"user_reviewed"))
+        profile["graduation_date"]="2025-12"
+        self.assertIn("graduation date falls outside",matcher._pre_ai_mandatory_conflict(job,profile,"user_reviewed"))
+
+    def test_comparable_gpa_conflict_is_saved_before_ai_without_calling_model(self):
+        resume_id,_,profile=matcher.active_candidate()
+        profile["education"]=[{"degree":"Bachelor's","major":"Computer Science","gpa":"3.6","gpa_scale":"4.0"}]
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET description=? WHERE job_key=?",
+                       ("Basic Qualifications: Minimum GPA 3.7/4.0.","greenhouse:cloudflare:42"))
+            db.execute("UPDATE resume_profiles SET profile_json=? WHERE resume_id=?",
+                       (json.dumps(profile),resume_id))
+        with patch.object(matcher.executor,"submit",return_value=None), \
+             patch.object(matcher,"analyze_with_ollama") as model:
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        model.assert_not_called()
+        self.assertEqual(response["prechecked_not_eligible"],1)
+        row=matcher._match_rows(["greenhouse:cloudflare:42"],resume_id)[0]
+        self.assertEqual(row["classification"],"not_eligible")
+        self.assertEqual(row["freshness_status"],"current")
+        self.assertIn("confirmed GPA is below",row["match"]["gaps"][0])
+
+    def test_notion_december_new_grad_uses_verified_education_without_false_mismatch(self):
+        description=("Software Engineer, New Grad (Dec 2026). You must graduate in December 2026 and be able to "
+            "start full-time by January or February 2027. Qualifications: Pursuing a bachelor's or master’s degree "
+            "in computer science, engineering, or another related field. Previous internship experience required.")
+        windows=__import__("job_relevance").extract_graduation_windows(description)
+        self.assertTrue(any(w.get("start_month")==12 and w["start_year"]==2026 for w in windows))
+        facts=canonical=__import__("candidate_verification").canonical_verified_candidate_facts({
+            "graduation_year":"2026","graduation_month":"December",
+            "education":[{"degree":"Bachelor's","major":"Computer Science"}]})
+        result=valid_result(education_requirements=[matcher.SkillEvidence(
+            requirement="Pursuing a bachelor's or master's degree in computer science, engineering, or another related field",
+            status="confirmed_mismatch",candidate_evidence=["Bachelors"])] )
+        checked=matcher.apply_safety_rules(result,facts,"user_reviewed",{"location":"California, United States"},
+            {"title":"Software Engineer, New Grad (Dec 2026)","location":"San Francisco, California, United States",
+             "employment_type":"FULL_TIME","content":description})
+        degree=checked.education_requirements[0]
+        self.assertNotEqual(degree.status,"confirmed_mismatch")
+        self.assertEqual(degree.status,"unclear") # the verified record does not confirm active enrollment
+        self.assertEqual(checked.classification,"needs_review")
+        self.assertIn("current enrollment is not confirmed",checked.education_assessment)
+        self.assertTrue(any("internship" in item.casefold() for item in checked.missing_information))
+        self.assertTrue(any("availability" in item.casefold() for item in checked.missing_information))
+        self.assertFalse(any("graduation" in item.casefold() and "unknown" in item.casefold() for item in checked.missing_information))
+
+    def test_bachelor_or_masters_accepts_verified_bachelors_when_enrolled(self):
+        requirement="Pursuing a bachelor's or master's degree in computer science, engineering, or another related field"
+        status,evidence=matcher._degree_requirement_status(requirement,{
+            "education":[{"degree":"Bachelor's","degree_normalized":"bachelor","major":"Computer Science",
+                          "major_normalized":"computer science","currently_enrolled":True}]})
+        self.assertEqual(status,"met")
+        self.assertTrue(evidence)
+
+    def test_future_graduation_with_confirmed_not_enrolled_flag_requires_review(self):
+        requirement="Pursuing a bachelor's or master's degree in computer science"
+        status,evidence=matcher._degree_requirement_status(requirement,{
+            "education":[{"degree":"Bachelor's","degree_normalized":"bachelor","major":"Computer Science",
+                          "major_normalized":"computer science","currently_enrolled":False,
+                          "graduation_date":"2099-12"}]})
+        self.assertEqual(status,"unclear")
+        self.assertIn("contradiction needs applicant confirmation",evidence[0])
+        status,_=matcher._degree_requirement_status(requirement,{
+            "education":[{"degree":"Bachelor's","degree_normalized":"bachelor","major":"Computer Science",
+                          "major_normalized":"computer science","currently_enrolled":False,
+                          "graduation_date":"2020-12"}]})
+        self.assertEqual(status,"confirmed_mismatch")
+
+    def test_deterministic_reassessment_archives_previous_result_and_updates_engine_summary(self):
+        key="greenhouse:cloudflare:42"
+        description=("Graduate by Dec 2026. Start full time by January/February 2027. "
+                     "Qualifications: Pursuing a bachelor's or master's degree in computer science. Previous internship experience.")
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET description=? WHERE job_key=?",(description,key))
+            stamp=matcher.now()
+            result=valid_result(education_requirements=[matcher.SkillEvidence(
+                requirement="Pursuing a bachelor's or master's degree in computer science",
+                status="confirmed_mismatch",candidate_evidence=["Bachelors"])])
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,
+                result_json,created_at,updated_at,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','not_eligible',35,?,?,?,'ollama:qwen2.5:3b/job-match-v4-education-window','stale')""",
+                (jobs.USER,key,"resume-v1",result.model_dump_json(),stamp,stamp))
+        reassessed=matcher.reassess_saved_match_result(key)
+        self.assertEqual(reassessed["classification"],"needs_review")
+        self.assertEqual(reassessed["freshness_status"],"current")
+        self.assertIn("current enrollment is not confirmed",reassessed["match"]["education_assessment"])
+        self.assertNotEqual(reassessed["match"]["education_requirements"][0]["status"],"confirmed_mismatch")
+        with jobs.database() as db:
+            row=db.execute("SELECT freshness_status,matching_model_version FROM job_match_results WHERE job_key=?",(key,)).fetchone()
+            archived=db.execute("SELECT count(*) FROM job_match_result_history WHERE job_key=?",(key,)).fetchone()[0]
+        self.assertEqual(row["freshness_status"],"current")
+        self.assertEqual(archived,1)
+
+    def test_deterministic_review_promotes_only_verified_current_preferred_early_career_role(self):
+        result=valid_result(classification="needs_review",match_score=57,missing_information=[],gaps=[],
+            required_skills=[],required_experience=[],education_requirements=[],technical_qualifications=[])
+        job={"job_key":"lever:mytos:job-123","title":"Junior/Mid Software Engineer","company":"Mytos",
+            "description":"Junior/Mid Software Engineer building full-stack cloud software. Remote, hybrid, or in-person.",
+            "location":"London","employment_type":"Full-time","work_arrangement":"Hybrid","location_status":"eligible",
+            "active":1,"availability_status":"current","last_verified_at":"2026-11-05T12:00:00+00:00"}
+        profile={"education":[{"degree":"Bachelor's","major":"Computer Science","graduation_date":"2026-12"}],
+            "projects":[{"name":"Confirmed web application","description":"Built frontend and backend features for a full-stack web application."}],
+            "work_authorization_by_country":[{"country":"United Kingdom","status":"authorized"}]}
+        prefs={"roles":["Software Engineer"],"levels":["New Graduate","Entry Level","Junior"],
+            "employment_types":["Full-time"],"location":"United States","work_arrangement":"Any",
+            "relocation_preference":"anywhere"}
+        changed=matcher._resolve_deterministic_entry_level_review(result,job,profile,"user_reviewed",prefs,True)
+        self.assertTrue(changed)
+        self.assertEqual(result.classification,"potential_match")
+        self.assertIn("authorization is still required",result.explanation)
+
+    def test_deterministic_review_does_not_promote_without_source_or_with_unresolved_requirement(self):
+        job={"job_key":"lever:mytos:job-123","title":"Junior Software Engineer","description":"Junior Software Engineer.",
+            "location":"London","employment_type":"Full-time","work_arrangement":"Hybrid","location_status":"eligible",
+            "active":1,"availability_status":"current","last_verified_at":"2026-11-05T12:00:00+00:00"}
+        profile={"education":[{"degree":"Bachelor's","major":"Computer Science"}]}
+        prefs={"levels":["Junior"],"employment_types":["Full-time"],"location":"United States","work_arrangement":"Any","relocation_preference":"anywhere"}
+        result=valid_result(classification="needs_review",missing_information=[],gaps=[],required_experience=[])
+        self.assertFalse(matcher._resolve_deterministic_entry_level_review(result,job,profile,"user_reviewed",prefs,False))
+        unresolved=valid_result(classification="needs_review",missing_information=[],gaps=[],
+            required_experience=[{"requirement":"2+ years of professional experience","status":"unclear","candidate_evidence":[]}])
+        self.assertFalse(matcher._resolve_deterministic_entry_level_review(unresolved,job,profile,"user_reviewed",prefs,True))
+        self.assertEqual(unresolved.classification,"needs_review")
+
+    def test_deterministic_review_never_infers_foreign_work_authorization_from_relocation(self):
+        job={"job_key":"lever:mytos:job-123","title":"Junior Software Engineer","description":"Junior Software Engineer.",
+            "location":"London","employment_type":"Full-time","work_arrangement":"Hybrid","location_status":"eligible",
+            "active":1,"availability_status":"current","last_verified_at":"2026-11-05T12:00:00+00:00"}
+        profile={"education":[{"degree":"Bachelor's","major":"Computer Science"}],
+            "projects":[{"name":"Confirmed web application","description":"Built frontend and backend features for a full-stack web application."}]}
+        prefs={"levels":["Junior"],"employment_types":["Full-time"],"location":"United States",
+            "work_arrangement":"Any","relocation_preference":"anywhere"}
+        result=valid_result(classification="needs_review",missing_information=[],gaps=[],required_skills=[],
+            required_experience=[],education_requirements=[],technical_qualifications=[])
+        self.assertFalse(matcher._resolve_deterministic_entry_level_review(result,job,profile,"user_reviewed",prefs,True))
+        self.assertEqual(result.classification,"needs_review")
+
+    def test_matching_engine_version_tracks_deterministic_review_semantics(self):
+        self.assertIn("v23-early-career-sponsorship-review",matcher.matching_engine_version())
+
+    def test_sponsorship_requirement_is_country_scoped_and_unknown_is_not_assumed(self):
+        self.assertIsNone(matcher._confirmed_sponsorship_need({},"United States"))
+        self.assertIsNone(matcher._confirmed_sponsorship_need(
+            {"sponsorship_needs_by_country":{"Canada":"yes"}},"United States"))
+        self.assertTrue(matcher._confirmed_sponsorship_need(
+            {"sponsorship_needs_by_country":{"United States":"yes"}},"US"))
+        self.assertFalse(matcher._confirmed_sponsorship_need(
+            {"sponsorship_required_now":"no","sponsorship_required_future":"no"},"US"))
+        profile={"sponsorship_required_now":"yes","education":[]}
+        conflict=matcher._pre_ai_mandatory_conflict({"title":"Software Engineer I",
+            "location":"San Francisco, United States","country":"United States",
+            "content":"This role is not eligible for immigration sponsorship."},profile,"user_reviewed")
+        self.assertIn("employer does not offer sponsorship",conflict)
+        self.assertIsNone(matcher._pre_ai_mandatory_conflict({"title":"Software Engineer I",
+            "location":"San Francisco, United States","country":"United States",
+            "content":"This role is not eligible for immigration sponsorship."},{"education":[]},"user_reviewed"))
+
+    def test_match_progress_targets_session_containing_requested_job(self):
+        stamp=matcher.now()
+        with jobs.database() as db:
+            for sid,key,updated,status in (("unrelated-paused","other:job","2999-01-01T00:00:00+00:00","paused"),
+                                           ("notion-completed","notion:job","2026-10-22T00:00:00+00:00","completed")):
+                db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                    total_jobs,error,created_at,updated_at) VALUES(?,?,?, ?,?,3,1,NULL,?,?)""",
+                    (sid,jobs.USER,"resume-v1",status,json.dumps([key]),stamp,updated))
+        progress=matcher._progress(job_keys=["notion:job"])
+        self.assertEqual(progress["session_id"],"notion-completed")
+        self.assertEqual(progress["status"],"completed")
+
+    def test_stale_result_is_archived_before_reassessment_requeues_it(self):
+        old_result=valid_result(explanation="Historical evidence assessment.").model_dump_json()
+        stamp=matcher.now()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,
+                match_score,result_json,created_at,updated_at,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',66,?,?,?,'ollama:old/job-match-v2','stale')""",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1",old_result,stamp,stamp))
+        feed=[{"id":42,"title":"Software Engineer I","content":"Python required.",
+               "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+               "location":{"name":"San Francisco, CA, United States"},"company_name":"Cloudflare"}]
+        with patch.object(matcher,"fetch_board",return_value=(feed,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        with jobs.database() as db:
+            history=db.execute("SELECT reason,snapshot_json FROM job_match_result_history WHERE job_key=?",
+                               ("greenhouse:cloudflare:42",)).fetchone()
+            current=db.execute("SELECT status,result_json FROM job_match_results WHERE job_key=?",
+                               ("greenhouse:cloudflare:42",)).fetchone()
+        self.assertTrue(response["session_id"])
+        self.assertEqual(history["reason"],"matching_retry_or_stale_reassessment")
+        self.assertIn("Historical evidence assessment",history["snapshot_json"])
+        self.assertEqual(current["status"],"queued")
+        self.assertIsNone(current["result_json"])
 
     def test_missing_required_graduation_and_education_are_needs_review(self):
         profile = {"technical_skills": ["Python"], "education": [{"degree": "B.S."}]}
@@ -193,7 +925,7 @@ class ResumeJobMatcherTests(unittest.TestCase):
             {"title": "New Graduate Software Engineer 2026",
              "description": "Candidates must have graduated by 2026 and hold a bachelor's degree."})
         self.assertEqual(result.classification, "needs_review")
-        self.assertTrue(any("graduation year" in note for note in result.missing_information))
+        self.assertTrue(any("graduation" in note.casefold() and "missing" in note.casefold() for note in result.missing_information))
         no_education = matcher.apply_safety_rules(valid_result(), {"technical_skills": ["Python"]}, "user_reviewed", {},
             {"title": "Software Engineer", "description": "A bachelor's degree is required."})
         self.assertEqual(no_education.classification, "needs_review")
@@ -203,22 +935,369 @@ class ResumeJobMatcherTests(unittest.TestCase):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"response": "not valid JSON"}
-        with patch.object(matcher, "OLLAMA_ATTEMPTS", 2), patch.object(matcher.time, "sleep"), \
+        with patch.object(matcher, "OLLAMA_ATTEMPTS", 3), patch.object(matcher.time, "sleep"), \
              patch.object(matcher.requests, "post", return_value=response) as post:
             with self.assertRaisesRegex(RuntimeError, "malformed match JSON"):
                 matcher.analyze_with_ollama({}, "user_reviewed", {}, {"title": "Role", "content": "Description"})
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_count, matcher.OLLAMA_ATTEMPTS)
+        self.assertEqual(post.call_args.kwargs["json"]["format"]["type"],"object")
+        self.assertIn(matcher.MATCHING_JSON_REPAIR_INSTRUCTION,
+                      post.call_args_list[1].kwargs["json"]["prompt"])
+
+    def test_schema_failure_error_names_invalid_fields_without_echoing_values(self):
+        with self.assertRaisesRegex(ValueError,"classification.*literal_error.*match_score") as caught:
+            matcher._parse_match_text('{"classification":"private-sentinel", "match_score":999}')
+        self.assertNotIn("private-sentinel",str(caught.exception))
+
+    def test_json_parser_recovers_fenced_object_with_surrounding_text(self):
+        parsed=matcher._parse_match_text("Here is the result:\n```json\n"+valid_result().model_dump_json()+"\n```\nDone.")
+        self.assertEqual(parsed.classification,"potential_match")
+
+    def test_gemini_structured_response_uses_server_key_and_validates_schema(self):
+        response=Mock();response.status_code=200
+        response.json.return_value={"candidates":[{"content":{"parts":[{"text":valid_result().model_dump_json()}]}}]}
+        with patch.dict("os.environ",{"GEMINI_API_KEY":"test-secret-key"}),patch.object(matcher.requests,"post",return_value=response) as post:
+            result=matcher.analyze_with_provider({"technical_skills":["Python"]},"user_reviewed",{},
+                {"title":"Software Engineer","content":"Python experience"},provider="gemini")
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(post.call_args.kwargs["headers"]["x-goog-api-key"],"test-secret-key")
+        self.assertNotIn("params",post.call_args.kwargs)
+        self.assertEqual(post.call_args.kwargs["json"]["generationConfig"]["responseMimeType"],"application/json")
+        self.assertEqual(post.call_args.kwargs["json"]["generationConfig"]["responseSchema"]["type"],"OBJECT")
+        self.assertIn("classification",post.call_args.kwargs["json"]["generationConfig"]["responseSchema"]["required"])
+
+    def test_gemini_missing_key_fails_closed_without_request(self):
+        with patch.dict("os.environ",{"GEMINI_API_KEY":""}),patch.object(matcher.requests,"post") as post:
+            with self.assertRaisesRegex(RuntimeError,"GEMINI_API_KEY is not configured"):
+                matcher.analyze_with_provider({},"user_reviewed",{}, {"title":"Role","content":"Description"},provider="gemini")
+        post.assert_not_called()
+
+    def test_groq_matching_uses_free_model_and_validates_structured_json(self):
+        response=Mock();response.status_code=200
+        response.json.return_value={"choices":[{"message":{"content":valid_result().model_dump_json()}}]}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret","GROQ_MODEL":"openai/gpt-oss-20b"}), \
+             patch.object(matcher.requests,"post",return_value=response) as post:
+            result=matcher.analyze_with_provider({"technical_skills":["Python"]},"synthetic-review",{},
+                {"title":"Synthetic Engineer","content":"Synthetic role description."},provider="groq")
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(post.call_args.args[0],"https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(post.call_args.kwargs["json"]["model"],"openai/gpt-oss-20b")
+        self.assertEqual(post.call_args.kwargs["json"]["response_format"],{"type":"json_object"})
+        self.assertEqual(post.call_args.kwargs["json"]["reasoning_effort"],"low")
+        self.assertEqual(post.call_args.kwargs["json"]["max_completion_tokens"],matcher.GROQ_MAX_COMPLETION_TOKENS)
+        self.assertGreater(matcher.GROQ_MAX_COMPLETION_TOKENS,1200)
+        self.assertEqual(post.call_args.kwargs["timeout"],matcher.GROQ_TIMEOUT)
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"],"Bearer synthetic-groq-secret")
+
+    def test_groq_http_400_uses_only_allowlisted_provider_code(self):
+        response=Mock();response.status_code=400
+        response.json.return_value={"error":{"code":"json_validate_failed","message":"private response sentinel"}}
+        self.assertEqual(matcher._groq_safe_http_error_code(response),"structured_output_rejected")
+        response.json.return_value={"error":{"code":"private-sentinel","message":"private response sentinel"}}
+        self.assertEqual(matcher._groq_safe_http_error_code(response),"http_400")
+        self.assertNotIn("private",matcher._groq_safe_http_error_code(response))
+
+    def test_groq_permanent_http_400_is_sanitized_and_not_retried(self):
+        response=Mock();response.status_code=400;response.headers={}
+        response.json.return_value={"error":{"code":"json_validate_failed","message":"private response sentinel"}}
+        response.raise_for_status.side_effect=matcher.requests.HTTPError(response=response)
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post",return_value=response) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic role description."},provider="groq")
+        self.assertEqual(post.call_count,1)
+        self.assertEqual(caught.exception.category,"provider_error")
+        self.assertEqual(caught.exception.status_code,400)
+        self.assertEqual(caught.exception.error_code,"structured_output_rejected")
+        self.assertNotIn("private response",str(caught.exception))
+        self.assertNotIn("synthetic-groq-secret",str(caught.exception))
+
+    def test_groq_provider_http_failure_has_safe_bounded_telemetry(self):
+        response=Mock();response.status_code=503;response.headers={}
+        response.raise_for_status.side_effect=matcher.requests.HTTPError(response=response)
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",return_value=response) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({"name":"Synthetic Candidate"},"user_reviewed",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(post.call_count,2)
+        self.assertEqual(caught.exception.category,"provider_error")
+        self.assertEqual(caught.exception.request_attempts,2)
+        self.assertEqual(caught.exception.retry_count,1)
+        self.assertEqual(caught.exception.status_code,503)
+        self.assertGreaterEqual(caught.exception.response_time_ms,0)
+        self.assertNotIn("synthetic-groq-secret",str(caught.exception))
+        self.assertNotIn("Synthetic Candidate",str(caught.exception))
+
+    def test_groq_timeout_records_bounded_attempt_count_without_exception_text(self):
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",side_effect=[matcher.requests.ReadTimeout("private prompt"),matcher.requests.ReadTimeout("private response")]) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({"name":"Synthetic"},"user_reviewed",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(caught.exception.category,"timeout")
+        self.assertEqual(caught.exception.request_attempts,2)
+        self.assertEqual(caught.exception.retry_count,1)
+        self.assertEqual(post.call_count,2)
+        self.assertNotIn("private prompt",str(caught.exception))
+        self.assertNotIn("private response",str(caught.exception))
+
+    def test_groq_token_limit_and_completion_cap_are_classified_without_body_storage(self):
+        too_large=Mock();too_large.status_code=413;too_large.headers={}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post",return_value=too_large) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(caught.exception.category,"token_limit")
+        self.assertEqual(caught.exception.status_code,413)
+        self.assertEqual(caught.exception.request_attempts,1)
+        self.assertEqual(post.call_count,1)
+        self.assertEqual(matcher._groq_token_limit_response(type("Response",(),{"status_code":400,
+            "json":lambda self:{"error":{"code":"context_length_exceeded","message":"Synthetic context exceeded"}}})()),True)
+
+        truncated=Mock();truncated.status_code=200;truncated.headers={}
+        truncated.json.return_value={"choices":[{"message":{"content":"{}"},"finish_reason":"length"}]}
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post",return_value=truncated):
+            with self.assertRaises(matcher.MatchingProviderError) as clipped:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(clipped.exception.category,"token_limit")
+        self.assertEqual(clipped.exception.error_code,"completion_token_cap")
+
+    def test_match_output_errors_distinguish_invalid_json_from_schema(self):
+        with self.assertRaises(matcher.MatchOutputError) as malformed:
+            matcher._parse_match_text("not a JSON object")
+        self.assertEqual(malformed.exception.category,"invalid_json")
+        with self.assertRaises(matcher.MatchOutputError) as schema:
+            matcher._parse_match_text('{"classification":"potential_match"}')
+        self.assertEqual(schema.exception.category,"schema_error")
+        self.assertNotIn("private-sentinel",str(schema.exception))
+
+    def test_worker_error_diagnostics_are_categorized_and_non_sensitive(self):
+        matcher._record_match_diagnostic(user_id=jobs.USER,session_id="synthetic-session",provider="groq",
+            model="openai/gpt-oss-20b",category="worker_error",request_attempts=0,retry_count=0,
+            error_code="worker_start_failed")
+        with jobs.database() as db:
+            row=db.execute("SELECT category,provider,request_attempts,retry_count,error_code FROM job_match_diagnostics WHERE user_id=? AND session_id=? ORDER BY diagnostic_id DESC LIMIT 1",
+                (jobs.USER,"synthetic-session")).fetchone()
+        self.assertEqual(tuple(row),("worker_error","groq",0,0,"worker_start_failed"))
+
+    def test_observed_runtime_failure_persists_only_safe_provider_diagnostics(self):
+        stamp=matcher.now()
+        job={"id":"synthetic-42","title":"Software Engineer","content":"Python software engineering role."*8,
+             "company_name":"Synthetic Co","absolute_url":"https://jobs.example.test/42",
+             "location":{"name":"United States"},"employment_type":"Full-time","_source_platform":"greenhouse"}
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1",stamp,stamp))
+        with patch.object(matcher,"_find_feed_job",return_value=(job,None)), \
+             patch.object(matcher,"relevance_for_job",return_value=(True,"","")), \
+             patch.object(matcher,"analyze_with_provider",side_effect=RuntimeError("private prompt and response sentinel")):
+            matcher._process_batch(["greenhouse:cloudflare:42"],"resume-v1","user_reviewed",{"technical_skills":["Python"]},
+                                   provider="groq",provider_model="openai/gpt-oss-20b")
+        with jobs.database() as db:
+            row=db.execute("SELECT status,error FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1")).fetchone()
+            diag=db.execute("SELECT provider,model,category,request_attempts,retry_count,response_time_ms,status_code,error_code FROM job_match_diagnostics WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY diagnostic_id DESC LIMIT 1",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1")).fetchone()
+        self.assertEqual(row["status"],"failed")
+        self.assertEqual(diag["category"],"provider_error")
+        self.assertEqual(diag["provider"],"groq")
+        self.assertEqual(diag["request_attempts"],0)
+        self.assertEqual(diag["error_code"],"provider_error")
+        self.assertNotIn("private prompt",row["error"])
+        self.assertNotIn("private prompt",str(dict(diag)))
+
+    def test_deterministic_validation_failure_is_separate_from_provider_failure(self):
+        stamp=matcher.now()
+        job={"id":"synthetic-43","title":"Software Engineer","content":"Python software engineering role."*8,
+             "company_name":"Synthetic Co","absolute_url":"https://jobs.example.test/43",
+             "location":{"name":"United States"},"employment_type":"Full-time","_source_platform":"greenhouse"}
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,"greenhouse:cloudflare:43","resume-v1",stamp,stamp))
+        with patch.object(matcher,"_find_feed_job",return_value=(job,None)), \
+             patch.object(matcher,"relevance_for_job",return_value=(True,"","")), \
+             patch.object(matcher,"analyze_with_provider",return_value=valid_result()), \
+             patch.object(matcher,"apply_safety_rules",side_effect=ValueError("private deterministic evidence")):
+            matcher._process_batch(["greenhouse:cloudflare:43"],"resume-v1","user_reviewed",{"technical_skills":["Python"]},
+                                   provider="groq",provider_model="openai/gpt-oss-20b")
+        with jobs.database() as db:
+            row=db.execute("SELECT status,error FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                (jobs.USER,"greenhouse:cloudflare:43","resume-v1")).fetchone()
+            diag=db.execute("SELECT category,error_code FROM job_match_diagnostics WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY diagnostic_id DESC LIMIT 1",
+                (jobs.USER,"greenhouse:cloudflare:43","resume-v1")).fetchone()
+        self.assertEqual(row["status"],"failed")
+        self.assertEqual(diag["category"],"deterministic_validation")
+        self.assertEqual(diag["error_code"],"deterministic_validation_failed")
+        self.assertNotIn("private deterministic evidence",row["error"])
+
+    def test_groq_matching_without_separate_consent_sends_nothing(self):
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":False,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post") as post:
+            with self.assertRaisesRegex(RuntimeError,"No candidate data was sent"):
+                matcher.analyze_with_provider({"email":"synthetic@example.test"},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        post.assert_not_called()
+
+    def test_groq_rate_limit_retries_are_bounded_and_never_change_provider(self):
+        rate_limit=Mock();rate_limit.status_code=429;rate_limit.headers={"retry-after":"7"}
+        rate_limit.raise_for_status.side_effect=matcher.requests.HTTPError(response=rate_limit)
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",return_value=rate_limit) as post:
+            with self.assertRaisesRegex(matcher.MatchingProviderError,r"Groq rate limit reached") as caught:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(caught.exception.category,"rate_limit")
+        self.assertEqual(post.call_count,1)
+        self.assertTrue(all(call.kwargs["json"]["model"]=="openai/gpt-oss-20b" for call in post.call_args_list))
+
+    def test_gemini_retries_malformed_json_with_repair_instruction(self):
+        bad=Mock();bad.status_code=200;bad.json.return_value={"candidates":[{"content":{"parts":[{"text":"not json"}]}}]}
+        good=Mock();good.status_code=200;good.json.return_value={"candidates":[{"content":{"parts":[{"text":valid_result().model_dump_json()}]}}]}
+        with patch.dict("os.environ",{"GEMINI_API_KEY":"test-secret-key"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",side_effect=[bad,good]) as post:
+            result=matcher.analyze_with_provider({},"user_reviewed",{}, {"title":"Role","content":"Description"},provider="gemini")
+        self.assertEqual(result.classification,"potential_match")
+        self.assertIn(matcher.MATCHING_JSON_REPAIR_INSTRUCTION,post.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"])
+
+    def test_new_matching_checkpoint_pins_selected_provider_and_model(self):
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"matching_provider":"gemini"}),jobs.USER))
+        fake={"id":42,"title":"Software Engineer","content":"Python experience required.",
+              "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+              "location":{"name":"San Francisco, CA, United States"},"employment_type":"Full-time"}
+        with patch.dict("os.environ",{"GEMINI_API_KEY":"test-secret-key"}), \
+             patch.object(matcher,"fetch_board",return_value=([fake],None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            result=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        with jobs.database() as db:
+            session=db.execute("SELECT provider,provider_model FROM job_match_sessions WHERE session_id=?",(result["session_id"],)).fetchone()
+        self.assertEqual(session["provider"],"gemini")
+        self.assertEqual(session["provider_model"],matcher.GEMINI_MODEL)
+        progress=matcher._progress(result["session_id"])
+        self.assertEqual(progress["provider"],"gemini")
+        self.assertEqual(progress["provider_model"],matcher.GEMINI_MODEL)
 
     def test_ollama_timeout_is_retried(self):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"response": valid_result().model_dump_json()}
         with patch.object(matcher.time, "sleep"), \
-             patch.object(matcher.requests, "post", side_effect=[matcher.requests.Timeout("read timeout"), response]) as post:
+             patch.object(matcher.requests, "post", side_effect=[matcher.requests.ConnectTimeout("connect timeout"), response]) as post:
             result = matcher.analyze_with_ollama({"technical_skills": ["Python"]}, "user_reviewed", {},
                                                  {"title": "Software Engineer", "content": "Python"})
         self.assertEqual(result.classification, "potential_match")
         self.assertEqual(post.call_count, 2)
+        self.assertTrue(all(call.kwargs.get("timeout")==matcher.OLLAMA_TIMEOUT for call in post.call_args_list))
+
+    def test_progress_reports_slow_but_live_request_without_recovery(self):
+        from datetime import timedelta
+        stamp=matcher.datetime.now(matcher.timezone.utc)
+        started=(stamp-timedelta(minutes=5)).isoformat()
+        heartbeat=(stamp-timedelta(seconds=5)).isoformat()
+        lease=(stamp+timedelta(minutes=2)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at)
+                VALUES(?,?,'resume-v1','processing',?,?)""",(jobs.USER,"greenhouse:cloudflare:42",started,started))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,
+                current_job_key,current_job_started_at,created_at,updated_at)
+                VALUES('slow-live',?,'resume-v1','running',?,3,1,'wf',?,?,?,?,?,?,?, ?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"]),"live-token",__import__('os').getpid(),
+                 matcher.socket.gethostname(),heartbeat,lease,"greenhouse:cloudflare:42",started,started,heartbeat))
+        progress=matcher._progress("slow-live")
+        self.assertEqual(progress["worker_health"],"slow_processing")
+        self.assertFalse(progress["recovery_available"])
+        self.assertTrue(progress["owner_pid_alive"])
+        self.assertGreaterEqual(progress["current_elapsed_seconds"],300)
+        self.assertEqual(progress["current_job"]["title"],"Software Engineer")
+        self.assertEqual(progress["last_progress_at"],heartbeat)
+
+    def test_legacy_paused_session_displays_latest_successful_checkpoint(self):
+        stamp=matcher.datetime.now(matcher.timezone.utc).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,
+                created_at,updated_at) VALUES(?,?,'resume-v1','completed','needs_review',?,?)""",
+                (jobs.USER,"greenhouse:cloudflare:42",stamp,stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,
+                batch_size,total_jobs,created_at,updated_at) VALUES('legacy-checkpoint',?,'resume-v1','paused',?,3,1,?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"]),stamp,stamp))
+        progress=matcher._progress("legacy-checkpoint")
+        self.assertEqual(progress["status"],"paused")
+        self.assertEqual(progress["last_successful_checkpoint"]["title"],"Software Engineer")
+        self.assertFalse(progress["recovery_available"])
+
+    def test_progress_offers_recovery_only_for_expired_dead_local_owner(self):
+        from datetime import timedelta
+        stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES('dead-progress',?,'resume-v1','running','[]',3,0,'wf','dead-token',99999999,?,?,?, ?,?)""",
+                (jobs.USER,matcher.socket.gethostname(),stale,stale,stale,stale))
+        progress=matcher._progress("dead-progress")
+        self.assertEqual(progress["worker_health"],"stalled_recoverable")
+        self.assertTrue(progress["recovery_available"])
+        with patch.object(matcher,"_pid_is_alive",return_value=True):
+            active=matcher._progress("dead-progress")
+        self.assertFalse(active["recovery_available"])
+        self.assertEqual(active["worker_health"],"heartbeat_late")
+
+    def test_terminal_failed_job_does_not_leave_completed_workflow_session_paused(self):
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher,"analyze_with_ollama",side_effect=RuntimeError("local model timed out")):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+            for _ in range(200):
+                progress=matcher._progress(response["session_id"])
+                if progress["status"]=="completed":break
+                time.sleep(.01)
+        self.assertEqual(progress["status"],"completed")
+        self.assertEqual(progress["failed"],1)
+        self.assertEqual(progress["pending"],0)
+        self.assertIn("failed analyses can be retried",progress["error"])
+
+    def test_recovery_refuses_an_expired_owner_on_an_unverified_remote_host(self):
+        from datetime import timedelta
+        from fastapi import HTTPException
+        stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES('remote-owner',?,'resume-v1','running','[]',3,0,'wf','remote-token',99999999,'other-host',?,?,?,?)""",
+                (jobs.USER,stale,stale,stale,stale))
+        with self.assertRaises(HTTPException) as caught:
+            matcher.recover_match_session("remote-owner",True)
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("another host",caught.exception.detail)
+        with jobs.database() as db:
+            row=db.execute("SELECT status,owner_token FROM job_match_sessions WHERE session_id='remote-owner'").fetchone()
+        self.assertEqual(tuple(row),("running","remote-token"))
 
     def test_ollama_connection_failure_is_retried_and_saved_as_error(self):
         with patch.object(matcher.time, "sleep"), patch.object(matcher.requests, "post",
@@ -227,16 +1306,345 @@ class ResumeJobMatcherTests(unittest.TestCase):
                 matcher.analyze_with_ollama({}, "user_reviewed", {}, {"title": "Software Engineer", "content": "Python"})
         self.assertEqual(post.call_count, matcher.OLLAMA_ATTEMPTS)
 
+    def test_ollama_read_timeout_is_classified_and_not_replayed_automatically(self):
+        with patch.object(matcher.requests,"post",side_effect=matcher.requests.ReadTimeout("private prompt text")) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_ollama({},"user_reviewed",{}, {"title":"Software Engineer","content":"Description"})
+        self.assertEqual(post.call_count,1)
+        self.assertEqual(caught.exception.category,"read_timeout")
+        self.assertIn("120 seconds",str(caught.exception))
+        self.assertNotIn("private prompt text",str(caught.exception))
+
+    def test_ollama_connect_timeout_retries_with_bounded_timeout_configuration(self):
+        response=Mock();response.raise_for_status.return_value=None
+        response.json.return_value={"response":valid_result().model_dump_json()}
+        with patch.object(matcher.time,"sleep"),patch.object(matcher.requests,"post",
+                side_effect=[matcher.requests.ConnectTimeout("connect"),response]) as post:
+            result=matcher.analyze_with_ollama({},"user_reviewed",{}, {"title":"Software Engineer","content":"Description"})
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(post.call_count,2)
+        self.assertEqual(post.call_args.kwargs["timeout"],matcher.OLLAMA_TIMEOUT)
+
+    def test_provider_timeout_environment_values_are_clamped(self):
+        with patch.dict("os.environ",{"BABYSTEPS_OLLAMA_CONNECT_TIMEOUT":"0","BABYSTEPS_OLLAMA_READ_TIMEOUT":"9999"}):
+            self.assertEqual(matcher._bounded_env_float("BABYSTEPS_OLLAMA_CONNECT_TIMEOUT",5,1,20),1)
+            self.assertEqual(matcher._bounded_env_float("BABYSTEPS_OLLAMA_READ_TIMEOUT",120,30,300),300)
+
+    def test_targeted_failed_retry_preserves_paused_sessions_and_completed_history(self):
+        from fastapi import HTTPException
+        fake=self._seed_retryable_failure()
+        with jobs.database() as db:
+            old_keys=json.dumps(["greenhouse:cloudflare:42","greenhouse:cloudflare:99"])
+            db.execute("INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,created_at,updated_at) VALUES('paused-five',?,'resume-v1','paused',?,3,2,?,?)",
+                       (jobs.USER,old_keys,matcher.now(),matcher.now()))
+        with patch.object(matcher,"_revalidate_failed_job",return_value=fake), \
+             patch.object(matcher,"_source_fingerprint",return_value="verified-source"), \
+             patch.object(matcher.executor,"submit",return_value=None) as submit:
+            response=matcher.retry_failed_match(matcher.FailedMatchRetryRequest(job_key="greenhouse:cloudflare:42"))
+        self.assertEqual(response["total"],1)
+        self.assertEqual(response["status"],"queued")
+        submit.assert_called_once()
+        with jobs.database() as db:
+            paused=db.execute("SELECT status,owner_token,job_keys_json FROM job_match_sessions WHERE session_id='paused-five'").fetchone()
+            new=db.execute("SELECT status,job_keys_json,total_jobs FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+            row=db.execute("SELECT status,error FROM job_match_results WHERE job_key='greenhouse:cloudflare:42'").fetchone()
+            archived=db.execute("SELECT reason FROM job_match_result_history WHERE job_key='greenhouse:cloudflare:42'").fetchone()
+        self.assertEqual(tuple(paused),("paused","",old_keys))
+        self.assertEqual(tuple(new),("queued",json.dumps(["greenhouse:cloudflare:42"]),1))
+        self.assertEqual(tuple(row),("queued",None))
+        self.assertEqual(archived["reason"],"explicit_targeted_failed_match_retry")
+
+    def test_workflow_stale_pointer_does_not_hide_legacy_paused_overlap(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,matching_session_id TEXT,diagnostics_json TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-1',?,'legacy-session',?)",
+                       (jobs.USER,json.dumps({"matching":{"status":"blocked","session_id":"legacy-session"}})))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,
+                batch_size,total_jobs,created_at,updated_at,owner_token,lease_expires_at,owner_host,owner_pid,workflow_id)
+                VALUES('legacy-session',?,'resume-v1','paused',?,1,2,'now','now','',NULL,'',NULL,'')""",
+                       (jobs.USER,json.dumps(["job:one","job:two"])))
+            conflict=matcher._matching_conflict(db,["job:one","job:two","job:three"],
+                "workflow-1",matcher.now())
+            exact=matcher._matching_conflict(db,["job:one","job:two"],"workflow-1",matcher.now())
+        self.assertEqual(conflict["code"],"legacy_checkpoint_overlap")
+        self.assertEqual(conflict["overlap_count"],2)
+        self.assertIsNone(exact)
+
+    def test_explicit_cancel_preserves_results_for_ownerless_paused_checkpoint(self):
+        from fastapi import HTTPException
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,
+                batch_size,total_jobs,created_at,updated_at,workflow_id,owner_token,owner_host,cancel_requested)
+                VALUES('approved-old-session',?,'resume-v1','paused',?,3,1,'2026-11-05','2026-11-05','', '', '',0)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,
+                match_score,created_at,updated_at,freshness_status) VALUES(?,?,?,'completed','needs_review',68,
+                '2026-11-05','2026-11-05','stale')""",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1"))
+        with self.assertRaises(HTTPException):
+            matcher.cancel_paused_checkpoint("approved-old-session")
+        result=matcher.cancel_paused_checkpoint("approved-old-session",confirmed=True)
+        self.assertEqual(result["status"],"cancelled")
+        self.assertEqual(result["preserved_job_count"],1)
+        with jobs.database() as db:
+            session=db.execute("SELECT status,cancel_requested FROM job_match_sessions WHERE session_id='approved-old-session'").fetchone()
+            saved=db.execute("SELECT status,classification,match_score,freshness_status FROM job_match_results WHERE job_key='greenhouse:cloudflare:42'").fetchone()
+        self.assertEqual(tuple(session),("cancelled",1))
+        self.assertEqual(tuple(saved),("completed","needs_review",68,"stale"))
+
+    def test_interrupted_groq_checkpoint_resumes_existing_session_and_stops_after_three_jobs(self):
+        from concurrent.futures import ThreadPoolExecutor
+        keys=[f"greenhouse:cloudflare:{number}" for number in range(42,47)]
+        stamp=matcher.now();profile_status,profile=matcher.active_candidate()[1:]
+        saved_prefs=matcher.preferences() or {}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b",
+                    "allow_groq_cloud_ai":True,"standing_policy_enabled":True,"standing_policy_allow_groq":True}),jobs.USER))
+            for index,key in enumerate(keys[1:],43):
+                db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (jobs.USER,key,"Cloudflare","Software Engineer","United States",f"https://job-boards.greenhouse.io/cloudflare/jobs/{index}",stamp,
+                     "Software Engineer building full-stack products and backend services. "*8,"greenhouse",str(index)))
+            first=db.execute("SELECT * FROM discovered_openings WHERE job_key=?",(keys[0],)).fetchone()
+            completed=valid_result()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',68,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,keys[0],"resume-v1",completed.model_dump_json(),stamp,stamp,
+                 matcher.profile_fingerprint(profile,"resume-v1"),matcher.stable_fingerprint(saved_prefs),
+                 matcher.job_fingerprint(dict(first)),matcher.matching_engine_version("groq","openai/gpt-oss-20b")))
+            for key in keys[1:]:
+                db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                           (jobs.USER,key,"resume-v1",stamp,stamp))
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,diagnostics_json TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('synthetic-workflow',?,'{}')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,
+                created_at,updated_at,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,
+                provider,provider_model,stop_after_batch,error)
+                VALUES('synthetic-interrupted',?,'resume-v1','interrupted',?,3,5,?,?, 'synthetic-workflow','',NULL,'',NULL,NULL,
+                'groq','openai/gpt-oss-20b',0,'RuntimeError: matching worker could not start; retry may resume from this checkpoint.')""",
+                (jobs.USER,json.dumps(keys),stamp,stamp))
+        synthetic_job={"id":"42","title":"Software Engineer","content":"Software Engineer building full-stack products and backend services. "*8,
+            "content_fingerprint":"synthetic-content","absolute_url":"https://job-boards.greenhouse.io/cloudflare/jobs/42",
+            "location":{"name":"United States"},"company_name":"Cloudflare","_source_platform":"greenhouse","_search_prompt":"software engineer jobs"}
+        calls=[]
+        def analyze(*_args,**_kwargs):
+            calls.append(True)
+            return valid_result()
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}), \
+             patch.object(matcher,"_find_feed_job",return_value=(synthetic_job,None)), \
+             patch.object(matcher,"analyze_with_provider",side_effect=analyze):
+            with jobs.database() as db:
+                db.execute("""UPDATE job_match_sessions SET status='queued',owner_token='synthetic-owner',owner_pid=?,owner_host=?,
+                    heartbeat_at=?,lease_expires_at=?,stop_after_batch=1 WHERE session_id='synthetic-interrupted'""",
+                    (os.getpid(),matcher.socket.gethostname(),stamp,matcher._match_lease_expiry()))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(matcher._session_worker,"synthetic-interrupted","resume-v1",profile_status,profile,
+                    "synthetic-owner","groq","openai/gpt-oss-20b").result(timeout=10)
+            with jobs.database() as db:
+                row=db.execute("SELECT status,owner_token,stop_after_batch,error FROM job_match_sessions WHERE session_id='synthetic-interrupted'").fetchone()
+                counts={r[0]:r[1] for r in db.execute("SELECT status,count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) GROUP BY status",(json.dumps(keys),))}
+            self.assertEqual(tuple(row),("paused","",0,"bounded_initial_batch_complete"))
+            self.assertEqual(counts,{"completed":4,"queued":1})
+            self.assertEqual(len(calls),3)
+            with jobs.database() as db:
+                db.execute("""UPDATE job_match_sessions SET status='queued',owner_token='restart-owner',owner_pid=?,owner_host=?,
+                    heartbeat_at=?,lease_expires_at=? WHERE session_id='synthetic-interrupted'""",
+                    (os.getpid(),matcher.socket.gethostname(),stamp,matcher._match_lease_expiry()))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(matcher._session_worker,"synthetic-interrupted","resume-v1",profile_status,profile,
+                    "restart-owner","groq","openai/gpt-oss-20b").result(timeout=10)
+        with jobs.database() as db:
+            sessions=db.execute("SELECT count(*) FROM job_match_sessions WHERE workflow_id='synthetic-workflow'").fetchone()[0]
+            status=db.execute("SELECT status FROM job_match_sessions WHERE session_id='synthetic-interrupted'").fetchone()[0]
+            completed=db.execute("SELECT count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) AND status='completed'",(json.dumps(keys),)).fetchone()[0]
+        self.assertEqual((sessions,status,completed),(1,"completed",5))
+        self.assertEqual(len(calls),4)
+
+    def test_process_shutdown_checkpoint_recovers_in_fresh_worker_process_without_duplicate_session(self):
+        from starlette.requests import Request
+        keys=[f"greenhouse:cloudflare:{number}" for number in range(42,47)]
+        settings={"allow_ai_matching":True,"allow_automatic_discovery":True,"matching_provider":"groq",
+            "groq_model":"openai/gpt-oss-20b","allow_groq_cloud_ai":True,"standing_policy_enabled":True,
+            "standing_policy_allow_groq":True,"standing_policy_daily_limit":3}
+        stamp=matcher.now();old_workflow_db=workflow.DB;workflow.DB=jobs.DB
+        workflow.initialize()
+        profile_status,profile=matcher.active_candidate()[1:]
+        saved_prefs=matcher.preferences() or {}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",(json.dumps(settings),jobs.USER))
+            with db:
+                for number,key in enumerate(keys,42):
+                    if number==42:
+                        db.execute("UPDATE discovered_openings SET description=?,source_id=?,content_fingerprint=? WHERE job_key=?",
+                            ("Software Engineer building full-stack products and backend services. "*8,str(number),"synthetic-v1",key))
+                    else:
+                        db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id,content_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (jobs.USER,key,"Cloudflare","Software Engineer","United States",f"https://job-boards.greenhouse.io/cloudflare/jobs/{number}",stamp,
+                             "Software Engineer building full-stack products and backend services. "*8,"greenhouse",str(number),"synthetic-v1"))
+            db.execute("""INSERT INTO user_workflows(workflow_id,user_id,prompt,status,current_stage,resume_id,resume_version,
+                profile_version,preferences_version,job_keys_json,diagnostics_json,discovered_count,created_at,updated_at)
+                VALUES('process-workflow',?,'synthetic software roles','running','matching','resume-v1','resume-v1','profile-v1',1,?,?,5,?,?)""",
+                (jobs.USER,json.dumps(keys),json.dumps({"workflow_preferences":saved_prefs,"discovery_status":"completed"}),stamp,stamp))
+            for index,key in enumerate(keys):
+                if index==0:
+                    opening=db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(jobs.USER,key)).fetchone()
+                    result=valid_result()
+                    db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                        created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                        VALUES(?,?,?,'completed','needs_review',68,?,?,?,?,?,?,?,'current')""",
+                        (jobs.USER,key,"resume-v1",result.model_dump_json(),stamp,stamp,matcher.profile_fingerprint(profile,"resume-v1"),
+                         matcher.stable_fingerprint(saved_prefs),matcher.job_fingerprint(dict(opening)),
+                         matcher.matching_engine_version("groq","openai/gpt-oss-20b")))
+                else:
+                    db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                        (jobs.USER,key,"resume-v1",stamp,stamp))
+        synthetic_jobs={key:{"id":key.rsplit(":",1)[1],"title":"Software Engineer",
+            "content":"Software Engineer building full-stack products and backend services. "*8,
+            "content_fingerprint":"synthetic-v1","absolute_url":f"https://job-boards.greenhouse.io/cloudflare/jobs/{key.rsplit(":",1)[1]}",
+            "location":{"name":"United States"},"company_name":"Cloudflare","_source_platform":"greenhouse",
+            "_search_prompt":"software engineer jobs"} for key in keys}
+        def fetch_synthetic(key,_cache):return synthetic_jobs[key],None
+        context=multiprocessing.get_context("fork");out=context.Queue();child=context.Process(
+            target=_simulate_process_shutdown_match_start,args=(str(jobs.DB),"process-workflow",keys,out))
+        try:
+            with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}), \
+                 patch.object(matcher,"_find_feed_job",side_effect=fetch_synthetic):
+                child.start();child.join(10)
+                self.assertFalse(child.is_alive())
+                self.assertEqual(child.exitcode,0)
+                child_result=out.get(timeout=2)
+                self.assertEqual(child_result[0],"HTTPException")
+                self.assertEqual(child_result[2],"RuntimeError: interpreter shutdown; matching worker could not start; retry may resume from this checkpoint.")
+                with jobs.database() as db:
+                    interrupted=db.execute("SELECT session_id,status,owner_token,total_jobs FROM job_match_sessions WHERE workflow_id='process-workflow'").fetchone()
+                    self.assertEqual(tuple(interrupted[1:]),("interrupted","",5))
+                    before=db.execute("SELECT status,count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) GROUP BY status",(json.dumps(keys),)).fetchall()
+                    self.assertEqual({r[0]:r[1] for r in before},{"completed":1,"queued":4})
+                calls=[]
+                def fake_analyze(*_args,**_kwargs):calls.append(True);return valid_result()
+                scope={"type":"http","asgi":{"version":"3.0","spec_version":"2.3"},"http_version":"1.1",
+                    "method":"POST","scheme":"http","path":"/api/workflows/process-workflow/resume",
+                    "raw_path":b"/api/workflows/process-workflow/resume","query_string":b"","headers":[],
+                    "client":("127.0.0.1",54321),"server":("127.0.0.1",8000)}
+                request=Request(scope)
+                with patch.object(workflow.application_answer_assistant,"get_authorization",return_value={"version":9,"settings":settings}), \
+                     patch.object(workflow,"_standing_policy_current",return_value=True), \
+                     patch.object(workflow.resume_job_matcher,"_groq_authorization_blocker",return_value=""), \
+                     patch.object(workflow,"_authorization",return_value=settings), \
+                     patch.object(workflow,"_ensure_snapshot"), \
+                     patch.object(workflow.application_agent,"resume_processing"), \
+                     patch.object(workflow.job_description_enricher,"connect",workflow.database), \
+                     patch.object(workflow.job_description_enricher,"usable_description",return_value=True), \
+                     patch.object(matcher,"_find_feed_job",side_effect=fetch_synthetic), \
+                     patch.object(matcher,"analyze_with_provider",side_effect=fake_analyze):
+                    response=workflow.resume_workflow("process-workflow",request)
+                    self.assertEqual(response["workflow"]["current_stage"],"matching")
+                    deadline=time.monotonic()+10
+                    while time.monotonic()<deadline:
+                        current=workflow._row("process-workflow")
+                        if current["status"] in {"paused","completed","failed"}:break
+                        time.sleep(.05)
+                self.assertEqual(current["status"],"paused")
+                self.assertEqual(len(calls),3)
+                with jobs.database() as db:
+                    matching_sessions=db.execute("SELECT session_id,status,total_jobs FROM job_match_sessions WHERE workflow_id='process-workflow'").fetchall()
+                    result_counts={r[0]:r[1] for r in db.execute("SELECT status,count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) GROUP BY status",(json.dumps(keys),))}
+                self.assertEqual(len(matching_sessions),1)
+                self.assertEqual(matching_sessions[0]["session_id"],interrupted["session_id"])
+                self.assertEqual((matching_sessions[0]["status"],matching_sessions[0]["total_jobs"]),("paused",5))
+                self.assertEqual(result_counts,{"completed":4,"queued":1})
+        finally:
+            if child.is_alive():child.terminate();child.join(2)
+            workflow.DB=old_workflow_db
+
+    def test_targeted_retry_refuses_completed_current_match_without_duplicate(self):
+        from fastapi import HTTPException
+        fake=self._seed_retryable_failure(status="completed")
+        with jobs.database() as db:
+            db.execute("UPDATE job_match_results SET freshness_status='current',classification='needs_review' WHERE job_key='greenhouse:cloudflare:42'")
+        with patch.object(matcher,"_revalidate_failed_job",return_value=fake), \
+             patch.object(matcher,"_source_fingerprint",return_value="verified-source"), \
+             patch.object(matcher.executor,"submit") as submit:
+            with self.assertRaises(HTTPException) as caught:
+                matcher.retry_failed_match(matcher.FailedMatchRetryRequest(job_key="greenhouse:cloudflare:42"))
+        self.assertEqual(caught.exception.status_code,409)
+        submit.assert_not_called()
+
+    def test_targeted_retry_refuses_when_another_worker_owns_the_slot(self):
+        from fastapi import HTTPException
+        fake=self._seed_retryable_failure()
+        stamp=matcher.now()
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at) VALUES('owned',?,'resume-v1','running','[]',3,0,'worker-token',?,'local',?,?,?,?)",
+                       (jobs.USER,os.getpid(),stamp,matcher._match_lease_expiry(),stamp,stamp))
+        with patch.object(matcher,"_revalidate_failed_job",return_value=fake), \
+             patch.object(matcher,"_source_fingerprint",return_value="verified-source"), \
+             patch.object(matcher.executor,"submit") as submit:
+            with self.assertRaises(HTTPException) as caught:
+                matcher.retry_failed_match(matcher.FailedMatchRetryRequest(job_key="greenhouse:cloudflare:42"))
+        self.assertEqual(caught.exception.status_code,409)
+        submit.assert_not_called()
+        with jobs.database() as db:self.assertEqual(db.execute("SELECT status FROM job_match_results WHERE job_key='greenhouse:cloudflare:42'").fetchone()[0],"failed")
+
+    def test_targeted_retry_does_not_send_confirmed_mandatory_conflict_to_ai(self):
+        from fastapi import HTTPException
+        fake=self._seed_retryable_failure()
+        fake["content"]="A master's degree in Computer Science is required. "+fake["content"]
+        with patch.object(matcher,"_revalidate_failed_job",return_value=fake), \
+             patch.object(matcher.executor,"submit") as submit:
+            with self.assertRaises(HTTPException) as caught:
+                matcher.retry_failed_match(matcher.FailedMatchRetryRequest(job_key="greenhouse:cloudflare:42"))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("mandatory qualification",caught.exception.detail)
+        submit.assert_not_called()
+
+    def test_retry_revalidation_blocks_expired_posting_before_network(self):
+        from fastapi import HTTPException
+        self._seed_retryable_failure()
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET active=0,availability_status='expired' WHERE job_key='greenhouse:cloudflare:42'")
+        with patch.object(matcher,"fetch_source") as fetch:
+            with self.assertRaises(HTTPException) as caught:matcher._revalidate_failed_job("greenhouse:cloudflare:42")
+        self.assertEqual(caught.exception.status_code,409)
+        fetch.assert_not_called()
+
+    def test_retry_revalidation_requires_current_public_feed_and_unchanged_content(self):
+        from fastapi import HTTPException
+        from job_connectors import EmployerSource,normalize_job
+        fake=self._seed_retryable_failure()
+        source=EmployerSource("Cloudflare","greenhouse","cloudflare","https://careers.example.com","United States")
+        raw={"id":42,"title":"Software Engineer","content":fake["content"],
+             "absolute_url":"https://job-boards.greenhouse.io/cloudflare/jobs/42",
+             "location":{"name":"San Francisco, CA, United States"}}
+        normalized=normalize_job("greenhouse",source,raw)
+        with jobs.database() as db:
+            db.execute("UPDATE discovered_openings SET content_fingerprint=? WHERE job_key='greenhouse:cloudflare:42'",
+                       (normalized["content_fingerprint"],))
+        with patch.object(matcher,"_source_fingerprint",return_value="verified-source"), \
+             patch.object(matcher,"fetch_source",return_value=([raw],None)) as fetch:
+            current=matcher._revalidate_failed_job("greenhouse:cloudflare:42")
+        self.assertEqual(current["content_fingerprint"],normalized["content_fingerprint"])
+        fetch.assert_called_once()
+        changed={**raw,"content":raw["content"]+" Additional updated requirement."}
+        with patch.object(matcher,"_source_fingerprint",return_value="verified-source"), \
+             patch.object(matcher,"fetch_source",return_value=([changed],None)):
+            with self.assertRaises(HTTPException) as caught:
+                matcher._revalidate_failed_job("greenhouse:cloudflare:42")
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertIn("posting changed",caught.exception.detail)
+
     def test_successful_verified_match_is_structured_and_grounded(self):
         response = Mock()
         response.raise_for_status.return_value = None
-        response.json.return_value = {"response": valid_result().model_dump_json()}
-        job = {"title": "Software Engineer", "content": "Python experience required."}
+        response.json.return_value = {"response": valid_result(
+            employment_type_assessment="The posting does not specify employment type.").model_dump_json()}
+        job = {"title": "Software Engineer I", "content": "Python experience required."}
         with patch.object(matcher.requests, "post", return_value=response) as post:
             model_result = matcher.analyze_with_ollama({"technical_skills": ["Python"]}, "user_reviewed", {}, job)
-        final = matcher.apply_safety_rules(model_result, {"technical_skills": ["Python"]}, "user_reviewed", {}, job)
+        final = matcher.apply_safety_rules(model_result, {"technical_skills": ["Python"]}, "user_reviewed", {"roles":["Software Engineer"]}, job)
         self.assertEqual(final.classification, "potential_match")
-        self.assertEqual(final.match_score, 84)
+        self.assertEqual(final.match_score, 74)
         self.assertIn("Python experience required", post.call_args.kwargs["json"]["prompt"])
 
     def test_feed_description_cache_reuses_downloaded_payload(self):
@@ -270,6 +1678,22 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertNotIn("resume_id", public)
         self.assertNotIn("job_key", public)
 
+    def test_batch_persists_selected_gemini_engine_version(self):
+        fake_job={"id":42,"title":"Software Engineer","content":"Python experience required.",
+                  "location":{"name":"San Francisco, CA, United States"},"metadata":[{"name":"Employment Type","value":"Full-time"}]}
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued','2026-01-01','2026-01-01')",
+                       (jobs.USER,"greenhouse:cloudflare:42","resume-v1"))
+        with patch.object(matcher,"fetch_board",return_value=([fake_job],None)), \
+             patch.object(matcher,"analyze_with_provider",return_value=valid_result()):
+            matcher._process_batch(["greenhouse:cloudflare:42"],"resume-v1","user_reviewed",{"technical_skills":["Python"]},
+                                   provider="gemini",provider_model=matcher.GEMINI_MODEL)
+        with jobs.database() as db:
+            result=db.execute("SELECT matching_model_version,freshness_status FROM job_match_results WHERE job_key=?",
+                              ("greenhouse:cloudflare:42",)).fetchone()
+        self.assertEqual(result["matching_model_version"],matcher.matching_engine_version("gemini",matcher.GEMINI_MODEL))
+        self.assertEqual(result["freshness_status"],"current")
+
     def test_analyze_matches_queues_only_saved_job_for_active_resume(self):
         fake_job = {"id": 42, "title": "Software Engineer", "content": "Python experience required.",
                     "location": {"name": "San Francisco, CA, United States"}, "metadata": [{"name": "Employment Type", "value": "Full-time"}]}
@@ -286,6 +1710,57 @@ class ResumeJobMatcherTests(unittest.TestCase):
                 time.sleep(0.01)
         self.assertEqual(rows[0]["status"], "completed")
 
+    def test_targeted_atoms_analysis_creates_a_single_job_session(self):
+        key="greenhouse:cssmerge:8687930002"
+        with jobs.database() as db:
+            db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES(?,?,?,?,?,?,?)",
+                (jobs.USER,key,"ATOMS Careers page","Software Engineer - New Grad","Multiple Locations Available",
+                 "https://job-boards.greenhouse.io/cssmerge/jobs/8687930002",matcher.now()))
+        fake_job={"id":"8687930002","title":"Software Engineer - New Grad","content":"Python experience required.",
+            "absolute_url":"https://job-boards.greenhouse.io/cssmerge/jobs/8687930002","location":{"name":"Multiple Locations Available"},
+            "company_name":"ATOMS Careers page","_source_platform":"greenhouse"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)),patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=[key],batch_size=3))
+        self.assertEqual(response["status"],"queued")
+        with jobs.database() as db:
+            session=db.execute("SELECT status,job_keys_json,total_jobs FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+        self.assertEqual(session["status"],"queued")
+        self.assertEqual(json.loads(session["job_keys_json"]),[key])
+        self.assertEqual(session["total_jobs"],1)
+
+    def test_unrelated_active_56_job_session_returns_structured_conflict_unchanged(self):
+        import os,socket
+        from fastapi import HTTPException
+        key="greenhouse:cssmerge:8687930002";stamp=matcher.now();session_id="live-56-batch"
+        unrelated=[f"greenhouse:other:{i}" for i in range(56)]
+        with jobs.database() as db:
+            db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES(?,?,?,?,?,?,?)",
+                (jobs.USER,key,"ATOMS Careers page","Software Engineer - New Grad","United States",
+                 "https://job-boards.greenhouse.io/cssmerge/jobs/8687930002",stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,
+                workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES(?,?,'resume-v1','running',?,3,56,'','live-owner',?,?,?,?,?,?)""",
+                (session_id,jobs.USER,json.dumps(unrelated),os.getpid(),socket.gethostname(),stamp,
+                 "2999-01-01T00:00:00+00:00",stamp,stamp))
+        fake_job={"id":"8687930002","title":"Software Engineer - New Grad","content":"Python experience required.",
+            "absolute_url":"https://job-boards.greenhouse.io/cssmerge/jobs/8687930002","location":{"name":"United States"},
+            "company_name":"ATOMS Careers page","_source_platform":"greenhouse"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)):
+            with self.assertRaises(HTTPException) as caught:
+                matcher.analyze_matches(matcher.MatchRequest(job_keys=[key],batch_size=3))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertEqual(caught.exception.detail["code"],"active_worker")
+        self.assertEqual(caught.exception.detail["same_jobs"],False)
+        self.assertEqual(caught.exception.detail["status"],"running")
+        self.assertEqual(caught.exception.detail["total_jobs"],56)
+        with jobs.database() as db:
+            old=db.execute("SELECT status,job_keys_json,owner_token FROM job_match_sessions WHERE session_id=?",(session_id,)).fetchone()
+            atoms=db.execute("SELECT COUNT(*) FROM job_match_sessions WHERE user_id=? AND job_keys_json LIKE ?",(jobs.USER,f"%{key}%")).fetchone()[0]
+        self.assertEqual(old["status"],"running")
+        self.assertEqual(json.loads(old["job_keys_json"]),unrelated)
+        self.assertEqual(old["owner_token"],"live-owner")
+        self.assertEqual(atoms,0)
+
     def test_ai_matching_requires_explicit_application_authorization(self):
         from fastapi import HTTPException
         with jobs.database() as db:
@@ -295,6 +1770,288 @@ class ResumeJobMatcherTests(unittest.TestCase):
             matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
         self.assertEqual(caught.exception.status_code,403)
         self.assertIn("Application settings",caught.exception.detail)
+
+    def test_unrelated_paused_legacy_session_does_not_block_new_workflow(self):
+        with jobs.database() as db:
+            old_keys=[f"greenhouse:cloudflare:old-{i}" for i in range(56)]
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,created_at,updated_at) VALUES('legacy-paused',?,'resume-v1','paused',?,3,56,'old','old')""",
+                (jobs.USER,json.dumps(old_keys)))
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,resume_id TEXT,current_stage TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-new',?,'resume-v1','matching')",(jobs.USER,))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python experience required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None) as submit:
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]),workflow_id="workflow-new")
+        self.assertEqual(response["status"],"queued")
+        self.assertTrue(response["session_id"])
+        self.assertEqual(submit.call_count,1)
+        with jobs.database() as db:
+            old=db.execute("SELECT status,owner_token FROM job_match_sessions WHERE session_id='legacy-paused'").fetchone()
+            new=db.execute("SELECT status,workflow_id,owner_token FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+        self.assertEqual(tuple(old),("paused",""))
+        self.assertEqual(new["status"],"queued")
+        self.assertEqual(new["workflow_id"],"workflow-new")
+        self.assertTrue(new["owner_token"])
+
+    def test_linked_subset_checkpoint_attaches_to_full_workflow_selection(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,matching_session_id TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('wf-retry',?, 'retry-session')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,created_at,updated_at)
+                VALUES('retry-session',?,'resume-v1','paused',?,3,1,'old','old')""",(jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+            requested=["greenhouse:cloudflare:42","greenhouse:cloudflare:43"]
+            self.assertIsNone(matcher._matching_conflict(db,requested,"wf-retry",matcher.now()))
+            attached=matcher._attach_workflow_checkpoint(db,"wf-retry",requested,matcher.now())
+            self.assertEqual(attached["workflow_id"],"wf-retry")
+            self.assertEqual(json.loads(attached["job_keys_json"]),requested)
+            self.assertEqual(attached["total_jobs"],2)
+
+    def test_workflow_never_attaches_a_checkpoint_owned_by_another_workflow(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,matching_session_id TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('wf-new',?, 'session-old')",(jobs.USER,))
+            db.execute("INSERT INTO user_workflows VALUES('wf-old',?, '')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,created_at,updated_at) VALUES('session-old',?,'resume-v1','paused',?,3,1,'wf-old','old','old')""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+            attached=matcher._attach_workflow_checkpoint(db,"wf-new",["greenhouse:cloudflare:42"],matcher.now())
+            self.assertIsNone(attached)
+            owner=db.execute("SELECT workflow_id,status FROM job_match_sessions WHERE session_id='session-old'").fetchone()
+            self.assertEqual(tuple(owner),("wf-old","paused"))
+
+    def test_matching_resume_does_not_reclaim_another_workflows_exact_paused_session(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,resume_id TEXT,matching_session_id TEXT,current_stage TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('wf-new',?,'resume-v1','session-old','matching')",(jobs.USER,))
+            db.execute("INSERT INTO user_workflows VALUES('wf-old',?,'resume-v1',NULL,'matching')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,created_at,updated_at) VALUES('session-old',?,'resume-v1','paused',?,3,1,'wf-old','old','old')""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]),workflow_id="wf-new")
+        self.assertNotEqual(response["session_id"],"session-old")
+        with jobs.database() as db:
+            old=db.execute("SELECT status,workflow_id,owner_token FROM job_match_sessions WHERE session_id='session-old'").fetchone()
+            new=db.execute("SELECT workflow_id,status FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+        self.assertEqual(tuple(old),("paused","wf-old",""))
+        self.assertEqual(tuple(new),("wf-new","queued"))
+
+    def test_legacy_active_session_requires_explicit_aged_recovery(self):
+        from datetime import timedelta
+        from fastapi import HTTPException
+        stamp=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=5)).isoformat()
+        with jobs.database() as db:
+            db.execute("""CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,status TEXT,
+                current_stage TEXT,pause_requested INTEGER,diagnostics_json TEXT,updated_at TEXT)""")
+            db.execute("INSERT INTO user_workflows VALUES('legacy-workflow',?,'running','matching',0,'{}',?)",
+                       (jobs.USER,stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,created_at,updated_at) VALUES('legacy-running',?,'resume-v1','running',?,3,1,'legacy-workflow',?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"]),stamp,stamp))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            with self.assertRaises(HTTPException) as caught:
+                matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertEqual(caught.exception.detail["code"],"legacy_unowned")
+        with self.assertRaises(HTTPException) as caught:
+            matcher.recover_match_session("legacy-running",False)
+        self.assertEqual(caught.exception.status_code,422)
+        recovered=matcher.recover_match_session("legacy-running",True)
+        self.assertTrue(recovered["recovered"])
+        with jobs.database() as db:
+            row=db.execute("SELECT status,job_keys_json FROM job_match_sessions WHERE session_id='legacy-running'").fetchone()
+            workflow=db.execute("SELECT status,current_stage,pause_requested FROM user_workflows WHERE workflow_id='legacy-workflow'").fetchone()
+        self.assertEqual(row["status"],"interrupted")
+        self.assertEqual(json.loads(row["job_keys_json"]),["greenhouse:cloudflare:42"])
+        self.assertEqual(tuple(workflow),("paused","matching",1))
+
+    def test_expired_dead_owner_is_interrupted_and_processing_checkpoint_requeued(self):
+        from datetime import timedelta
+        stale=(matcher.datetime.now(matcher.timezone.utc)-timedelta(minutes=6)).isoformat()
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at)
+                VALUES(?,?,'resume-v1','processing',?,?)""",(jobs.USER,"greenhouse:cloudflare:stale",stale,stale))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,
+                total_jobs,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at)
+                VALUES('dead-owner',?,'resume-v1','running',?,3,1,'','dead-token',99999999,?,?,?, ?,?)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:stale"]),matcher.socket.gethostname(),stale,stale,stale,stale))
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))
+        self.assertEqual(response["status"],"queued")
+        with jobs.database() as db:
+            session=db.execute("SELECT status,owner_token,job_keys_json FROM job_match_sessions WHERE session_id='dead-owner'").fetchone()
+            result=db.execute("SELECT status FROM job_match_results WHERE job_key='greenhouse:cloudflare:stale'").fetchone()
+        self.assertEqual(session["status"],"interrupted")
+        self.assertEqual(session["owner_token"],"")
+        self.assertEqual(result["status"],"queued")
+        self.assertEqual(json.loads(session["job_keys_json"]),["greenhouse:cloudflare:stale"])
+
+    def test_concurrent_matching_acquisition_has_one_owner(self):
+        import threading
+        from fastapi import HTTPException
+        gate=threading.Barrier(2);results=[]
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        def run():
+            gate.wait()
+            try:results.append(("ok",matcher.analyze_matches(matcher.MatchRequest(job_keys=["greenhouse:cloudflare:42"]))))
+            except HTTPException as error:results.append(("conflict",error.detail.get("code") if isinstance(error.detail,dict) else error.detail))
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            threads=[threading.Thread(target=run) for _ in range(2)]
+            for thread in threads:thread.start()
+            for thread in threads:thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sum(item[0]=="ok" for item in results),1)
+        self.assertEqual(sum(item[0]=="conflict" for item in results),1)
+        with jobs.database() as db:
+            owned=db.execute("SELECT COUNT(*) FROM job_match_sessions WHERE user_id=? AND status IN ('queued','running','paused') AND owner_token<>''",(jobs.USER,)).fetchone()[0]
+        self.assertEqual(owned,1)
+
+    def test_two_processes_cannot_acquire_distinct_matching_workers(self):
+        from fastapi import HTTPException
+        ctx=multiprocessing.get_context("fork")
+        barrier=ctx.Barrier(2);results=ctx.Queue()
+        fake_job={"id":42,"title":"Software Engineer","content":"Python required.",
+                  "absolute_url":"https://boards.greenhouse.io/cloudflare/jobs/42",
+                  "location":{"name":"San Francisco, CA, United States"},"_source_platform":"greenhouse",
+                  "company_name":"Cloudflare","_search_prompt":"software engineering jobs"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fake_job,None)), \
+             patch.object(matcher.executor,"submit",return_value=None):
+            processes=[ctx.Process(target=_process_match_claim,args=(str(jobs.DB),barrier,results)) for _ in range(2)]
+            for process in processes:process.start()
+            outcomes=[results.get(timeout=10) for _ in processes]
+            for process in processes:process.join(10)
+        self.assertTrue(all(process.exitcode==0 for process in processes))
+        self.assertEqual(sum(result[0]=="ok" for result in outcomes),1)
+        self.assertEqual(sum(result[0]=="error" for result in outcomes),1)
+        with jobs.database() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM job_match_sessions WHERE status IN ('queued','running','paused') AND owner_token<>''").fetchone()[0],1)
+
+    def test_twelve_discovered_jobs_match_in_one_owned_workflow_session(self):
+        keys=[f"greenhouse:cloudflare:batch-{i}" for i in range(12)]
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,resume_id TEXT,current_stage TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-12',?,'resume-v1','matching')",(jobs.USER,))
+            for i,key in enumerate(keys):
+                db.execute("""INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at)
+                    VALUES(?,?,'Cloudflare','Software Engineer','San Francisco, CA, United States',?,?)""",
+                    (jobs.USER,key,f"https://boards.greenhouse.io/cloudflare/jobs/{i}","2026-10-20"))
+        def fake_find(key,_cache):
+            external=key.rsplit(':',1)[-1]
+            return ({"id":external,"title":"Software Engineer","content":"Python experience required.",
+                "absolute_url":f"https://boards.greenhouse.io/cloudflare/jobs/{external}",
+                "location":{"name":"San Francisco, CA, United States"},"employment_type":"Full-time",
+                "country":"United States","workplaceType":"On-site","_source_platform":"greenhouse",
+                "company_name":"Cloudflare","_search_prompt":"software engineering jobs"},None)
+        with patch.object(matcher,"_find_feed_job",side_effect=fake_find), \
+             patch.object(matcher,"analyze_with_ollama",return_value=valid_result()) as model:
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3),workflow_id="workflow-12")
+            self.assertEqual(response["status"],"queued")
+            for _ in range(500):
+                progress=matcher._progress(response["session_id"])
+                if progress["status"] in {"completed","paused","interrupted"}:break
+                time.sleep(.01)
+        self.assertEqual(progress["status"],"completed",progress)
+        self.assertEqual(progress["completed"],12)
+        self.assertEqual(progress["pending"],0)
+        self.assertEqual(model.call_count,12)
+        self.assertEqual({item["job_key"] for item in progress["results"]},set(keys))
+        retry=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3),workflow_id="workflow-12")
+        self.assertEqual(retry["session_id"],response["session_id"])
+        self.assertEqual(retry["status"],"completed")
+        self.assertEqual(model.call_count,12)
+        with jobs.database() as db:
+            row=db.execute("SELECT workflow_id,status FROM job_match_sessions WHERE session_id=?",(response["session_id"],)).fetchone()
+            saved=db.execute("SELECT COUNT(*) FROM job_match_results WHERE user_id=? AND job_key IN (SELECT value FROM json_each(?)) AND status='completed'",
+                             (jobs.USER,json.dumps(keys))).fetchone()[0]
+        self.assertEqual(tuple(row),("workflow-12","completed"))
+        self.assertEqual(saved,12)
+
+    def test_bounded_workflow_resume_preserves_failed_results_without_retrying_them(self):
+        failed_key="greenhouse:cloudflare:42"
+        queued_key="greenhouse:cloudflare:43"
+        deferred_key="greenhouse:cloudflare:44"
+        failed_job=self._seed_retryable_failure()
+        keys=[failed_key,queued_key,deferred_key]
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,resume_id TEXT,current_stage TEXT,matching_session_id TEXT,diagnostics_json TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-preserve',?,'resume-v1','matching','session-preserve','{}')",(jobs.USER,))
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id,active,availability_status,content_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (jobs.USER,queued_key,"Cloudflare","Software Engineer","United States","https://job-boards.greenhouse.io/cloudflare/jobs/43",matcher.now(),
+                 "Software Engineer building backend services and customer-facing web applications. "*8,"greenhouse","43",1,"current","queued-fingerprint"))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,queued_key,"resume-v1",matcher.now(),matcher.now()))
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id,active,availability_status,content_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (jobs.USER,deferred_key,"Cloudflare","Software Engineer","United States","https://job-boards.greenhouse.io/cloudflare/jobs/44",matcher.now(),
+                 "Software Engineer building backend services and customer-facing web applications. "*8,"greenhouse","44",1,"current","deferred-fingerprint"))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,deferred_key,"resume-v1",matcher.now(),matcher.now()))
+            db.execute("INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,workflow_id,created_at,updated_at,provider,provider_model) VALUES('session-preserve',?,'resume-v1','paused',?,3,3,'workflow-preserve',?,?, 'ollama','qwen2.5:3b')",
+                (jobs.USER,json.dumps(keys),matcher.now(),matcher.now()))
+        fresh_job={**failed_job,"id":"43","content_fingerprint":"queued-fingerprint",
+            "absolute_url":"https://job-boards.greenhouse.io/cloudflare/jobs/43"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fresh_job,None)) as feed, \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3,preserve_failed=True,bounded_resume=True),
+                                             workflow_id="workflow-preserve")
+        self.assertEqual(response["session_id"],"session-preserve")
+        self.assertEqual(feed.call_count,2)
+        self.assertEqual([call.args[0] for call in feed.call_args_list],[queued_key,deferred_key])
+        with jobs.database() as db:
+            failed=db.execute("SELECT status,error FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                               (jobs.USER,failed_key,"resume-v1")).fetchone()
+            queued=db.execute("SELECT status FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                               (jobs.USER,queued_key,"resume-v1")).fetchone()
+            deferred=db.execute("SELECT status FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                                (jobs.USER,deferred_key,"resume-v1")).fetchone()
+            archived=db.execute("SELECT COUNT(*) FROM job_match_result_history WHERE user_id=? AND job_key=?",
+                                (jobs.USER,failed_key)).fetchone()[0]
+        self.assertEqual(tuple(failed),("failed","Local model read timeout"))
+        self.assertEqual(queued["status"],"queued")
+        self.assertEqual(deferred["status"],"queued")
+        self.assertEqual(archived,0)
+
+    def test_bounded_worker_uses_saved_checkpoint_order_not_sqlite_result_order(self):
+        keys=[f"greenhouse:cloudflare:ordered-{index}" for index in range(4)]
+        token="synthetic-owner-token"
+        stamp=matcher.now()
+        with jobs.database() as db:
+            for key in reversed(keys):
+                db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                    (jobs.USER,key,"resume-v1",stamp,stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,
+                workflow_id,owner_token,owner_pid,created_at,updated_at,provider,provider_model,stop_after_batch)
+                VALUES('ordered-session',?,'resume-v1','queued',?,3,4,'workflow-order',?,NULL,?,?, 'ollama','qwen2.5:3b',1)""",
+                (jobs.USER,json.dumps(keys),token,stamp,stamp))
+        batches=[]
+        with patch.object(matcher,"_process_batch",side_effect=lambda batch,*args,**kwargs:batches.append(list(batch))):
+            matcher._session_worker("ordered-session","resume-v1","user_reviewed",{},token,"ollama","qwen2.5:3b")
+        self.assertEqual(batches,[keys[:3]])
+        with jobs.database() as db:
+            row=db.execute("SELECT status,stop_after_batch,owner_token,error FROM job_match_sessions WHERE session_id='ordered-session'").fetchone()
+        self.assertEqual(tuple(row),("paused",0,"","bounded_initial_batch_complete"))
 
     def test_unrelated_saved_jobs_are_excluded_before_ollama(self):
         with jobs.database() as db:
@@ -308,26 +2065,35 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(result["excluded"], 1)
         ollama.assert_not_called()
 
-    def test_session_batches_pause_resume_without_repeating_completed_jobs(self):
+    def test_session_pause_resume_preserves_completed_jobs_and_ownership(self):
         for job_id in (142, 143, 144, 145):
             with jobs.database() as db:
                 db.execute("INSERT INTO discovered_openings (user_id,job_key,company,title,location,url,discovered_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (
                     jobs.USER, f"greenhouse:cloudflare:{job_id}", "Cloudflare", "Software Engineer",
                     "San Francisco, CA, United States", f"https://boards.greenhouse.io/cloudflare/jobs/{job_id}", "2026-01-01"))
         feed = [{"id": job_id, "title": "Software Engineer", "content": "Python required."} for job_id in (142, 143, 144, 145)]
+        model_started=threading.Event();continue_model=threading.Event();calls=[]
+        def model_call(*_args):
+            calls.append(1)
+            if len(calls)==1:
+                model_started.set();continue_model.wait(5)
+            return valid_result()
         with patch.object(matcher, "fetch_board", return_value=(feed, None)), \
-             patch.object(matcher, "analyze_with_ollama", return_value=valid_result()) as model:
+             patch.object(matcher, "analyze_with_ollama", side_effect=model_call) as model:
             response = matcher.analyze_matches(matcher.MatchRequest(job_keys=[f"greenhouse:cloudflare:{i}" for i in (142, 143, 144, 145)], batch_size=3))
+            self.assertTrue(model_started.wait(2))
+            matcher.pause_matches(session_id=response["session_id"])
+            continue_model.set()
             for _ in range(100):
-                progress = matcher.get_match_progress()
-                if progress["status"] == "paused":
+                progress = matcher._progress(response["session_id"])
+                if progress["status"] == "paused" and progress["owner_state"]=="unowned":
                     break
                 time.sleep(0.01)
-            self.assertEqual(progress["completed"], 3)
-            self.assertEqual(progress["pending"], 1)
-            matcher.resume_matches()
+            self.assertEqual(progress["completed"], 1)
+            self.assertEqual(progress["pending"], 3)
+            matcher.resume_matches(session_id=response["session_id"])
             for _ in range(100):
-                progress = matcher.get_match_progress()
+                progress = matcher._progress(response["session_id"])
                 if progress["status"] == "completed":
                     break
                 time.sleep(0.01)
