@@ -19,6 +19,7 @@ import application_agent as app_agent
 import candidate_verification as profile
 import application_answer_assistant as answer_assistant
 import resume_job_matcher as matcher
+import job_search_agent as jobs
 from job_search_agent import USER
 
 
@@ -183,7 +184,8 @@ class ApplicationAgentTests(unittest.TestCase):
         self.old_db,self.old_storage=app_agent.DB,app_agent.STORAGE
         self.old_profile_db=profile.DB
         self.old_assistant_db=answer_assistant.DB
-        app_agent.DB=self.db; app_agent.STORAGE=self.storage; profile.DB=self.db; answer_assistant.DB=self.db
+        self.old_jobs_db=jobs.DB
+        app_agent.DB=self.db; app_agent.STORAGE=self.storage; profile.DB=self.db; answer_assistant.DB=self.db; jobs.DB=self.db
         with app_agent.connect() as db:
             db.execute("CREATE TABLE resumes(id TEXT PRIMARY KEY,user_id TEXT,stored_name TEXT,original_name TEXT,created_at TEXT,active INTEGER,extracted_text TEXT)")
             db.execute("INSERT INTO resumes VALUES('r1',?,'r1.pdf','Resume.pdf','2026-01-01',1,'')",(USER,))
@@ -219,7 +221,7 @@ class ApplicationAgentTests(unittest.TestCase):
 
     def tearDown(self):
         self.submit_patch.stop(); self.patch_playwright.stop()
-        app_agent.DB=self.old_db; app_agent.STORAGE=self.old_storage; profile.DB=self.old_profile_db; answer_assistant.DB=self.old_assistant_db
+        app_agent.DB=self.old_db; app_agent.STORAGE=self.old_storage; profile.DB=self.old_profile_db; answer_assistant.DB=self.old_assistant_db; jobs.DB=self.old_jobs_db
         if self.old_key_path is None: os.environ.pop("BABYSTEPSAI_KEY_PATH",None)
         else: os.environ["BABYSTEPSAI_KEY_PATH"]=self.old_key_path
         self.temp.cleanup()
@@ -235,6 +237,26 @@ class ApplicationAgentTests(unittest.TestCase):
         if path=="/api/applications": return app_agent.list_applications()
         if path=="/api/applications/progress": return app_agent.application_progress()
         if path=="/api/applications/saved-jobs": return app_agent.list_saved_application_jobs()
+        if path=="/api/applications/attention": return app_agent.list_application_attention()
+
+    def test_attention_handoff_is_deduplicated_by_canonical_opening_without_attempt(self):
+        base={"company":"Same Employer","title":"Entry Level Software Engineer",
+              "job_url":"https://jobs.greenhouse.io/same/123","application_url":"https://jobs.greenhouse.io/same/123"}
+        first={**base,"job_key":"greenhouse:first-board:123"}
+        second={**base,"job_key":"greenhouse:second-board:123",
+                "job_url":"https://jobs.greenhouse.io/another/123","application_url":"https://jobs.greenhouse.io/another/123"}
+        one=app_agent._record_application_attention(first,"unsupported_form","No supported form was exposed.",
+            eligibility_state="needs_review",form_state="unsupported",report={"form_fingerprint":"synthetic-form-v1"})
+        two=app_agent._record_application_attention(second,"unsupported_form","No supported form was exposed.",
+            eligibility_state="needs_review",form_state="unsupported",report={"form_fingerprint":"synthetic-form-v1"})
+        self.assertEqual(one,two)
+        listing=app_agent.list_application_attention()
+        self.assertEqual(listing["count"],1)
+        self.assertEqual(listing["items"][0]["job_key"],second["job_key"])
+        self.assertEqual(listing["items"][0]["preparation_state"],"not_prepared")
+        with app_agent.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM applications").fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts").fetchone()[0],0)
 
     def _save_evidence_review_fixture(self, description, *, years=0):
         key="review-authentic-"+str(time.time_ns())
@@ -1052,13 +1074,23 @@ class ApplicationAgentTests(unittest.TestCase):
         settings={"standing_policy_enabled":True,"standing_policy_excluded_employers":[],
             "standing_policy_categories":["Software Engineering"],"standing_policy_employment_types":["Full-time"],
             "standing_policy_countries":["United States"],"standing_policy_locations":["Anywhere"],
-            "standing_policy_work_arrangements":["Remote"],"standing_policy_experience_levels":["New Graduate"]}
+            "standing_policy_work_arrangements":["Any"],"standing_policy_experience_levels":["New Graduate"]}
         with (patch.object(app_agent,"get_authorization",return_value={"settings":settings}),
               patch.object(app_agent,"_standing_policy_still_current",return_value=True)):
             stale=app_agent._standing_policy_blocker({"active":False,"availability_status":"unknown"})
             incomplete=app_agent._standing_policy_blocker({"active":True,"availability_status":"current","career_category":""})
+            explicit_title={"active":True,"availability_status":"current","career_category":"","title":"Full-Stack Software Engineer — New Grad",
+                "company":"Synthetic Employer","employment_type":"full-time","country":"United States","location":"San Francisco",
+                "work_arrangement":"OnSite","last_verified_at":"2099-01-01T00:00:00+00:00"}
+            with patch.object(matcher,"_verified_saved_employer_source",return_value=True):
+                title_fallback=app_agent._standing_policy_blocker(explicit_title)
+                taxonomy_alias=app_agent._standing_policy_blocker({**explicit_title,"career_category":"Software Development"})
+                unknown_arrangement=app_agent._standing_policy_blocker({**explicit_title,"work_arrangement":""})
         self.assertIn("inactive or is not verified",stale)
         self.assertIn("category is outside or missing",incomplete)
+        self.assertEqual(title_fallback,"")
+        self.assertEqual(taxonomy_alias,"")
+        self.assertIn("Work arrangement is outside or missing",unknown_arrangement)
 
     def test_authorized_rolling_limit_remains_source_of_truth_on_dashboard(self):
         answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(max_applications_per_24_hours=7))
@@ -1156,6 +1188,12 @@ class ApplicationAgentTests(unittest.TestCase):
             db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
                 ("inspection-external",USER,key,"ashby","compatible",json.dumps(report),stamp))
         return key,url
+
+    def _refresh_fixture_match_engine(self,key):
+        """Keep consent tests focused on provider authorization, not stale fixtures."""
+        with app_agent.connect() as db:
+            db.execute("UPDATE job_match_results SET matching_model_version=? WHERE user_id=? AND job_key=?",
+                (matcher.matching_engine_version(),USER,key))
 
     def test_unassessed_plaintext_requirements_block_authorization_and_preparation(self):
         description=("What You'll Bring: Proven product builder able to ship software at scale. "
@@ -1261,6 +1299,7 @@ class ApplicationAgentTests(unittest.TestCase):
         key,url=self._make_external_eligible_job()
         answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(
             allow_automated_form_preparation=True,allow_ai_drafting=True,matching_provider="gemini"))
+        self._refresh_fixture_match_engine(key)
         with patch.object(app_agent,"validate_application_url"),patch.dict(os.environ,{"GEMINI_API_KEY":"test-key"}):
             plan=app_agent.preparation_authorization_plan(key)
             with self.assertRaises(HTTPException) as caught:
@@ -1276,6 +1315,7 @@ class ApplicationAgentTests(unittest.TestCase):
             matching_provider="groq",groq_model="openai/gpt-oss-20b")
         with patch.dict(os.environ,{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(app_agent,"validate_application_url"):
             answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(**base))
+            self._refresh_fixture_match_engine(key)
             plan=app_agent.preparation_authorization_plan(key)
             request=app_agent.PreparationAuthorizationRequest(confirmed=True,confirmed_employer=plan["employer"],
                 confirmed_title=plan["title"],confirmed_application_url=plan["application_url"],
@@ -1840,7 +1880,7 @@ class ApplicationAgentTests(unittest.TestCase):
             result=json.loads(db.execute(
                 "SELECT result_json FROM job_match_results WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0])
         unmapped=app_agent._unmapped_required_posting_items(description,result)
-        self.assertEqual(len(unmapped),4)
+        self.assertEqual(len(unmapped),3)
         self.assertTrue(any("web applications" in item for item in unmapped))
         with patch.object(matcher,"active_candidate",return_value=("r1","user_reviewed",profile_data)), \
              patch.object(matcher,"preferences",return_value=prefs):
@@ -1864,11 +1904,67 @@ class ApplicationAgentTests(unittest.TestCase):
             "What You'll Do\nPartner with customers to deliver high-quality features.\n"
             "We are hiring new graduates available to start between winter 2026 and summer 2027.")
         unmapped=app_agent._unmapped_required_posting_items(description,{})
-        self.assertEqual(len(unmapped),3)
-        self.assertTrue(any("product builder" in item for item in unmapped))
+        self.assertEqual(len(unmapped),2)
+        self.assertFalse(any("product builder" in item for item in unmapped))
+        self.assertTrue(any("full-stack fluency" in item.casefold() for item in unmapped))
         self.assertTrue(any("available to start" in item for item in unmapped))
         self.assertFalse(any("nice-to-have" in item for item in unmapped))
         self.assertFalse(any("Partner with customers" in item for item in unmapped))
+
+    def test_qualitative_requirements_are_nonblocking_context_but_objective_facts_stay_mandatory(self):
+        description=("Requirements\n"
+            "Customer empathy and product thinking.\n"
+            "High ownership, low ego, and strong communication and collaboration.\n"
+            "Full-stack fluency with React, TypeScript, and Python.\n"
+            "Experience delivering software across multiple release cycles.\n"
+            "We need to hire new graduates available to start between winter 2026 and summer 2027.")
+        unmapped=app_agent._unmapped_required_posting_items(description,{})
+        self.assertFalse(any(app_agent._is_qualitative_employer_expectation(item) for item in unmapped))
+        self.assertTrue(any("full-stack fluency" in item.casefold() for item in unmapped))
+        self.assertTrue(any("multiple release cycles" in item.casefold() for item in unmapped))
+        self.assertTrue(any("available to start" in item.casefold() for item in unmapped))
+        soft_only={
+            "required_skills":[{"requirement":"Customer empathy and product thinking","status":"gap"}],
+            "missing_information":["Technical qualification needs confirmation: Technical evidence (customer work): Describe one confirmed stakeholder example."],
+            "classification":"needs_review",
+            "technical_qualifications":[
+                {"requirement":"Customer empathy: Track record of translating stakeholder goals into crisp technical specs and delightful products","requiredness":"required","status":"needs_review","missing_question":"Technical evidence (customer work): Describe one confirmed stakeholder example."},
+                {"requirement":"Founder‑level ownership: You run toward ambiguity and see failures as data","requiredness":"required","status":"needs_review"},
+                {"requirement":"Excellent communicator","requiredness":"required","status":"needs_review"}]}
+        self.assertFalse(app_agent._unresolved_mandatory(json.dumps(soft_only)))
+        assessment=app_agent._eligibility_review_assessment({},soft_only)
+        self.assertEqual(assessment["mandatory_unresolved"],[])
+        qualitative=[item["requirement"] for item in assessment["employer_uncertainties"] if item["category"]=="qualitative_employer_expectation"]
+        self.assertTrue(any("Customer empathy" in item for item in qualitative))
+        self.assertTrue(any("Founder" in item for item in qualitative))
+        self.assertTrue(any("communicator" in item for item in qualitative))
+        self.assertFalse(any(item["category"]=="missing_applicant_information" for item in assessment["blockers"]))
+        objective={**soft_only,"required_experience":[{"requirement":"3 years of professional software experience","status":"unclear"}]}
+        self.assertTrue(app_agent._unresolved_mandatory(json.dumps(objective)))
+
+    def test_flattened_agave_requirements_stop_before_challenges_and_respect_exceptions(self):
+        description=("Requirements - Exceptional college grads with strong intern/co-op experience, ideally from a top undergraduate program - "
+            "Bachelor’s Degree in Computer Science earned November 2026 - June 2027 - Self-motivated, high ownership, low ego; "
+            "desire to work on a fast-paced, intense, fun team. Pumped to work in-person with us in SF 5 days/week. - "
+            "No need to have: prior experience with our tech stack or at B2B SaaS/API company Interesting technical challenges? - "
+            "Unification: we’re unifying dozens-to-hundreds of fragmented systems under a single standard.")
+        unmapped=app_agent._unmapped_required_posting_items(description,{"location_assessment":"on-site in San Francisco"})
+        joined=" ".join(unmapped).casefold()
+        self.assertIn("strong intern/co-op experience",joined)
+        self.assertNotIn("ideally from a top undergraduate",joined)
+        self.assertIn("bachelor’s degree in computer science",joined)
+        self.assertIn("june 2027",joined)
+        self.assertNotIn("product builder",joined)
+        self.assertNotIn("no need to have",joined)
+        self.assertNotIn("prior experience with our tech stack",joined)
+        self.assertNotIn("unification",joined)
+        composite={"location_assessment":"Confirmed willingness to relocate anywhere is compatible with this location; work authorization is evaluated separately.",
+            "education_requirements":[{"requirement":"Requirements - Exceptional college grads with strong intern/co-op experience, ideally from a top undergraduate university - Bachelor’s Degree in Computer Science earned November 2026 - June 2027 - Self-motivated, high ownership, low ego","status":"met"}]}
+        unresolved=app_agent._unmapped_required_posting_items(description,composite)
+        self.assertTrue(any("strong intern/co-op experience" in item.casefold() for item in unresolved))
+        self.assertTrue(any("bachelor’s degree in computer science" in item.casefold() for item in unresolved))
+        self.assertFalse(any("self-motivated" in item.casefold() for item in unresolved))
+        self.assertFalse(any("in-person" in item.casefold() for item in unresolved))
 
     def test_start_window_is_considered_assessed_only_with_explicit_availability_assessment(self):
         description="We need to hire new graduates available to start between winter of 2026 and summer of 2027."
@@ -1876,6 +1972,10 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertTrue(any("available to start" in item for item in missing))
         assessed={"availability_assessment":{"status":"needs_review","requirement":"available to start between winter of 2026 and summer of 2027"}}
         self.assertEqual(app_agent._unmapped_required_posting_items(description,assessed),[])
+        flattened="Requirements - We need to hire multiple new graduate engineers available to start between winter of 2026 and summer of 2027."
+        self.assertEqual(app_agent._unmapped_required_posting_items(flattened,assessed),[])
+        unresolved={"availability_assessment":{**assessed["availability_assessment"],"requiredness":"required"}}
+        self.assertTrue(app_agent._unresolved_mandatory(json.dumps(unresolved)))
 
     def test_technical_evidence_answer_requires_specific_confirmation_and_reassesses_without_ai(self):
         key,profile_data,prefs=self._save_evidence_review_fixture(

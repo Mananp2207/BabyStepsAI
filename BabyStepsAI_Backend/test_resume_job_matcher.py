@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import job_search_agent as jobs
 import resume_job_matcher as matcher
+import workflow_orchestrator as workflow
 from job_relevance import extract_technical_qualification_requirements
 
 
@@ -43,11 +44,32 @@ def _process_match_claim(db_path,barrier,result_queue):
         result_queue.put(("error",getattr(error,"detail",type(error).__name__)))
 
 
+def _simulate_process_shutdown_match_start(db_path,workflow_id,keys,result_queue):
+    import concurrent.futures.thread as futures_thread
+    jobs.DB=Path(db_path)
+    futures_thread._shutdown=True
+    try:
+        matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3,stop_after_batch=True),workflow_id=workflow_id)
+        result_queue.put(("unexpected_success",None,None))
+    except Exception as error:
+        with jobs.database() as db:
+            session=db.execute("SELECT session_id,status,error FROM job_match_sessions WHERE user_id=? AND workflow_id=? ORDER BY updated_at DESC LIMIT 1",
+                               (jobs.USER,workflow_id)).fetchone()
+            try:diagnostics=json.loads(db.execute("SELECT diagnostics_json FROM user_workflows WHERE workflow_id=?",(workflow_id,)).fetchone()[0] or "{}")
+            except (TypeError,IndexError,json.JSONDecodeError):diagnostics={}
+            diagnostics["failure"]="The matching worker could not start. Its checkpoint is saved; resume matching to retry."
+            db.execute("UPDATE user_workflows SET status='failed',current_stage='failed',diagnostics_json=? WHERE workflow_id=?",
+                       (json.dumps(diagnostics),workflow_id))
+        result_queue.put((type(error).__name__,session["session_id"] if session else None,
+                          session["error"] if session else None))
+
+
 class ResumeJobMatcherTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.old_db = jobs.DB
         jobs.DB = Path(self.tempdir.name) / "matcher.sqlite3"
+        with matcher._groq_rate_lock:matcher._groq_rate_state.clear()
         with jobs.database() as db:
             db.executescript("""
                 CREATE TABLE resumes (id TEXT PRIMARY KEY, user_id TEXT, created_at TEXT, active INTEGER);
@@ -964,8 +986,166 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(post.call_args.args[0],"https://api.groq.com/openai/v1/chat/completions")
         self.assertEqual(post.call_args.kwargs["json"]["model"],"openai/gpt-oss-20b")
         self.assertEqual(post.call_args.kwargs["json"]["response_format"],{"type":"json_object"})
+        self.assertEqual(post.call_args.kwargs["json"]["reasoning_effort"],"low")
+        self.assertEqual(post.call_args.kwargs["json"]["max_completion_tokens"],matcher.GROQ_MAX_COMPLETION_TOKENS)
+        self.assertGreater(matcher.GROQ_MAX_COMPLETION_TOKENS,1200)
         self.assertEqual(post.call_args.kwargs["timeout"],matcher.GROQ_TIMEOUT)
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"],"Bearer synthetic-groq-secret")
+
+    def test_groq_http_400_uses_only_allowlisted_provider_code(self):
+        response=Mock();response.status_code=400
+        response.json.return_value={"error":{"code":"json_validate_failed","message":"private response sentinel"}}
+        self.assertEqual(matcher._groq_safe_http_error_code(response),"structured_output_rejected")
+        response.json.return_value={"error":{"code":"private-sentinel","message":"private response sentinel"}}
+        self.assertEqual(matcher._groq_safe_http_error_code(response),"http_400")
+        self.assertNotIn("private",matcher._groq_safe_http_error_code(response))
+
+    def test_groq_permanent_http_400_is_sanitized_and_not_retried(self):
+        response=Mock();response.status_code=400;response.headers={}
+        response.json.return_value={"error":{"code":"json_validate_failed","message":"private response sentinel"}}
+        response.raise_for_status.side_effect=matcher.requests.HTTPError(response=response)
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post",return_value=response) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic role description."},provider="groq")
+        self.assertEqual(post.call_count,1)
+        self.assertEqual(caught.exception.category,"provider_error")
+        self.assertEqual(caught.exception.status_code,400)
+        self.assertEqual(caught.exception.error_code,"structured_output_rejected")
+        self.assertNotIn("private response",str(caught.exception))
+        self.assertNotIn("synthetic-groq-secret",str(caught.exception))
+
+    def test_groq_provider_http_failure_has_safe_bounded_telemetry(self):
+        response=Mock();response.status_code=503;response.headers={}
+        response.raise_for_status.side_effect=matcher.requests.HTTPError(response=response)
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",return_value=response) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({"name":"Synthetic Candidate"},"user_reviewed",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(post.call_count,2)
+        self.assertEqual(caught.exception.category,"provider_error")
+        self.assertEqual(caught.exception.request_attempts,2)
+        self.assertEqual(caught.exception.retry_count,1)
+        self.assertEqual(caught.exception.status_code,503)
+        self.assertGreaterEqual(caught.exception.response_time_ms,0)
+        self.assertNotIn("synthetic-groq-secret",str(caught.exception))
+        self.assertNotIn("Synthetic Candidate",str(caught.exception))
+
+    def test_groq_timeout_records_bounded_attempt_count_without_exception_text(self):
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",side_effect=[matcher.requests.ReadTimeout("private prompt"),matcher.requests.ReadTimeout("private response")]) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({"name":"Synthetic"},"user_reviewed",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(caught.exception.category,"timeout")
+        self.assertEqual(caught.exception.request_attempts,2)
+        self.assertEqual(caught.exception.retry_count,1)
+        self.assertEqual(post.call_count,2)
+        self.assertNotIn("private prompt",str(caught.exception))
+        self.assertNotIn("private response",str(caught.exception))
+
+    def test_groq_token_limit_and_completion_cap_are_classified_without_body_storage(self):
+        too_large=Mock();too_large.status_code=413;too_large.headers={}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post",return_value=too_large) as post:
+            with self.assertRaises(matcher.MatchingProviderError) as caught:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(caught.exception.category,"token_limit")
+        self.assertEqual(caught.exception.status_code,413)
+        self.assertEqual(caught.exception.request_attempts,1)
+        self.assertEqual(post.call_count,1)
+        self.assertEqual(matcher._groq_token_limit_response(type("Response",(),{"status_code":400,
+            "json":lambda self:{"error":{"code":"context_length_exceeded","message":"Synthetic context exceeded"}}})()),True)
+
+        truncated=Mock();truncated.status_code=200;truncated.headers={}
+        truncated.json.return_value={"choices":[{"message":{"content":"{}"},"finish_reason":"length"}]}
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post",return_value=truncated):
+            with self.assertRaises(matcher.MatchingProviderError) as clipped:
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(clipped.exception.category,"token_limit")
+        self.assertEqual(clipped.exception.error_code,"completion_token_cap")
+
+    def test_match_output_errors_distinguish_invalid_json_from_schema(self):
+        with self.assertRaises(matcher.MatchOutputError) as malformed:
+            matcher._parse_match_text("not a JSON object")
+        self.assertEqual(malformed.exception.category,"invalid_json")
+        with self.assertRaises(matcher.MatchOutputError) as schema:
+            matcher._parse_match_text('{"classification":"potential_match"}')
+        self.assertEqual(schema.exception.category,"schema_error")
+        self.assertNotIn("private-sentinel",str(schema.exception))
+
+    def test_worker_error_diagnostics_are_categorized_and_non_sensitive(self):
+        matcher._record_match_diagnostic(user_id=jobs.USER,session_id="synthetic-session",provider="groq",
+            model="openai/gpt-oss-20b",category="worker_error",request_attempts=0,retry_count=0,
+            error_code="worker_start_failed")
+        with jobs.database() as db:
+            row=db.execute("SELECT category,provider,request_attempts,retry_count,error_code FROM job_match_diagnostics WHERE user_id=? AND session_id=? ORDER BY diagnostic_id DESC LIMIT 1",
+                (jobs.USER,"synthetic-session")).fetchone()
+        self.assertEqual(tuple(row),("worker_error","groq",0,0,"worker_start_failed"))
+
+    def test_observed_runtime_failure_persists_only_safe_provider_diagnostics(self):
+        stamp=matcher.now()
+        job={"id":"synthetic-42","title":"Software Engineer","content":"Python software engineering role."*8,
+             "company_name":"Synthetic Co","absolute_url":"https://jobs.example.test/42",
+             "location":{"name":"United States"},"employment_type":"Full-time","_source_platform":"greenhouse"}
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1",stamp,stamp))
+        with patch.object(matcher,"_find_feed_job",return_value=(job,None)), \
+             patch.object(matcher,"relevance_for_job",return_value=(True,"","")), \
+             patch.object(matcher,"analyze_with_provider",side_effect=RuntimeError("private prompt and response sentinel")):
+            matcher._process_batch(["greenhouse:cloudflare:42"],"resume-v1","user_reviewed",{"technical_skills":["Python"]},
+                                   provider="groq",provider_model="openai/gpt-oss-20b")
+        with jobs.database() as db:
+            row=db.execute("SELECT status,error FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1")).fetchone()
+            diag=db.execute("SELECT provider,model,category,request_attempts,retry_count,response_time_ms,status_code,error_code FROM job_match_diagnostics WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY diagnostic_id DESC LIMIT 1",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1")).fetchone()
+        self.assertEqual(row["status"],"failed")
+        self.assertEqual(diag["category"],"provider_error")
+        self.assertEqual(diag["provider"],"groq")
+        self.assertEqual(diag["request_attempts"],0)
+        self.assertEqual(diag["error_code"],"provider_error")
+        self.assertNotIn("private prompt",row["error"])
+        self.assertNotIn("private prompt",str(dict(diag)))
+
+    def test_deterministic_validation_failure_is_separate_from_provider_failure(self):
+        stamp=matcher.now()
+        job={"id":"synthetic-43","title":"Software Engineer","content":"Python software engineering role."*8,
+             "company_name":"Synthetic Co","absolute_url":"https://jobs.example.test/43",
+             "location":{"name":"United States"},"employment_type":"Full-time","_source_platform":"greenhouse"}
+        with jobs.database() as db:
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,"greenhouse:cloudflare:43","resume-v1",stamp,stamp))
+        with patch.object(matcher,"_find_feed_job",return_value=(job,None)), \
+             patch.object(matcher,"relevance_for_job",return_value=(True,"","")), \
+             patch.object(matcher,"analyze_with_provider",return_value=valid_result()), \
+             patch.object(matcher,"apply_safety_rules",side_effect=ValueError("private deterministic evidence")):
+            matcher._process_batch(["greenhouse:cloudflare:43"],"resume-v1","user_reviewed",{"technical_skills":["Python"]},
+                                   provider="groq",provider_model="openai/gpt-oss-20b")
+        with jobs.database() as db:
+            row=db.execute("SELECT status,error FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                (jobs.USER,"greenhouse:cloudflare:43","resume-v1")).fetchone()
+            diag=db.execute("SELECT category,error_code FROM job_match_diagnostics WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY diagnostic_id DESC LIMIT 1",
+                (jobs.USER,"greenhouse:cloudflare:43","resume-v1")).fetchone()
+        self.assertEqual(row["status"],"failed")
+        self.assertEqual(diag["category"],"deterministic_validation")
+        self.assertEqual(diag["error_code"],"deterministic_validation_failed")
+        self.assertNotIn("private deterministic evidence",row["error"])
 
     def test_groq_matching_without_separate_consent_sends_nothing(self):
         with jobs.database() as db:
@@ -978,17 +1158,18 @@ class ResumeJobMatcherTests(unittest.TestCase):
         post.assert_not_called()
 
     def test_groq_rate_limit_retries_are_bounded_and_never_change_provider(self):
-        rate_limit=Mock();rate_limit.status_code=429
+        rate_limit=Mock();rate_limit.status_code=429;rate_limit.headers={"retry-after":"7"}
         rate_limit.raise_for_status.side_effect=matcher.requests.HTTPError(response=rate_limit)
         with jobs.database() as db:
             db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
                 (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
         with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
              patch.object(matcher.requests,"post",return_value=rate_limit) as post:
-            with self.assertRaisesRegex(RuntimeError,r"Groq rate limit \(HTTP 429\)"):
+            with self.assertRaisesRegex(matcher.MatchingProviderError,r"Groq rate limit reached") as caught:
                 matcher.analyze_with_provider({},"synthetic-review",{},
                     {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
-        self.assertEqual(post.call_count,2)
+        self.assertEqual(caught.exception.category,"rate_limit")
+        self.assertEqual(post.call_count,1)
         self.assertTrue(all(call.kwargs["json"]["model"]=="openai/gpt-oss-20b" for call in post.call_args_list))
 
     def test_gemini_retries_malformed_json_with_repair_instruction(self):
@@ -1172,6 +1353,210 @@ class ResumeJobMatcherTests(unittest.TestCase):
         self.assertEqual(tuple(new),("queued",json.dumps(["greenhouse:cloudflare:42"]),1))
         self.assertEqual(tuple(row),("queued",None))
         self.assertEqual(archived["reason"],"explicit_targeted_failed_match_retry")
+
+    def test_workflow_stale_pointer_does_not_hide_legacy_paused_overlap(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,matching_session_id TEXT,diagnostics_json TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-1',?,'legacy-session',?)",
+                       (jobs.USER,json.dumps({"matching":{"status":"blocked","session_id":"legacy-session"}})))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,
+                batch_size,total_jobs,created_at,updated_at,owner_token,lease_expires_at,owner_host,owner_pid,workflow_id)
+                VALUES('legacy-session',?,'resume-v1','paused',?,1,2,'now','now','',NULL,'',NULL,'')""",
+                       (jobs.USER,json.dumps(["job:one","job:two"])))
+            conflict=matcher._matching_conflict(db,["job:one","job:two","job:three"],
+                "workflow-1",matcher.now())
+            exact=matcher._matching_conflict(db,["job:one","job:two"],"workflow-1",matcher.now())
+        self.assertEqual(conflict["code"],"legacy_checkpoint_overlap")
+        self.assertEqual(conflict["overlap_count"],2)
+        self.assertIsNone(exact)
+
+    def test_explicit_cancel_preserves_results_for_ownerless_paused_checkpoint(self):
+        from fastapi import HTTPException
+        with jobs.database() as db:
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,
+                batch_size,total_jobs,created_at,updated_at,workflow_id,owner_token,owner_host,cancel_requested)
+                VALUES('approved-old-session',?,'resume-v1','paused',?,3,1,'2026-11-05','2026-11-05','', '', '',0)""",
+                (jobs.USER,json.dumps(["greenhouse:cloudflare:42"])))
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,
+                match_score,created_at,updated_at,freshness_status) VALUES(?,?,?,'completed','needs_review',68,
+                '2026-11-05','2026-11-05','stale')""",
+                (jobs.USER,"greenhouse:cloudflare:42","resume-v1"))
+        with self.assertRaises(HTTPException):
+            matcher.cancel_paused_checkpoint("approved-old-session")
+        result=matcher.cancel_paused_checkpoint("approved-old-session",confirmed=True)
+        self.assertEqual(result["status"],"cancelled")
+        self.assertEqual(result["preserved_job_count"],1)
+        with jobs.database() as db:
+            session=db.execute("SELECT status,cancel_requested FROM job_match_sessions WHERE session_id='approved-old-session'").fetchone()
+            saved=db.execute("SELECT status,classification,match_score,freshness_status FROM job_match_results WHERE job_key='greenhouse:cloudflare:42'").fetchone()
+        self.assertEqual(tuple(session),("cancelled",1))
+        self.assertEqual(tuple(saved),("completed","needs_review",68,"stale"))
+
+    def test_interrupted_groq_checkpoint_resumes_existing_session_and_stops_after_three_jobs(self):
+        from concurrent.futures import ThreadPoolExecutor
+        keys=[f"greenhouse:cloudflare:{number}" for number in range(42,47)]
+        stamp=matcher.now();profile_status,profile=matcher.active_candidate()[1:]
+        saved_prefs=matcher.preferences() or {}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b",
+                    "allow_groq_cloud_ai":True,"standing_policy_enabled":True,"standing_policy_allow_groq":True}),jobs.USER))
+            for index,key in enumerate(keys[1:],43):
+                db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (jobs.USER,key,"Cloudflare","Software Engineer","United States",f"https://job-boards.greenhouse.io/cloudflare/jobs/{index}",stamp,
+                     "Software Engineer building full-stack products and backend services. "*8,"greenhouse",str(index)))
+            first=db.execute("SELECT * FROM discovered_openings WHERE job_key=?",(keys[0],)).fetchone()
+            completed=valid_result()
+            db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                VALUES(?,?,?,'completed','needs_review',68,?,?,?,?,?,?,?,'current')""",
+                (jobs.USER,keys[0],"resume-v1",completed.model_dump_json(),stamp,stamp,
+                 matcher.profile_fingerprint(profile,"resume-v1"),matcher.stable_fingerprint(saved_prefs),
+                 matcher.job_fingerprint(dict(first)),matcher.matching_engine_version("groq","openai/gpt-oss-20b")))
+            for key in keys[1:]:
+                db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                           (jobs.USER,key,"resume-v1",stamp,stamp))
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT,user_id TEXT,diagnostics_json TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('synthetic-workflow',?,'{}')",(jobs.USER,))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,
+                created_at,updated_at,workflow_id,owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,
+                provider,provider_model,stop_after_batch,error)
+                VALUES('synthetic-interrupted',?,'resume-v1','interrupted',?,3,5,?,?, 'synthetic-workflow','',NULL,'',NULL,NULL,
+                'groq','openai/gpt-oss-20b',0,'RuntimeError: matching worker could not start; retry may resume from this checkpoint.')""",
+                (jobs.USER,json.dumps(keys),stamp,stamp))
+        synthetic_job={"id":"42","title":"Software Engineer","content":"Software Engineer building full-stack products and backend services. "*8,
+            "content_fingerprint":"synthetic-content","absolute_url":"https://job-boards.greenhouse.io/cloudflare/jobs/42",
+            "location":{"name":"United States"},"company_name":"Cloudflare","_source_platform":"greenhouse","_search_prompt":"software engineer jobs"}
+        calls=[]
+        def analyze(*_args,**_kwargs):
+            calls.append(True)
+            return valid_result()
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}), \
+             patch.object(matcher,"_find_feed_job",return_value=(synthetic_job,None)), \
+             patch.object(matcher,"analyze_with_provider",side_effect=analyze):
+            with jobs.database() as db:
+                db.execute("""UPDATE job_match_sessions SET status='queued',owner_token='synthetic-owner',owner_pid=?,owner_host=?,
+                    heartbeat_at=?,lease_expires_at=?,stop_after_batch=1 WHERE session_id='synthetic-interrupted'""",
+                    (os.getpid(),matcher.socket.gethostname(),stamp,matcher._match_lease_expiry()))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(matcher._session_worker,"synthetic-interrupted","resume-v1",profile_status,profile,
+                    "synthetic-owner","groq","openai/gpt-oss-20b").result(timeout=10)
+            with jobs.database() as db:
+                row=db.execute("SELECT status,owner_token,stop_after_batch,error FROM job_match_sessions WHERE session_id='synthetic-interrupted'").fetchone()
+                counts={r[0]:r[1] for r in db.execute("SELECT status,count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) GROUP BY status",(json.dumps(keys),))}
+            self.assertEqual(tuple(row),("paused","",0,"bounded_initial_batch_complete"))
+            self.assertEqual(counts,{"completed":4,"queued":1})
+            self.assertEqual(len(calls),3)
+            with jobs.database() as db:
+                db.execute("""UPDATE job_match_sessions SET status='queued',owner_token='restart-owner',owner_pid=?,owner_host=?,
+                    heartbeat_at=?,lease_expires_at=? WHERE session_id='synthetic-interrupted'""",
+                    (os.getpid(),matcher.socket.gethostname(),stamp,matcher._match_lease_expiry()))
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(matcher._session_worker,"synthetic-interrupted","resume-v1",profile_status,profile,
+                    "restart-owner","groq","openai/gpt-oss-20b").result(timeout=10)
+        with jobs.database() as db:
+            sessions=db.execute("SELECT count(*) FROM job_match_sessions WHERE workflow_id='synthetic-workflow'").fetchone()[0]
+            status=db.execute("SELECT status FROM job_match_sessions WHERE session_id='synthetic-interrupted'").fetchone()[0]
+            completed=db.execute("SELECT count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) AND status='completed'",(json.dumps(keys),)).fetchone()[0]
+        self.assertEqual((sessions,status,completed),(1,"completed",5))
+        self.assertEqual(len(calls),4)
+
+    def test_process_shutdown_checkpoint_recovers_in_fresh_worker_process_without_duplicate_session(self):
+        from starlette.requests import Request
+        keys=[f"greenhouse:cloudflare:{number}" for number in range(42,47)]
+        settings={"allow_ai_matching":True,"allow_automatic_discovery":True,"matching_provider":"groq",
+            "groq_model":"openai/gpt-oss-20b","allow_groq_cloud_ai":True,"standing_policy_enabled":True,
+            "standing_policy_allow_groq":True,"standing_policy_daily_limit":3}
+        stamp=matcher.now();old_workflow_db=workflow.DB;workflow.DB=jobs.DB
+        workflow.initialize()
+        profile_status,profile=matcher.active_candidate()[1:]
+        saved_prefs=matcher.preferences() or {}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",(json.dumps(settings),jobs.USER))
+            with db:
+                for number,key in enumerate(keys,42):
+                    if number==42:
+                        db.execute("UPDATE discovered_openings SET description=?,source_id=?,content_fingerprint=? WHERE job_key=?",
+                            ("Software Engineer building full-stack products and backend services. "*8,str(number),"synthetic-v1",key))
+                    else:
+                        db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id,content_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (jobs.USER,key,"Cloudflare","Software Engineer","United States",f"https://job-boards.greenhouse.io/cloudflare/jobs/{number}",stamp,
+                             "Software Engineer building full-stack products and backend services. "*8,"greenhouse",str(number),"synthetic-v1"))
+            db.execute("""INSERT INTO user_workflows(workflow_id,user_id,prompt,status,current_stage,resume_id,resume_version,
+                profile_version,preferences_version,job_keys_json,diagnostics_json,discovered_count,created_at,updated_at)
+                VALUES('process-workflow',?,'synthetic software roles','running','matching','resume-v1','resume-v1','profile-v1',1,?,?,5,?,?)""",
+                (jobs.USER,json.dumps(keys),json.dumps({"workflow_preferences":saved_prefs,"discovery_status":"completed"}),stamp,stamp))
+            for index,key in enumerate(keys):
+                if index==0:
+                    opening=db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(jobs.USER,key)).fetchone()
+                    result=valid_result()
+                    db.execute("""INSERT INTO job_match_results(user_id,job_key,resume_id,status,classification,match_score,result_json,
+                        created_at,updated_at,candidate_fingerprint,preferences_fingerprint,job_fingerprint,matching_model_version,freshness_status)
+                        VALUES(?,?,?,'completed','needs_review',68,?,?,?,?,?,?,?,'current')""",
+                        (jobs.USER,key,"resume-v1",result.model_dump_json(),stamp,stamp,matcher.profile_fingerprint(profile,"resume-v1"),
+                         matcher.stable_fingerprint(saved_prefs),matcher.job_fingerprint(dict(opening)),
+                         matcher.matching_engine_version("groq","openai/gpt-oss-20b")))
+                else:
+                    db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                        (jobs.USER,key,"resume-v1",stamp,stamp))
+        synthetic_jobs={key:{"id":key.rsplit(":",1)[1],"title":"Software Engineer",
+            "content":"Software Engineer building full-stack products and backend services. "*8,
+            "content_fingerprint":"synthetic-v1","absolute_url":f"https://job-boards.greenhouse.io/cloudflare/jobs/{key.rsplit(":",1)[1]}",
+            "location":{"name":"United States"},"company_name":"Cloudflare","_source_platform":"greenhouse",
+            "_search_prompt":"software engineer jobs"} for key in keys}
+        def fetch_synthetic(key,_cache):return synthetic_jobs[key],None
+        context=multiprocessing.get_context("fork");out=context.Queue();child=context.Process(
+            target=_simulate_process_shutdown_match_start,args=(str(jobs.DB),"process-workflow",keys,out))
+        try:
+            with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}), \
+                 patch.object(matcher,"_find_feed_job",side_effect=fetch_synthetic):
+                child.start();child.join(10)
+                self.assertFalse(child.is_alive())
+                self.assertEqual(child.exitcode,0)
+                child_result=out.get(timeout=2)
+                self.assertEqual(child_result[0],"HTTPException")
+                self.assertEqual(child_result[2],"RuntimeError: interpreter shutdown; matching worker could not start; retry may resume from this checkpoint.")
+                with jobs.database() as db:
+                    interrupted=db.execute("SELECT session_id,status,owner_token,total_jobs FROM job_match_sessions WHERE workflow_id='process-workflow'").fetchone()
+                    self.assertEqual(tuple(interrupted[1:]),("interrupted","",5))
+                    before=db.execute("SELECT status,count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) GROUP BY status",(json.dumps(keys),)).fetchall()
+                    self.assertEqual({r[0]:r[1] for r in before},{"completed":1,"queued":4})
+                calls=[]
+                def fake_analyze(*_args,**_kwargs):calls.append(True);return valid_result()
+                scope={"type":"http","asgi":{"version":"3.0","spec_version":"2.3"},"http_version":"1.1",
+                    "method":"POST","scheme":"http","path":"/api/workflows/process-workflow/resume",
+                    "raw_path":b"/api/workflows/process-workflow/resume","query_string":b"","headers":[],
+                    "client":("127.0.0.1",54321),"server":("127.0.0.1",8000)}
+                request=Request(scope)
+                with patch.object(workflow.application_answer_assistant,"get_authorization",return_value={"version":9,"settings":settings}), \
+                     patch.object(workflow,"_standing_policy_current",return_value=True), \
+                     patch.object(workflow.resume_job_matcher,"_groq_authorization_blocker",return_value=""), \
+                     patch.object(workflow,"_authorization",return_value=settings), \
+                     patch.object(workflow,"_ensure_snapshot"), \
+                     patch.object(workflow.application_agent,"resume_processing"), \
+                     patch.object(workflow.job_description_enricher,"connect",workflow.database), \
+                     patch.object(workflow.job_description_enricher,"usable_description",return_value=True), \
+                     patch.object(matcher,"_find_feed_job",side_effect=fetch_synthetic), \
+                     patch.object(matcher,"analyze_with_provider",side_effect=fake_analyze):
+                    response=workflow.resume_workflow("process-workflow",request)
+                    self.assertEqual(response["workflow"]["current_stage"],"matching")
+                    deadline=time.monotonic()+10
+                    while time.monotonic()<deadline:
+                        current=workflow._row("process-workflow")
+                        if current["status"] in {"paused","completed","failed"}:break
+                        time.sleep(.05)
+                self.assertEqual(current["status"],"paused")
+                self.assertEqual(len(calls),3)
+                with jobs.database() as db:
+                    matching_sessions=db.execute("SELECT session_id,status,total_jobs FROM job_match_sessions WHERE workflow_id='process-workflow'").fetchall()
+                    result_counts={r[0]:r[1] for r in db.execute("SELECT status,count(*) FROM job_match_results WHERE job_key IN (SELECT value FROM json_each(?)) GROUP BY status",(json.dumps(keys),))}
+                self.assertEqual(len(matching_sessions),1)
+                self.assertEqual(matching_sessions[0]["session_id"],interrupted["session_id"])
+                self.assertEqual((matching_sessions[0]["status"],matching_sessions[0]["total_jobs"]),("paused",5))
+                self.assertEqual(result_counts,{"completed":4,"queued":1})
+        finally:
+            if child.is_alive():child.terminate();child.join(2)
+            workflow.DB=old_workflow_db
 
     def test_targeted_retry_refuses_completed_current_match_without_duplicate(self):
         from fastapi import HTTPException
@@ -1603,6 +1988,70 @@ class ResumeJobMatcherTests(unittest.TestCase):
                              (jobs.USER,json.dumps(keys))).fetchone()[0]
         self.assertEqual(tuple(row),("workflow-12","completed"))
         self.assertEqual(saved,12)
+
+    def test_bounded_workflow_resume_preserves_failed_results_without_retrying_them(self):
+        failed_key="greenhouse:cloudflare:42"
+        queued_key="greenhouse:cloudflare:43"
+        deferred_key="greenhouse:cloudflare:44"
+        failed_job=self._seed_retryable_failure()
+        keys=[failed_key,queued_key,deferred_key]
+        with jobs.database() as db:
+            db.execute("CREATE TABLE user_workflows(workflow_id TEXT PRIMARY KEY,user_id TEXT,resume_id TEXT,current_stage TEXT,matching_session_id TEXT,diagnostics_json TEXT)")
+            db.execute("INSERT INTO user_workflows VALUES('workflow-preserve',?,'resume-v1','matching','session-preserve','{}')",(jobs.USER,))
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id,active,availability_status,content_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (jobs.USER,queued_key,"Cloudflare","Software Engineer","United States","https://job-boards.greenhouse.io/cloudflare/jobs/43",matcher.now(),
+                 "Software Engineer building backend services and customer-facing web applications. "*8,"greenhouse","43",1,"current","queued-fingerprint"))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,queued_key,"resume-v1",matcher.now(),matcher.now()))
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,description,source_platform,source_id,active,availability_status,content_fingerprint) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (jobs.USER,deferred_key,"Cloudflare","Software Engineer","United States","https://job-boards.greenhouse.io/cloudflare/jobs/44",matcher.now(),
+                 "Software Engineer building backend services and customer-facing web applications. "*8,"greenhouse","44",1,"current","deferred-fingerprint"))
+            db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                (jobs.USER,deferred_key,"resume-v1",matcher.now(),matcher.now()))
+            db.execute("INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,workflow_id,created_at,updated_at,provider,provider_model) VALUES('session-preserve',?,'resume-v1','paused',?,3,3,'workflow-preserve',?,?, 'ollama','qwen2.5:3b')",
+                (jobs.USER,json.dumps(keys),matcher.now(),matcher.now()))
+        fresh_job={**failed_job,"id":"43","content_fingerprint":"queued-fingerprint",
+            "absolute_url":"https://job-boards.greenhouse.io/cloudflare/jobs/43"}
+        with patch.object(matcher,"_find_feed_job",return_value=(fresh_job,None)) as feed, \
+             patch.object(matcher.executor,"submit",return_value=None):
+            response=matcher.analyze_matches(matcher.MatchRequest(job_keys=keys,batch_size=3,preserve_failed=True,bounded_resume=True),
+                                             workflow_id="workflow-preserve")
+        self.assertEqual(response["session_id"],"session-preserve")
+        self.assertEqual(feed.call_count,2)
+        self.assertEqual([call.args[0] for call in feed.call_args_list],[queued_key,deferred_key])
+        with jobs.database() as db:
+            failed=db.execute("SELECT status,error FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                               (jobs.USER,failed_key,"resume-v1")).fetchone()
+            queued=db.execute("SELECT status FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                               (jobs.USER,queued_key,"resume-v1")).fetchone()
+            deferred=db.execute("SELECT status FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=?",
+                                (jobs.USER,deferred_key,"resume-v1")).fetchone()
+            archived=db.execute("SELECT COUNT(*) FROM job_match_result_history WHERE user_id=? AND job_key=?",
+                                (jobs.USER,failed_key)).fetchone()[0]
+        self.assertEqual(tuple(failed),("failed","Local model read timeout"))
+        self.assertEqual(queued["status"],"queued")
+        self.assertEqual(deferred["status"],"queued")
+        self.assertEqual(archived,0)
+
+    def test_bounded_worker_uses_saved_checkpoint_order_not_sqlite_result_order(self):
+        keys=[f"greenhouse:cloudflare:ordered-{index}" for index in range(4)]
+        token="synthetic-owner-token"
+        stamp=matcher.now()
+        with jobs.database() as db:
+            for key in reversed(keys):
+                db.execute("INSERT INTO job_match_results(user_id,job_key,resume_id,status,created_at,updated_at) VALUES(?,?,?,'queued',?,?)",
+                    (jobs.USER,key,"resume-v1",stamp,stamp))
+            db.execute("""INSERT INTO job_match_sessions(session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,
+                workflow_id,owner_token,owner_pid,created_at,updated_at,provider,provider_model,stop_after_batch)
+                VALUES('ordered-session',?,'resume-v1','queued',?,3,4,'workflow-order',?,NULL,?,?, 'ollama','qwen2.5:3b',1)""",
+                (jobs.USER,json.dumps(keys),token,stamp,stamp))
+        batches=[]
+        with patch.object(matcher,"_process_batch",side_effect=lambda batch,*args,**kwargs:batches.append(list(batch))):
+            matcher._session_worker("ordered-session","resume-v1","user_reviewed",{},token,"ollama","qwen2.5:3b")
+        self.assertEqual(batches,[keys[:3]])
+        with jobs.database() as db:
+            row=db.execute("SELECT status,stop_after_batch,owner_token,error FROM job_match_sessions WHERE session_id='ordered-session'").fetchone()
+        self.assertEqual(tuple(row),("paused",0,"","bounded_initial_batch_complete"))
 
     def test_unrelated_saved_jobs_are_excluded_before_ollama(self):
         with jobs.database() as db:

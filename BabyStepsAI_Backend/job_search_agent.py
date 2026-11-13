@@ -2336,10 +2336,51 @@ def employer_sources_page(request: Request):
     return HTMLResponse(page)
 
 
+def _complete_missing_employer_website(db, item: EmployerImportItem, source_type: str, token: str) -> bool:
+    """Fill only a missing website when same-site public evidence ties it to the source.
+
+    This deliberately does not change source health, activation, feed metadata,
+    or an already populated website.  It is used by the existing local source
+    registration flow when an otherwise identical board is imported again.
+    """
+    website = item.website_url.strip()
+    evidence = item.evidence_url.strip()
+    if not website or not evidence:
+        return False
+    try:
+        validate_public_https_url(website)
+        validate_public_https_url(evidence)
+    except ValueError:
+        return False
+    website_host = (urlparse(website).hostname or "").casefold().removeprefix("www.")
+    evidence_host = (urlparse(evidence).hostname or "").casefold().removeprefix("www.")
+    if not website_host or website_host != evidence_host:
+        return False
+    requested_name = re.sub(r"[^a-z0-9]+", " ", item.name.casefold()).strip()
+    saved = db.execute("SELECT name,website_url FROM employers WHERE source_type=? AND source_token=?",
+                       (source_type, token)).fetchone()
+    if not saved:
+        return False
+    if str(saved["website_url"] or "").strip():
+        return False
+    saved_name = re.sub(r"[^a-z0-9]+", " ", str(saved["name"] or "").casefold()).strip()
+    if not requested_name or requested_name != saved_name:
+        return False
+    updated = db.execute("""UPDATE employers SET website_url=?,updated_at=?
+        WHERE source_type=? AND source_token=? AND (website_url IS NULL OR trim(website_url)='')""",
+        (website, datetime.now(timezone.utc).isoformat(), source_type, token))
+    return updated.rowcount == 1
+
+
 def register_employer_sources(payload: EmployerImportRequest):
-    """Add public source candidates idempotently; every new row stays inactive."""
+    """Add public source candidates idempotently; new rows stay inactive.
+
+    Re-importing an existing board can only complete a missing company website
+    when same-site HTTPS evidence and the saved employer name match.
+    """
     stamp = datetime.now(timezone.utc).isoformat()
     imported = 0
+    websites_completed = 0
     with database() as db:
         for item in payload.sources:
             source_type = item.source_type.casefold()
@@ -2390,7 +2431,10 @@ def register_employer_sources(payload: EmployerImportRequest):
                     ("source_validation", "pending", {}), ("source_activation", "inactive", {})]
                 db.executemany("INSERT INTO employer_discovery_stages(employer_id,stage_key,status,diagnostics_json,updated_at) VALUES(?,?,?,?,?)",
                     [(f"{source_type}:{token}", key, stage, json.dumps(details), stamp) for key, stage, details in stage_rows])
-    return {"imported": imported, "active": 0, "message": "New sources stay inactive until read-only validation succeeds."}
+            else:
+                websites_completed += int(_complete_missing_employer_website(db, item, source_type, token))
+    return {"imported": imported, "website_metadata_completed": websites_completed, "active": 0,
+            "message": "New sources stay inactive until read-only validation succeeds."}
 
 
 def persist_candidate_seeds(candidates: list[dict], *, return_details: bool = False):

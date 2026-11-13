@@ -41,6 +41,7 @@ MODEL = "qwen2.5:3b"
 MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v23-early-career-sponsorship-review"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MAX_COMPLETION_TOKENS = 1800
 GROQ_TIMEOUT = (5, 45)
 def _bounded_env_float(name,default,minimum,maximum):
     try:value=float(os.getenv(name,str(default)))
@@ -63,6 +64,8 @@ MAX_PROFILE_CHARS = 9000
 MAX_DESCRIPTION_CHARS = 11000
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ollama-job-match")
 _batch_lock = threading.Lock()
+_groq_rate_lock=threading.Lock()
+_groq_rate_state={}
 logger=logging.getLogger(__name__)
 MATCH_LEASE_SECONDS = 180
 MATCH_HEARTBEAT_SECONDS = 20
@@ -71,6 +74,9 @@ MATCH_HEARTBEAT_SECONDS = 20
 class MatchRequest(BaseModel):
     job_keys: list[str] = Field(min_length=1, max_length=250)
     batch_size: int = Field(default=3, ge=MIN_JOBS_PER_BATCH, le=MAX_JOBS_PER_BATCH)
+    stop_after_batch: bool = False
+    preserve_failed: bool = False
+    bounded_resume: bool = False
 
 
 class FailedMatchRetryRequest(BaseModel):
@@ -79,10 +85,116 @@ class FailedMatchRetryRequest(BaseModel):
 
 class MatchingProviderError(RuntimeError):
     """Safe user-facing provider error without prompt or response contents."""
-    def __init__(self,category,message):
+    def __init__(self,category,message,*,request_attempts=0,response_time_ms=None,
+                 status_code=None,error_code="provider_error"):
         super().__init__(message)
         self.category=category
         self.public_message=message
+        self.request_attempts=request_attempts
+        self.retry_count=max(0,request_attempts-1)
+        self.response_time_ms=response_time_ms
+        self.status_code=status_code
+        self.error_code=error_code
+
+
+class MatchOutputError(ValueError):
+    """A response parsing failure with a safe, stable diagnostic category."""
+    def __init__(self,category,message):
+        super().__init__(message)
+        self.category=category
+
+
+MATCH_DIAGNOSTIC_CATEGORIES={"success","rate_limit","token_limit","timeout","invalid_json",
+    "schema_error","provider_error","worker_error","deterministic_validation","authorization_error","unknown"}
+_provider_telemetry=threading.local()
+
+
+def _reset_provider_telemetry(provider,model):
+    _provider_telemetry.data={"provider":provider if provider in {"groq","ollama","gemini"} else "unknown",
+        "model":model if isinstance(model,str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,120}",model) else "unknown",
+        "request_attempts":0,"status_code":None,"started":time.monotonic(),"response_time_ms":0}
+
+
+def _provider_telemetry_snapshot():
+    data=dict(getattr(_provider_telemetry,"data",{}) or {})
+    started=data.pop("started",None)
+    if started is not None:data["response_time_ms"]=max(0,min(300000,int((time.monotonic()-started)*1000)))
+    return data
+
+
+def _safe_diagnostic_value(value,allowed,default):
+    text=str(value or "").strip().casefold()
+    return text if text in allowed else default
+
+
+def _record_match_diagnostic(*,user_id,job_key="",resume_id="",session_id="",provider="unknown",
+        model="unknown",category="unknown",request_attempts=None,retry_count=None,
+        response_time_ms=None,status_code=None,error_code="",created_at=None):
+    """Append privacy-safe provider/worker metrics; never store prompts or response bodies."""
+    category=_safe_diagnostic_value(category,MATCH_DIAGNOSTIC_CATEGORIES,"unknown")
+    provider=provider if provider in {"groq","ollama","gemini","job_source","unknown"} else "unknown"
+    model=model if isinstance(model,str) and re.fullmatch(r"[A-Za-z0-9._/-]{1,120}",model) else "unknown"
+    def bounded_count(value):
+        return None if value is None else max(0,min(3,int(value)))
+    request_attempts=bounded_count(request_attempts)
+    retry_count=bounded_count(retry_count)
+    response_time_ms=None if response_time_ms is None else max(0,min(300000,int(response_time_ms)))
+    status_code=int(status_code) if isinstance(status_code,int) and 100<=status_code<=599 else None
+    error_code=str(error_code or "")[:80]
+    if not re.fullmatch(r"[a-z0-9_.-]*",error_code):error_code="unspecified"
+    with database() as db:
+        db.execute("""INSERT INTO job_match_diagnostics(user_id,job_key,resume_id,session_id,provider,model,
+            category,request_attempts,retry_count,response_time_ms,status_code,error_code,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (user_id,str(job_key or "")[:400],str(resume_id or "")[:100],str(session_id or "")[:100],
+             provider,model,category,request_attempts,retry_count,response_time_ms,status_code,error_code,
+             created_at or now()))
+
+
+def _safe_record_match_diagnostic(**values):
+    try:_record_match_diagnostic(**values)
+    except Exception as error:
+        logger.warning("Matching diagnostics could not be persisted: type=%s",type(error).__name__)
+
+
+def _provider_failure(error,provider,*,fallback_category="provider_error"):
+    """Create a sanitized error carrying only bounded telemetry and stable codes."""
+    snapshot=_provider_telemetry_snapshot()
+    category=getattr(error,"category",fallback_category)
+    category={"read_timeout":"timeout","invalid_response":"invalid_json","connection":"provider_error",
+        "request_rejected":"provider_error"}.get(category,category)
+    if category not in MATCH_DIAGNOSTIC_CATEGORIES:category=fallback_category
+    code=getattr(error,"error_code","") or {
+        "rate_limit":"http_429" if snapshot.get("status_code")==429 else "rate_window_exhausted",
+        "token_limit":"token_limit","timeout":"request_timeout","invalid_json":"invalid_json",
+        "schema_error":"schema_validation","provider_error":"provider_error",
+        "authorization_error":"consent_blocked","deterministic_validation":"validation_error",
+    }.get(category,"provider_error")
+    return MatchingProviderError(category,getattr(error,"public_message",None) or
+        "The selected matching provider failed safely. No application action was taken.",
+        request_attempts=snapshot.get("request_attempts",0),
+        response_time_ms=snapshot.get("response_time_ms"),status_code=snapshot.get("status_code"),error_code=code)
+
+
+def _record_provider_diagnostic(*,user_id,job_key,resume_id,session_id,provider,model,category,error=None):
+    snapshot=_provider_telemetry_snapshot()
+    if isinstance(error,MatchingProviderError):
+        category={"read_timeout":"timeout","invalid_response":"invalid_json","connection":"provider_error",
+            "request_rejected":"provider_error"}.get(error.category,error.category)
+        attempts=error.request_attempts if error.request_attempts is not None else snapshot.get("request_attempts",0)
+        retries=max(0,attempts-1)
+        elapsed=error.response_time_ms if error.response_time_ms is not None else snapshot.get("response_time_ms")
+        status=error.status_code if error.status_code is not None else snapshot.get("status_code")
+        code=error.error_code
+    else:
+        attempts=snapshot.get("request_attempts",0);retries=max(0,attempts-1)
+        elapsed=snapshot.get("response_time_ms");status=snapshot.get("status_code")
+        code=("deterministic_validation_failed" if category=="deterministic_validation" else
+            {"ValueError":"invalid_json","ValidationError":"schema_validation","Timeout":"request_timeout",
+             "RuntimeError":"provider_runtime_error"}.get(type(error).__name__,type(error).__name__.casefold())) if error is not None else ""
+    _safe_record_match_diagnostic(user_id=user_id,job_key=job_key,resume_id=resume_id,session_id=session_id,
+        provider=provider,model=model,category=category,request_attempts=attempts,retry_count=retries,
+        response_time_ms=elapsed,status_code=status,error_code=code)
 
 
 def _safe_feed_failure(error):
@@ -207,6 +319,13 @@ def initialize():
         db.execute("""CREATE TABLE IF NOT EXISTS job_match_result_history (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL,job_key TEXT NOT NULL,
             resume_id TEXT NOT NULL,archived_at TEXT NOT NULL,reason TEXT NOT NULL,snapshot_json TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS job_match_diagnostics (
+            diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id TEXT NOT NULL,job_key TEXT NOT NULL DEFAULT '',
+            resume_id TEXT NOT NULL DEFAULT '',session_id TEXT NOT NULL DEFAULT '',provider TEXT NOT NULL,
+            model TEXT NOT NULL,category TEXT NOT NULL,request_attempts INTEGER,retry_count INTEGER,
+            response_time_ms INTEGER,status_code INTEGER,error_code TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_job_match_diagnostics_result ON job_match_diagnostics(user_id,job_key,resume_id,diagnostic_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_job_match_diagnostics_session ON job_match_diagnostics(user_id,session_id,diagnostic_id)")
         # Experience requirements under explicit "Required Skills" and "What
         # we're looking for" headings are now extracted as mandatory. Preserve
         # prior rows and mark them stale for deterministic reassessment.
@@ -233,6 +352,7 @@ def initialize():
             ("cancel_requested","INTEGER NOT NULL DEFAULT 0"),
             ("provider","TEXT NOT NULL DEFAULT 'ollama'"),
             ("provider_model","TEXT NOT NULL DEFAULT ''"),
+            ("stop_after_batch","INTEGER NOT NULL DEFAULT 0"),
         ):
             if name not in session_columns:
                 db.execute(f"ALTER TABLE job_match_sessions ADD COLUMN {name} {declaration}")
@@ -1321,7 +1441,7 @@ def _extract_json_object(text):
     try:return json.loads(value)
     except json.JSONDecodeError:pass
     start=value.find("{")
-    if start<0:raise ValueError("malformed match JSON (no JSON object found).")
+    if start<0:raise MatchOutputError("invalid_json","The provider response did not contain a JSON object.")
     depth=0;quoted=False;escaped=False
     for index in range(start,len(value)):
         char=value[index]
@@ -1337,8 +1457,8 @@ def _extract_json_object(text):
             if depth==0:
                 try:return json.loads(value[start:index+1])
                 except json.JSONDecodeError as error:
-                    raise ValueError("malformed match JSON (invalid JSON syntax).") from error
-    raise ValueError("malformed match JSON (incomplete JSON object).")
+                    raise MatchOutputError("invalid_json","The provider response contained invalid JSON syntax.") from error
+    raise MatchOutputError("invalid_json","The provider response contained an incomplete JSON object.")
 
 
 def _parse_match_text(text,provider="AI provider"):
@@ -1351,12 +1471,12 @@ def _parse_match_text(text,provider="AI provider"):
             field=".".join(str(part) for part in item.get("loc",())) or "response"
             failures.append(f"{field} ({item.get('type','invalid')})")
         detail=", ".join(failures) or "unknown schema fields"
-        raise ValueError(f"{provider} returned malformed match JSON (schema validation failed at {detail}).") from error
+        raise MatchOutputError("schema_error",f"{provider} returned data that did not match the required schema ({detail}).") from error
     except (TypeError,ValueError) as error:
         message=str(error)
-        if message.startswith("malformed match JSON"):
-            raise ValueError(f"{provider} returned {message}.") from error
-        raise ValueError(f"{provider} returned malformed match JSON (unexpected value type).") from error
+        if getattr(error,"category","")=="invalid_json":
+            raise MatchOutputError("invalid_json",str(error)) from error
+        raise MatchOutputError("invalid_json",f"{provider} returned an unreadable JSON response.") from error
 
 
 def _parse_match_response(response):
@@ -1437,10 +1557,51 @@ def matching_engine_version(provider=None,model=None):
     return f"{provider}:{model}/job-match-v23-early-career-sponsorship-review"
 
 
+def _groq_token_limit_response(response):
+    """Classify likely context/completion limit responses without retaining body text."""
+    if response is None:return False
+    status=getattr(response,"status_code",None)
+    if status==413:return True
+    if status!=400:return False
+    try:body=response.json()
+    except (TypeError,ValueError,AttributeError):return False
+    error=body.get("error",{}) if isinstance(body,dict) else {}
+    parts=[]
+    if isinstance(error,dict):parts.extend(str(error.get(k) or "") for k in ("code","type","message"))
+    haystack=" ".join(parts).casefold()
+    return bool(re.search(r"(?:context|token|completion).{0,40}(?:limit|length|maximum|exceed|too large)|(?:limit|length|maximum|exceed|too large).{0,40}(?:context|token|completion)",haystack))
+
+
+def _groq_safe_http_error_code(response, status_code=None):
+    """Return an allowlisted diagnostic code without persisting provider text."""
+    code=status_code if isinstance(status_code,int) else getattr(response,"status_code",None)
+    if code==429:return "http_429"
+    if code!=400:return f"http_{code}" if isinstance(code,int) else "provider_error"
+    try:body=response.json() if response is not None else {}
+    except (TypeError,ValueError,AttributeError):body={}
+    error=body.get("error",{}) if isinstance(body,dict) else {}
+    raw=[]
+    if isinstance(error,dict):raw.extend((error.get("code"),error.get("type")))
+    categories={
+        "json_validate_failed":"structured_output_rejected",
+        "invalid_request_error":"invalid_request",
+        "model_not_found":"model_not_found",
+        "unsupported_parameter":"unsupported_parameter",
+        "invalid_api_key":"credentials_rejected",
+        "insufficient_quota":"quota_exhausted",
+        "content_policy_violation":"policy_rejected",
+    }
+    for value in raw:
+        key=str(value or "").strip().casefold()
+        if key in categories:return categories[key]
+    return "http_400"
+
+
 def _provider_result(profile,profile_status,prefs,job,provider,model):
+    _reset_provider_telemetry(provider,model)
     if provider == "groq":
         if not groq_api_key():
-            raise RuntimeError("Groq matching is selected, but GROQ_API_KEY is not configured on this server.")
+            raise MatchingProviderError("provider_error","Groq is selected, but its server credential is unavailable.",error_code="credential_unavailable")
         with database() as db:
             row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()
         try:settings=json.loads(row["settings_json"] or "{}") if row else {}
@@ -1449,43 +1610,84 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
         if (settings.get("matching_provider")!="groq" or not settings.get("allow_ai_matching") or
                 not settings.get("allow_groq_cloud_ai") or selected_model!=model or
                 (settings.get("standing_policy_enabled") and not settings.get("standing_policy_allow_groq"))):
-            raise RuntimeError("Explicit Groq cloud-processing consent is not current. No candidate data was sent to Groq.")
+            raise MatchingProviderError("authorization_error","Explicit Groq cloud-processing consent is not current. No candidate data was sent.",error_code="consent_blocked")
     prompt=build_prompt(profile,profile_status,prefs,job)
     last_error=None
     repair_details=""
     api_key=os.getenv("GEMINI_API_KEY","").strip() if provider=="gemini" else ""
     if provider=="gemini" and not api_key:
-        raise RuntimeError("Gemini matching is selected, but GEMINI_API_KEY is not configured in the server environment.")
-    if provider not in {"ollama","gemini","groq"}:raise RuntimeError("Unsupported matching provider.")
-    if provider=="groq" and not groq_model_allowed(model):raise RuntimeError("The selected Groq model is not on the free-tier allowlist.")
+        raise MatchingProviderError("provider_error","Gemini is selected, but GEMINI_API_KEY is not configured on this server.",error_code="credential_unavailable")
+    if provider not in {"ollama","gemini","groq"}:
+        raise MatchingProviderError("provider_error","The selected matching provider is unsupported.",error_code="unsupported_provider")
+    if provider=="groq" and not groq_model_allowed(model):
+        raise MatchingProviderError("provider_error","The selected Groq model is not on the server allowlist.",error_code="unsupported_model")
     attempts=max(1,min(int(OLLAMA_ATTEMPTS),2 if provider=="groq" else 3))
+    failure_category="provider_error"
+    error_code="provider_error"
+    last_status_code=None
     for attempt in range(attempts):
         request_prompt=prompt if not repair_details else prompt+"\n\n"+MATCHING_JSON_REPAIR_INSTRUCTION+"\nValidation issue: "+repair_details
         try:
             if provider=="ollama":
                 with OLLAMA_LOCK:
+                    _provider_telemetry.data["request_attempts"]+=1
                     response=requests.post(OLLAMA,json={"model":model,"prompt":request_prompt,"stream":False,
                         "format":MatchResult.model_json_schema(),
                         "options":{"temperature":0,"num_ctx":8192,"num_predict":1800}},timeout=OLLAMA_TIMEOUT)
+                    _provider_telemetry.data["status_code"]=getattr(response,"status_code",None)
                     return _parse_match_response(response)
             if provider=="groq":
+                _groq_wait_for_rate_window(model,request_prompt)
+                _provider_telemetry.data["request_attempts"]+=1
                 groq_response=requests.post(GROQ_URL,headers={"Authorization":"Bearer "+groq_api_key()},json={
                     "model":model,"messages":[{"role":"user","content":request_prompt}],
-                    "temperature":0,"response_format":{"type":"json_object"}},timeout=GROQ_TIMEOUT)
+                    "temperature":0,"reasoning_effort":"low",
+                    "max_completion_tokens":GROQ_MAX_COMPLETION_TOKENS,
+                    "response_format":{"type":"json_object"}},timeout=GROQ_TIMEOUT)
+                last_status_code=getattr(groq_response,"status_code",None)
+                _provider_telemetry.data["status_code"]=last_status_code
+                _observe_groq_rate_headers(model,groq_response)
+                if groq_response.status_code==429:
+                    retry_after=_rate_header_seconds((getattr(groq_response,"headers",{}) or {}).get("retry-after"))
+                    note=(f" Retry after about {int(retry_after)} seconds." if retry_after is not None else " Wait for the provider window to reset.")
+                    failure_category="rate_limit";error_code="http_429"
+                    raise MatchingProviderError(failure_category,"Groq rate limit reached; the matching job remains queued and the session will pause."+note,
+                        request_attempts=_provider_telemetry.data["request_attempts"],response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                        status_code=last_status_code,error_code=error_code)
+                if _groq_token_limit_response(groq_response):
+                    failure_category="token_limit";error_code="token_limit"
+                    raise MatchingProviderError(failure_category,"Groq rejected the request because it exceeded a token or context limit.",
+                        request_attempts=_provider_telemetry.data["request_attempts"],response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                        status_code=last_status_code,error_code=error_code)
                 if groq_response.status_code in {401,403}:
-                    raise RuntimeError("Groq rejected the configured credentials or model access.")
+                    failure_category="provider_error";error_code="credentials_or_model_rejected"
+                    raise MatchingProviderError(failure_category,"Groq rejected the configured credentials or model access.",
+                        request_attempts=_provider_telemetry.data["request_attempts"],response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                        status_code=last_status_code,error_code=error_code)
                 groq_response.raise_for_status()
-                envelope=groq_response.json()
+                try:envelope=groq_response.json()
+                except (ValueError,TypeError) as error:
+                    raise MatchOutputError("invalid_json","Groq returned an unreadable response envelope.") from error
                 choices=envelope.get("choices") if isinstance(envelope,dict) else None
                 message=choices[0].get("message") if isinstance(choices,list) and choices else None
                 content=message.get("content") if isinstance(message,dict) else None
                 if not isinstance(content,str) or not content.strip():
-                    raise ValueError("Groq returned no structured match content.")
-                return _parse_match_text(content,"Groq")
+                    raise MatchOutputError("invalid_json","Groq returned no structured match content.")
+                finish_reason=choices[0].get("finish_reason") if isinstance(choices[0],dict) else None
+                if finish_reason=="length":
+                    failure_category="token_limit";error_code="completion_token_cap"
+                    raise MatchingProviderError(failure_category,"Groq stopped at the configured completion-token cap; the response was not accepted.",
+                        request_attempts=_provider_telemetry.data["request_attempts"],response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                        status_code=last_status_code,error_code=error_code)
+                parsed=_parse_match_text(content,"Groq")
+                _provider_telemetry.data["category"]="success"
+                return parsed
+            _provider_telemetry.data["request_attempts"]+=1
             response=requests.post(GEMINI_URL.format(model=model),headers={"x-goog-api-key":api_key},json={
                 "contents":[{"role":"user","parts":[{"text":request_prompt}]}],
                 "generationConfig":{"temperature":0,"responseMimeType":"application/json",
                                     "responseSchema":_gemini_response_schema()}},timeout=GEMINI_TIMEOUT)
+            _provider_telemetry.data["status_code"]=getattr(response,"status_code",None)
             if response.status_code in {401,403}:
                 raise RuntimeError("Gemini rejected the configured API key or model access.")
             if 400<=response.status_code<500 and response.status_code!=429:
@@ -1503,10 +1705,16 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
                 # immediately can tie up an 8 GB local device for minutes.
                 # Keep the failed job recoverable through an explicit retry.
                 raise MatchingProviderError("read_timeout",
-                    f"Ollama did not finish this match within {int(OLLAMA_TIMEOUT[1])} seconds. No result was saved; check local model load and retry this job when ready.") from error
-            last_error=f"network or service error ({type(error).__name__})"
-            if attempt+1>=OLLAMA_ATTEMPTS:
-                raise MatchingProviderError("read_timeout","The selected AI provider did not finish the match in time. No result was saved; retry this job later.") from error
+                    f"Ollama did not finish this match within {int(OLLAMA_TIMEOUT[1])} seconds. No result was saved; check local model load and retry this job when ready.",
+                    request_attempts=_provider_telemetry.data.get("request_attempts",0),
+                    response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                    status_code=_provider_telemetry.data.get("status_code"),error_code="read_timeout") from error
+            failure_category="timeout";error_code="read_timeout"
+            last_error="The selected AI provider did not finish before its response timeout."
+            if attempt+1>=attempts:
+                raise MatchingProviderError("timeout","The selected AI provider did not finish the match in time. No result was saved; retry this job later.",
+                    request_attempts=_provider_telemetry.data.get("request_attempts",0),response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                    status_code=last_status_code,error_code=error_code) from error
             time.sleep(min(0.5*(2**attempt),2))
         except (requests.RequestException,ValueError,RuntimeError) as error:
             if provider=="ollama" and isinstance(error,requests.ConnectTimeout):
@@ -1518,25 +1726,113 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
                 if code is not None and 400<=code<500:
                     raise MatchingProviderError("request_rejected",f"Ollama rejected the matching request (HTTP {code}). Check the local model configuration.") from error
                 last_error=f"Ollama service error (HTTP {code})" if code else "Ollama service error"
-            elif provider=="gemini" and isinstance(error,requests.RequestException):
-                last_error=f"network or service error ({type(error).__name__})"
-            elif provider=="groq" and isinstance(error,requests.RequestException):
+            elif provider in {"gemini","groq"} and isinstance(error,requests.Timeout):
+                failure_category="timeout";error_code="connect_timeout" if isinstance(error,requests.ConnectTimeout) else "request_timeout"
+                last_error="The matching provider did not finish before its timeout."
+            elif provider in {"gemini","groq"} and isinstance(error,requests.RequestException):
                 code=getattr(getattr(error,"response",None),"status_code",None)
-                last_error=(f"Groq rate limit (HTTP {code})" if code==429 else
-                            f"Groq provider error (HTTP {code})" if code else
-                            f"Groq network or service error ({type(error).__name__})")
+                last_status_code=code if code is not None else last_status_code
+                if code==429:failure_category="rate_limit";error_code="http_429"
+                elif code in {400,413} and provider=="groq" and _groq_token_limit_response(getattr(error,"response",None)):
+                    failure_category="token_limit";error_code="token_limit"
+                elif provider=="groq":error_code=_groq_safe_http_error_code(getattr(error,"response",None),code)
+                else:failure_category="provider_error";error_code=f"http_{code}" if isinstance(code,int) else type(error).__name__.casefold()
+                last_error="The matching provider returned a request error."
+            elif isinstance(error,MatchOutputError):
+                failure_category=error.category
+                error_code="schema_validation" if error.category=="schema_error" else "invalid_json"
+                repair_details=error_code
+                last_error=error
+            elif isinstance(error,ValueError):
+                failure_category="invalid_json";error_code="invalid_json";repair_details="invalid_json";last_error=error
+            elif isinstance(error,RuntimeError):
+                failure_category="provider_error";error_code="provider_error";last_error=error
             else:last_error=error
-            if isinstance(error,ValueError):repair_details=str(error)[:240]
+            if isinstance(error,MatchingProviderError):
+                failure_category=error.category;error_code=error.error_code
+                last_status_code=error.status_code if error.status_code is not None else last_status_code
+                last_error=error
+                break
             if isinstance(error,RuntimeError) and provider in {"gemini","groq"} and ("HTTP " in str(error) or "rejected the configured" in str(error)):break
+            # A non-rate-limited 4xx is a deterministic request rejection; repeating
+            # an unchanged prompt cannot fix it and may consume provider quota.
+            if provider=="groq" and isinstance(error,requests.RequestException) and isinstance(last_status_code,int) and 400<=last_status_code<500 and last_status_code!=429:break
             if attempt+1<attempts:time.sleep(min(0.5*(2**attempt),2))
     if provider=="ollama":
         if isinstance(last_error,ValueError):
-            raise MatchingProviderError("invalid_response","Ollama returned malformed match JSON after bounded repair attempts. Retry the selected job; no application action was taken.")
+            category=getattr(last_error,"category","invalid_json")
+            raise MatchingProviderError(category,"Ollama returned malformed match JSON or schema-incompatible output after bounded repair attempts. Retry the selected job; no application action was taken.",
+                request_attempts=_provider_telemetry.data.get("request_attempts",0),response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+                status_code=_provider_telemetry.data.get("status_code"),error_code="invalid_json" if category=="invalid_json" else "schema_validation")
         reason=str(last_error) if isinstance(last_error,str) and re.fullmatch(
             r"Ollama is not reachable|Ollama connection timed out|Ollama service error(?: \(HTTP [1-5][0-9]{2}\))?",last_error) else "Ollama provider failure"
         category="connection" if "reachable" in reason.casefold() or "connection timed out" in reason.casefold() else "provider_failure"
-        raise MatchingProviderError(category,f"Ollama matching failed after {max(1,min(int(OLLAMA_ATTEMPTS),3))} bounded attempts ({reason}). Retry this job after checking the local model.")
-    raise RuntimeError(f"{provider.title()} matching failed after {attempts} bounded attempts ({last_error}).")
+        raise MatchingProviderError(category,f"Ollama matching failed after {max(1,min(int(OLLAMA_ATTEMPTS),3))} bounded attempts ({reason}). Retry this job after checking the local model.",
+            request_attempts=_provider_telemetry.data.get("request_attempts",0),response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+            status_code=_provider_telemetry.data.get("status_code"),error_code="provider_error")
+    if provider=="groq":
+        safe_message={"rate_limit":"Groq rate limit reached. The job remains queued for a later safe retry.",
+            "token_limit":"Groq rejected or truncated the response at a token limit.",
+            "timeout":"Groq did not finish the request before its timeout.",
+            "invalid_json":"Groq did not return valid JSON after bounded repair.",
+            "schema_error":"Groq output did not satisfy the required match schema.",
+            "provider_error":"Groq returned a provider or request error."}.get(failure_category,"Groq matching failed safely.")
+        raise MatchingProviderError(failure_category,safe_message,
+            request_attempts=_provider_telemetry.data.get("request_attempts",0),response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+            status_code=last_status_code,error_code=error_code)
+    raise MatchingProviderError(failure_category,"The selected matching provider failed safely.",
+        request_attempts=_provider_telemetry.data.get("request_attempts",0),response_time_ms=_provider_telemetry_snapshot().get("response_time_ms"),
+        status_code=last_status_code,error_code=error_code)
+
+
+def _rate_header_seconds(value):
+    text=str(value or "").strip().casefold()
+    if not text:return None
+    try:return max(0.0,float(text))
+    except ValueError:pass
+    total=0.0;found=False
+    for amount,unit in re.findall(r"(\d+(?:\.\d+)?)(h|m|s)",text):
+        total+=float(amount)*{"h":3600,"m":60,"s":1}[unit];found=True
+    return total if found else None
+
+
+def _groq_wait_for_rate_window(model,prompt):
+    estimate=max(1,(len(prompt)+2)//3)+GROQ_MAX_COMPLETION_TOKENS
+    while True:
+        with _groq_rate_lock:
+            state=dict(_groq_rate_state) if _groq_rate_state.get("model")==model else {}
+            if not state:return
+            if state:
+                if state.get("token_limit") and estimate>state["token_limit"]:
+                    raise MatchingProviderError("token_limit","The saved prompt exceeds Groq's reported token window; it remains queued for safe review.",error_code="token_window_exceeded")
+                waits=[]
+                if state.get("remaining_requests")==0 and state.get("requests_reset_at"):
+                    waits.append(state["requests_reset_at"]-time.monotonic())
+                if (state.get("remaining_tokens") is not None and state.get("remaining_tokens")<estimate and
+                    state.get("tokens_reset_at")):
+                    waits.append(state["tokens_reset_at"]-time.monotonic())
+                delay=max(waits,default=0.0)
+                if delay<=0:return
+                if delay>60:
+                    raise MatchingProviderError("rate_limit","Groq's response headers show the free-tier window is exhausted; the matching checkpoint remains queued until reset.")
+        time.sleep(max(.25,min(delay,60)))
+
+
+def _observe_groq_rate_headers(model,response):
+    headers=getattr(response,"headers",{}) or {}
+    now_mono=time.monotonic()
+    token_reset=_rate_header_seconds(headers.get("x-ratelimit-reset-tokens"))
+    request_reset=_rate_header_seconds(headers.get("x-ratelimit-reset-requests"))
+    def integer(name):
+        try:return max(0,int(headers.get(name)))
+        except (TypeError,ValueError):return None
+    with _groq_rate_lock:
+        _groq_rate_state.clear()
+        _groq_rate_state.update({"model":model,"token_limit":integer("x-ratelimit-limit-tokens"),
+            "remaining_tokens":integer("x-ratelimit-remaining-tokens"),
+            "remaining_requests":integer("x-ratelimit-remaining-requests"),
+            "tokens_reset_at":now_mono+token_reset if token_reset is not None else None,
+            "requests_reset_at":now_mono+request_reset if request_reset is not None else None})
 
 
 def analyze_with_provider(profile,profile_status,prefs,job,provider=None,model=None):
@@ -1641,6 +1937,9 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
         _persist_state(job_key, resume_id, "processing")
         job, feed_error = _find_feed_job(job_key, feeds)
         if feed_error:
+            _safe_record_match_diagnostic(user_id=USER,job_key=job_key,resume_id=resume_id,session_id=session_id or "",
+                provider="job_source",model="unknown",category="provider_error",request_attempts=0,retry_count=0,
+                error_code="posting_unverified")
             _persist_state(job_key, resume_id, "failed", error=_safe_feed_failure(feed_error))
             _finish_session_job(session_id,owner_token,job_key)
             continue
@@ -1650,10 +1949,37 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
             _persist_state(job_key, resume_id, "excluded", error="Excluded before AI analysis: posting is unrelated to saved career preferences.")
             _finish_session_job(session_id,owner_token,job_key)
             continue
+        _reset_provider_telemetry(provider,provider_model or MODEL)
         try:
             result = (analyze_with_ollama(profile,profile_status,prefs,job) if provider=="ollama"
                       else analyze_with_provider(profile,profile_status,prefs,job,provider,provider_model))
-            result = apply_safety_rules(result, profile, profile_status, prefs, job)
+        except Exception as error:
+            diagnostic=_provider_failure(error,provider)
+            _record_provider_diagnostic(user_id=USER,job_key=job_key,resume_id=resume_id,session_id=session_id or "",
+                provider=provider,model=provider_model or MODEL,category=diagnostic.category,error=diagnostic)
+            if session_id and owner_token and diagnostic.category=="rate_limit":
+                _persist_state(job_key,resume_id,"queued",error=diagnostic.public_message)
+                _finish_session_job(session_id,owner_token,job_key)
+                with database() as db:_release_match_owner(db,session_id,owner_token,status="paused",error="provider_rate_limit")
+                return
+            _persist_state(job_key,resume_id,"failed",error=diagnostic.public_message)
+            _finish_session_job(session_id,owner_token,job_key)
+            continue
+        try:
+            result=apply_safety_rules(result,profile,profile_status,prefs,job)
+        except Exception as error:
+            _record_provider_diagnostic(user_id=USER,job_key=job_key,resume_id=resume_id,session_id=session_id or "",
+                provider=provider,model=provider_model or MODEL,category="deterministic_validation",error=error)
+            _persist_state(job_key,resume_id,"failed",error="Deterministic matching validation failed. No application action was taken.")
+            _finish_session_job(session_id,owner_token,job_key)
+            continue
+        try:
+            telemetry=_provider_telemetry_snapshot()
+            _safe_record_match_diagnostic(user_id=USER,job_key=job_key,resume_id=resume_id,session_id=session_id or "",
+                provider=provider,model=provider_model or MODEL,category="success",
+                request_attempts=telemetry.get("request_attempts",0),
+                retry_count=max(0,telemetry.get("request_attempts",0)-1),response_time_ms=telemetry.get("response_time_ms"),
+                status_code=telemetry.get("status_code"),error_code="")
             _persist_state(job_key, resume_id, "completed", result)
             with database() as db:
                 stored = db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?", (USER, job_key)).fetchone()
@@ -1671,14 +1997,12 @@ def _process_batch(job_keys, resume_id, profile_status, profile, session_id=None
                     WHERE user_id=? AND job_key=? AND resume_id=?""",
                     (result.model_dump_json(),candidate_fp,preferences_fp,opening_fp,engine_version,USER,job_key,resume_id))
             _finish_session_job(session_id,owner_token,job_key,completed=True)
-        except Exception as error:
-            # Persist only sanitized diagnostics; never include prompt, profile,
-            # response text, URL query values, or exception payloads.
-            public_error=getattr(error,"public_message",None)
-            if not public_error:
-                public_error=("The current public posting could not be verified for matching. Refresh the source and retry." if feed_error
-                              else f"Match analysis failed ({type(error).__name__}). No application action was taken; retry this selected job.")
-            _persist_state(job_key, resume_id, "failed", error=str(public_error)[:500])
+        except Exception:
+            # This path is local persistence/worker logic, never a provider error.
+            _safe_record_match_diagnostic(user_id=USER,job_key=job_key,resume_id=resume_id,session_id=session_id or "",
+                provider="unknown",model="unknown",category="worker_error",request_attempts=0,retry_count=0,
+                error_code="result_persist_failed")
+            _persist_state(job_key,resume_id,"failed",error="Matching result could not be persisted safely. No application action was taken.")
             _finish_session_job(session_id,owner_token,job_key)
 
 
@@ -1733,7 +2057,10 @@ def _session_worker(session_id, resume_id, profile_status, profile, owner_token=
                 placeholders=",".join("?" for _ in keys) or "NULL"
                 rows=db.execute(f"SELECT job_key,status FROM job_match_results WHERE user_id=? AND resume_id=? AND job_key IN ({placeholders})",
                                 (USER,resume_id,*keys)).fetchall()
-                pending=[row["job_key"] for row in rows if row["status"] in ("queued","processing")]
+                status_by_key={row["job_key"]:row["status"] for row in rows}
+                # The JSON checkpoint defines deterministic order. SQLite row
+                # order may differ and must not change the bounded job set.
+                pending=[key for key in keys if status_by_key.get(key) in ("queued","processing")]
                 batch=pending[:int(session["batch_size"])]
                 if not batch:
                     failed=sum(row["status"]=="failed" for row in rows)
@@ -1749,12 +2076,18 @@ def _session_worker(session_id, resume_id, profile_status, profile, owner_token=
                     (batch[0],stamp,stamp,_match_lease_expiry(),stamp,session_id,owner_token))
             _process_batch(batch,resume_id,profile_status,profile,session_id,owner_token,provider,provider_model)
             with database() as db:
-                session=db.execute("SELECT status,owner_token,cancel_requested FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                session=db.execute("SELECT status,owner_token,cancel_requested,stop_after_batch FROM job_match_sessions WHERE session_id=? AND user_id=?",
                                    (session_id,USER)).fetchone()
                 if not session or session["owner_token"]!=owner_token:return
                 if session["cancel_requested"] or session["status"] in {"paused","cancelled"}:
                     _release_match_owner(db,session_id,owner_token,
                                          status="cancelled" if session["cancel_requested"] else "paused")
+                    return
+                if session["stop_after_batch"]:
+                    db.execute("UPDATE job_match_sessions SET stop_after_batch=0 WHERE session_id=? AND user_id=? AND owner_token=?",
+                               (session_id,USER,owner_token))
+                    _release_match_owner(db,session_id,owner_token,status="paused",
+                                         error="bounded_initial_batch_complete")
                     return
                 complete=db.execute("""SELECT job_key FROM job_match_results WHERE user_id=? AND resume_id=?
                     AND job_key IN (SELECT value FROM json_each(?)) AND status='completed'
@@ -1763,10 +2096,17 @@ def _session_worker(session_id, resume_id, profile_status, profile, owner_token=
                     db.execute("UPDATE job_match_sessions SET last_successful_job_key=? WHERE session_id=? AND owner_token=?",
                                (complete["job_key"],session_id,owner_token))
     except Exception as error:
-        logger.exception("Matching session worker failed for session %s",session_id[:8])
         with database() as db:
+            session=db.execute("SELECT resume_id,current_job_key,provider,provider_model FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                               (session_id,USER)).fetchone()
             _release_match_owner(db,session_id,owner_token,status="interrupted",
                                  error=f"{type(error).__name__}: matching worker stopped; resume may continue from saved results.")
+        _safe_record_match_diagnostic(user_id=USER,job_key=session["current_job_key"] if session else "",
+            resume_id=session["resume_id"] if session else resume_id,session_id=session_id,
+            provider=session["provider"] if session else provider or "unknown",
+            model=session["provider_model"] if session else provider_model or "unknown",
+            category="worker_error",request_attempts=0,retry_count=0,error_code=type(error).__name__.casefold())
+        logger.error("Matching session worker stopped safely: type=%s session_ref=%s",type(error).__name__,session_id[:8])
     finally:
         stop.set();heartbeat.join(timeout=2)
 
@@ -1979,9 +2319,39 @@ def _matching_conflict(db,requested_keys,workflow_id,stamp,*,allow_paused_overla
     linked_session_id=None
     if workflow_id:
         try:
-            linked=db.execute("SELECT matching_session_id FROM user_workflows WHERE workflow_id=? AND user_id=?",
+            linked=db.execute("SELECT matching_session_id,diagnostics_json FROM user_workflows WHERE workflow_id=? AND user_id=?",
                               (workflow_id,USER)).fetchone()
             linked_session_id=linked["matching_session_id"] if linked else None
+        except sqlite3.OperationalError:
+            try:
+                linked=db.execute("SELECT matching_session_id FROM user_workflows WHERE workflow_id=? AND user_id=?",
+                                  (workflow_id,USER)).fetchone()
+                linked_session_id=linked["matching_session_id"] if linked else None
+            except sqlite3.OperationalError:
+                linked_session_id=None
+            linked=None
+        try:
+            if linked_session_id:
+                linked_session=db.execute("SELECT workflow_id,job_keys_json FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                                           (linked_session_id,USER)).fetchone()
+                if not linked_session:
+                    linked_session_id=None
+                else:
+                    linked_workflow=str(linked_session["workflow_id"] or "")
+                    try:linked_keys=set(json.loads(linked_session["job_keys_json"] or "[]"))
+                    except (TypeError,json.JSONDecodeError):linked_keys=set()
+                    # A stored pointer may be stale or may refer to a blocking
+                    # legacy checkpoint. Preserve explicitly linked legacy
+                    # subsets, except when diagnostics identify this pointer
+                    # as the session that blocked the workflow.
+                    try:diagnostics=json.loads(linked["diagnostics_json"] or "{}") if linked and "diagnostics_json" in linked.keys() else {}
+                    except (TypeError,json.JSONDecodeError):diagnostics={}
+                    matching_diagnostics=diagnostics.get("matching") if isinstance(diagnostics.get("matching"),dict) else {}
+                    blocked_pointer=(matching_diagnostics.get("status")=="blocked" and
+                                     matching_diagnostics.get("session_id")==linked_session_id)
+                    if (linked_workflow not in {"",workflow_id} or
+                        (not linked_workflow and not linked_keys.issubset(set(requested_keys))) or blocked_pointer):
+                        linked_session_id=None
         except sqlite3.OperationalError:pass
     rows=db.execute("""SELECT * FROM job_match_sessions WHERE user_id=? AND
         (status IN ('queued','running') OR (status='paused' AND owner_token<>'')) ORDER BY updated_at DESC""",
@@ -2172,9 +2542,16 @@ def _match_rows(job_keys=None, resume_id=None):
         rows = db.execute("""SELECT m.job_key,m.resume_id,m.status,m.classification,m.match_score,m.freshness_status,
             m.candidate_fingerprint,m.preferences_fingerprint,m.job_fingerprint,m.matching_model_version,
             m.result_json,m.error,m.created_at,m.updated_at,o.company,o.title,o.location,o.url,
-            o.description,o.employment_type,o.country,o.work_arrangement,o.location_status,o.location_reason
+            o.description,o.employment_type,o.country,o.work_arrangement,o.location_status,o.location_reason,
+            d.provider AS diagnostic_provider,d.model AS diagnostic_model,d.category AS diagnostic_category,
+            d.request_attempts AS diagnostic_request_attempts,d.retry_count AS diagnostic_retry_count,
+            d.response_time_ms AS diagnostic_response_time_ms,d.status_code AS diagnostic_status_code,
+            d.error_code AS diagnostic_error_code
             FROM job_match_results m LEFT JOIN discovered_openings o
-            ON o.user_id=m.user_id AND o.job_key=m.job_key WHERE """ + " AND ".join(clauses) +
+            ON o.user_id=m.user_id AND o.job_key=m.job_key
+            LEFT JOIN job_match_diagnostics d ON d.diagnostic_id=(SELECT MAX(d2.diagnostic_id)
+                FROM job_match_diagnostics d2 WHERE d2.user_id=m.user_id AND d2.job_key=m.job_key AND d2.resume_id=m.resume_id)
+            WHERE """ + " AND ".join(clauses) +
             " ORDER BY CASE WHEN m.match_score IS NULL THEN 1 ELSE 0 END, m.match_score DESC, m.updated_at DESC", params).fetchall()
     try:
         current_resume,current_status,current_profile=active_candidate()
@@ -2187,6 +2564,12 @@ def _match_rows(job_keys=None, resume_id=None):
     result = []
     for row in rows:
         item = dict(row)
+        diagnostic_fields={"diagnostic_provider":"provider","diagnostic_model":"model","diagnostic_category":"category",
+            "diagnostic_request_attempts":"request_attempts","diagnostic_retry_count":"retry_count",
+            "diagnostic_response_time_ms":"response_time_ms","diagnostic_status_code":"status_code",
+            "diagnostic_error_code":"error_code"}
+        diagnostic={diagnostic_fields[key]:item.pop(key) for key in diagnostic_fields}
+        item["diagnostics"]=diagnostic if diagnostic.get("category") else None
         is_completed=item.get("status")=="completed"
         expected_job_fingerprint=job_fingerprint(item)
         version_is_stale=item.get("matching_model_version")!=current_engine_version
@@ -2375,6 +2758,8 @@ def retry_failed_match(request:FailedMatchRetryRequest):
         with database() as db:
             _release_match_owner(db,session_id,token,status="interrupted",
                                  error="Matching worker could not start; the selected failed job remains recoverable.")
+        _safe_record_match_diagnostic(user_id=USER,job_key=request.job_key,resume_id=resume_id,session_id=session_id,
+            provider=provider,model=model,category="worker_error",request_attempts=0,retry_count=0,error_code="worker_start_failed")
         raise HTTPException(503,"The selected-job retry could not start. Its checkpoint was preserved.") from error
     return _progress(session_id)
 
@@ -2422,6 +2807,29 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
         missing = set(keys) - valid_keys
         if missing:
             raise HTTPException(404, "One or more selected jobs are no longer saved.")
+    if request.bounded_resume:
+        # Restrict preflight and queue updates to the next persisted pending
+        # batch while retaining the full saved workflow checkpoint.
+        with database() as db:
+            pending_rows = db.execute(
+                f"SELECT job_key,status FROM job_match_results WHERE user_id=? AND resume_id=? "
+                f"AND job_key IN ({placeholders}) AND status IN ('queued','processing')",
+                (USER, resume_id, *keys),
+            ).fetchall()
+        pending = {row["job_key"] for row in pending_rows}
+        keys = [key for key in keys if key in pending][:request.batch_size]
+    if request.preserve_failed and keys:
+        # A checkpoint continuation must not silently retry historical failures.
+        # Explicit retries remain available through /api/jobs/matches/retry-failed.
+        with database() as db:
+            failure_placeholders=",".join("?" for _ in keys)
+            failed_rows = db.execute(
+                f"SELECT job_key FROM job_match_results WHERE user_id=? AND resume_id=? "
+                f"AND job_key IN ({failure_placeholders}) AND status='failed'",
+                (USER, resume_id, *keys),
+            ).fetchall()
+        failed_keys = {row["job_key"] for row in failed_rows}
+        keys = [key for key in keys if key not in failed_keys]
     # Recompute stored fingerprints before deciding whether a completed result
     # is reusable. Legacy rows without fingerprints must be reanalyzed.
     _match_rows(keys,resume_id)
@@ -2544,8 +2952,17 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
         if session_id:
             current=db.execute("SELECT * FROM job_match_sessions WHERE session_id=? AND user_id=?",
                                (session_id,USER)).fetchone()
-            provider=current["provider"] or provider
-            provider_model=current["provider_model"] or _provider_model(provider)
+            saved_provider=current["provider"] or provider
+            saved_model=current["provider_model"] or _provider_model(saved_provider)
+            if saved_provider=="groq":
+                blocker=_groq_authorization_blocker(authorization_settings)
+                if blocker:raise HTTPException(403,blocker)
+                if provider!="groq" or saved_model!=provider_model:
+                    raise HTTPException(409,"The saved Groq checkpoint does not match the currently authorized provider and model.")
+            elif current["provider"] and current["provider"]!=provider:
+                raise HTTPException(409,"The saved matching checkpoint uses a different provider; it was preserved.")
+            provider=saved_provider
+            provider_model=saved_model
             if current["owner_token"]:
                 raise HTTPException(409,{"code":"active_worker","message":"This matching checkpoint is still owned by an active worker."})
             # Any processing rows left by a previous dead/legacy worker are
@@ -2556,27 +2973,33 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
             owner_token=uuid.uuid4().hex
             db.execute("""UPDATE job_match_sessions SET status='queued',error=NULL,batch_size=?,workflow_id=CASE
                 WHEN workflow_id='' THEN ? ELSE workflow_id END,provider=?,provider_model=?,owner_token=?,owner_pid=?,
-                owner_host=?,heartbeat_at=?,lease_expires_at=?,cancel_requested=0,current_job_key='',current_job_started_at=NULL,updated_at=?
+                owner_host=?,heartbeat_at=?,lease_expires_at=?,cancel_requested=0,current_job_key='',current_job_started_at=NULL,
+                stop_after_batch=?,updated_at=?
                 WHERE session_id=? AND user_id=?""",
                 (request.batch_size,workflow_id or '',provider,provider_model,owner_token,os.getpid(),socket.gethostname(),
-                 timestamp,_match_lease_expiry(),timestamp,session_id,USER))
+                 timestamp,_match_lease_expiry(),int(request.stop_after_batch),timestamp,session_id,USER))
             should_submit=True
         elif queued or excluded_keys or preference_conflicts or requested_keys:
             session_id = str(uuid.uuid4());owner_token=uuid.uuid4().hex
             db.execute("""INSERT INTO job_match_sessions
                 (session_id,user_id,resume_id,status,job_keys_json,batch_size,total_jobs,workflow_id,
-                 owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at,provider,provider_model)
-                VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 owner_token,owner_pid,owner_host,heartbeat_at,lease_expires_at,created_at,updated_at,provider,provider_model,stop_after_batch)
+                VALUES(?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (session_id,USER,resume_id,json.dumps(requested_keys),request.batch_size,len(requested_keys),workflow_id or '',
-                 owner_token,os.getpid(),socket.gethostname(),timestamp,_match_lease_expiry(),timestamp,timestamp,provider,provider_model))
+                 owner_token,os.getpid(),socket.gethostname(),timestamp,_match_lease_expiry(),timestamp,timestamp,provider,provider_model,
+                 int(request.stop_after_batch)))
             should_submit=True
     if session_id:
         if should_submit:
             try:executor.submit(_session_worker,session_id,resume_id,profile_status,profile,owner_token,provider,provider_model)
             except Exception as error:
+                startup_reason=("interpreter shutdown" if "interpreter shutdown" in str(error).casefold()
+                               else "executor unavailable")
                 with database() as db:
                     _release_match_owner(db,session_id,owner_token,status="interrupted",
-                        error=f"{type(error).__name__}: matching worker could not start; retry may resume from this checkpoint.")
+                        error=f"{type(error).__name__}: {startup_reason}; matching worker could not start; retry may resume from this checkpoint.")
+                _safe_record_match_diagnostic(user_id=USER,resume_id=resume_id,session_id=session_id,provider=provider,
+                    model=provider_model,category="worker_error",request_attempts=0,retry_count=0,error_code="worker_start_failed")
                 raise HTTPException(503,"The matching worker could not start. Its checkpoint is saved; resume matching to retry.") from error
         return _session_progress_response(session_id,queued=len(queued),excluded=len(excluded_keys),
                                           prechecked=len(preference_conflicts))
@@ -2633,6 +3056,9 @@ def resume_matches(session_id:str|None=None,workflow_id:str|None=None):
                         row["provider"] or "ollama",row["provider_model"] or _provider_model(row["provider"] or "ollama"))
     except Exception as error:
         with database() as db:_release_match_owner(db,session_id,token,status='interrupted',error=f"{type(error).__name__}: matching worker could not start.")
+        _safe_record_match_diagnostic(user_id=USER,resume_id=resume_id,session_id=session_id,
+            provider=row["provider"] or "ollama",model=row["provider_model"] or MODEL,
+            category="worker_error",request_attempts=0,retry_count=0,error_code="worker_start_failed")
         raise HTTPException(503,"The matching worker could not start. Its checkpoint is saved.") from error
     return _progress(session_id)
 
@@ -2650,6 +3076,42 @@ def cancel_matches(session_id:str|None=None):
         db.execute("UPDATE job_match_sessions SET cancel_requested=1,status='cancelled',updated_at=? WHERE session_id=? AND owner_token=?",
                    (now(),row["session_id"],row["owner_token"]))
     return _progress(row["session_id"])
+
+
+def cancel_paused_checkpoint(session_id:str,confirmed=False):
+    """Cancel one explicitly approved, ownerless paused checkpoint without rewriting results."""
+    if not confirmed:
+        raise HTTPException(422,"Confirm cancellation of this paused matching checkpoint.")
+    stamp=now();stamp_dt=datetime.fromisoformat(stamp)
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row=db.execute("SELECT * FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                       (session_id,USER)).fetchone()
+        if not row:raise HTTPException(404,"Matching session not found.")
+        if row["status"]!="paused" or row["owner_token"]:
+            raise HTTPException(409,"Only an ownerless paused checkpoint can be cancelled this way.")
+        if row["lease_expires_at"] and row["lease_expires_at"]>stamp:
+            raise HTTPException(409,"The matching worker lease is still valid.")
+        if row["owner_pid"] and row["owner_host"]==socket.gethostname() and _pid_is_alive(row["owner_pid"]):
+            raise HTTPException(409,"The recorded matching worker process is still alive.")
+        try:last=datetime.fromisoformat(row["updated_at"])
+        except (TypeError,ValueError):last=stamp_dt
+        if last.tzinfo is None:last=last.replace(tzinfo=timezone.utc)
+        if (stamp_dt-last).total_seconds()<MATCH_OWNERLESS_RECOVERY_SECONDS:
+            raise HTTPException(409,"The paused checkpoint changed recently; wait before cancelling it.")
+        try:keys=json.loads(row["job_keys_json"] or "[]")
+        except (TypeError,json.JSONDecodeError):keys=[]
+        if keys:
+            marks=",".join("?" for _ in keys)
+            processing=db.execute(f"SELECT 1 FROM job_match_results WHERE user_id=? AND resume_id=? AND status='processing' AND job_key IN ({marks}) LIMIT 1",
+                                  (USER,row["resume_id"],*keys)).fetchone()
+            if processing:
+                raise HTTPException(409,"A job result is still processing; recover the worker before cancellation.")
+        changed=db.execute("""UPDATE job_match_sessions SET status='cancelled',cancel_requested=1,
+            error='explicitly_cancelled_by_applicant',updated_at=? WHERE session_id=? AND user_id=?
+            AND status='paused' AND owner_token=''""",(stamp,session_id,USER)).rowcount
+        if not changed:raise HTTPException(409,"The matching checkpoint changed; reload its current state.")
+    return {"session_id":session_id,"status":"cancelled","preserved_job_count":len(keys),"results_preserved":True}
 
 
 @router.post("/api/jobs/matches/{session_id}/recover")

@@ -83,6 +83,57 @@ def _opening_identity(job):
         parts={"url":url}
     digest=hashlib.sha256(json.dumps(parts,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     return {"hash":digest,"parts":parts,"url":url}
+
+def _record_application_attention(job, blocker_code, reason, *, eligibility_state="needs_review",
+                                  form_state="unknown", report=None):
+    """Create or refresh one durable handoff per canonical opening and blocker.
+
+    This ledger is separate from application attempts: an unsupported or blocked
+    form must never look like a preparation attempt.
+    """
+    report=report if isinstance(report,dict) else {}
+    identity=_opening_identity(job)
+    posting_url=_sanitized_inspection_url(job.get("job_url") or job.get("url") or "")
+    application_url=_sanitized_inspection_url(job.get("application_url") or job.get("url") or "")
+    blocker_code=str(blocker_code or "human_review")[:60]
+    reason=str(reason or "Review this opening manually.")[:600]
+    actions={"unsupported_form":"Open the official employer application and complete it manually.",
+        "human_verification":"Complete the requested human verification on the employer site, then return here.",
+        "applicant_information":"Confirm the missing applicant information before preparation.",
+        "employer_clarification":"Review the official posting or contact the employer to clarify the requirement.",
+        "posting_review":"Verify the current posting and requisition status on the official employer site.",
+        "preparation_failure":"Review the preparation details and retry only after resolving the listed issue."}
+    action=actions.get(blocker_code,"Review the official employer posting and resolve this item manually.")
+    stamp=now()
+    form_fingerprint=str(report.get("form_fingerprint") or "")[:128]
+    posting_fingerprint=str(job.get("content_fingerprint") or "")[:128]
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        prior_application=db.execute("""SELECT a.state FROM applications a WHERE a.user_id=? AND
+            (a.job_key=? OR a.id=(SELECT r.application_id FROM application_opening_reservations r
+                WHERE r.user_id=? AND r.identity_hash=? LIMIT 1)) ORDER BY a.updated_at DESC LIMIT 1""",
+            (USER,str(job.get("job_key") or "")[:250],USER,identity["hash"])).fetchone()
+        preparation_state=str(prior_application["state"] if prior_application else "not_prepared")[:40]
+        current=db.execute("SELECT attention_id FROM application_attention_items WHERE user_id=? AND identity_hash=? AND blocker_code=? AND status IN ('open','acknowledged')",
+            (USER,identity["hash"],blocker_code)).fetchone()
+        if current:
+            db.execute("""UPDATE application_attention_items SET job_key=?,employer=?,title=?,posting_url=?,application_url=?,
+                reason=?,applicant_action=?,eligibility_state=?,form_state=?,preparation_state=?,form_fingerprint=?,posting_fingerprint=?,last_seen_at=?,updated_at=?
+                WHERE attention_id=? AND status IN ('open','acknowledged')""",
+                (str(job.get("job_key") or "")[:250],str(job.get("company") or job.get("employer") or "")[:160],
+                 str(job.get("title") or "")[:200],posting_url[:2048],application_url[:2048],reason,action,
+                 str(eligibility_state)[:40],str(form_state)[:40],preparation_state,form_fingerprint,posting_fingerprint,stamp,stamp,current["attention_id"]))
+            return current["attention_id"]
+        attention_id=str(uuid.uuid4())
+        db.execute("""INSERT INTO application_attention_items(attention_id,user_id,identity_hash,job_key,employer,title,
+            posting_url,application_url,blocker_code,reason,applicant_action,eligibility_state,form_state,preparation_state,
+            form_fingerprint,posting_fingerprint,status,created_at,updated_at,last_seen_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)""",
+            (attention_id,USER,identity["hash"],str(job.get("job_key") or "")[:250],
+             str(job.get("company") or job.get("employer") or "")[:160],str(job.get("title") or "")[:200],
+             posting_url[:2048],application_url[:2048],blocker_code,reason,action,str(eligibility_state)[:40],
+             str(form_state)[:40],preparation_state,form_fingerprint,posting_fingerprint,stamp,stamp,stamp))
+    return attention_id
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try: return super().__exit__(exc_type, exc_value, traceback)
@@ -193,6 +244,19 @@ def initialize():
             id TEXT PRIMARY KEY,user_id TEXT NOT NULL,job_key TEXT NOT NULL,provider TEXT NOT NULL,
             outcome TEXT NOT NULL,report_json TEXT NOT NULL,inspected_at TEXT NOT NULL)""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_form_inspections_user_job ON application_form_inspections(user_id,job_key,inspected_at)")
+        db.execute("""CREATE TABLE IF NOT EXISTS application_attention_items(
+            attention_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,identity_hash TEXT NOT NULL,job_key TEXT NOT NULL,
+            employer TEXT NOT NULL,title TEXT NOT NULL,posting_url TEXT NOT NULL,application_url TEXT NOT NULL,
+            blocker_code TEXT NOT NULL,reason TEXT NOT NULL,applicant_action TEXT NOT NULL,
+            eligibility_state TEXT NOT NULL,form_state TEXT NOT NULL,preparation_state TEXT NOT NULL DEFAULT 'not_prepared',
+            form_fingerprint TEXT NOT NULL DEFAULT '',posting_fingerprint TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','acknowledged','resolved')),
+            created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,acknowledged_at TEXT,resolved_at TEXT)""")
+        attention_index=db.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_application_attention_open'").fetchone()
+        if attention_index and "acknowledged" not in str(attention_index["sql"] or ""):
+            db.execute("DROP INDEX uq_application_attention_open")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_application_attention_open ON application_attention_items(user_id,identity_hash,blocker_code) WHERE status IN ('open','acknowledged')")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_application_attention_status ON application_attention_items(user_id,status,updated_at DESC)")
         db.execute("""CREATE TABLE IF NOT EXISTS application_preparation_authorizations(
             authorization_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,job_key TEXT NOT NULL,
             application_url_hash TEXT NOT NULL,resume_id TEXT NOT NULL,match_updated_at TEXT NOT NULL,
@@ -907,7 +971,13 @@ def _standing_policy_blocker(job):
     if any(norm(value) and norm(value) in employer for value in settings.get("standing_policy_excluded_employers",[])):
         return "This employer is excluded by the standing policy."
     category=norm(job.get("career_category") or job.get("category"))
-    allowed_categories={norm(value) for value in settings.get("standing_policy_categories",[])}
+    category_aliases={"software development":"software engineering"}
+    category=category_aliases.get(category,category)
+    if not category and re.search(r"\bsoftware\s+engineer\b",norm(job.get("title"))):
+        # A verified ATS title is explicit enough to satisfy this category
+        # scope; leave other missing or ambiguous categories fail-closed.
+        category="software engineering"
+    allowed_categories={category_aliases.get(norm(value),norm(value)) for value in settings.get("standing_policy_categories",[])}
     if not category or category not in allowed_categories:return "The job category is outside or missing from the standing policy scope."
     employment_alias={"fulltime":"full time","full time":"full time","parttime":"part time","part time":"part time",
         "contract":"contract","intern":"internship","internship":"internship","temporary":"temporary"}
@@ -930,7 +1000,8 @@ def _standing_policy_blocker(job):
             any(value and (value==job_location or value in job_location) for value in allowed_locations)):
         return "Job location is outside or missing from the standing policy scope."
     arrangement=norm(job.get("work_arrangement"))
-    if not arrangement or arrangement not in {norm(value) for value in settings.get("standing_policy_work_arrangements",[])}:
+    allowed_arrangements={norm(value) for value in settings.get("standing_policy_work_arrangements",[])}
+    if not arrangement or not allowed_arrangements or not ("any" in allowed_arrangements or arrangement in allowed_arrangements):
         return "Work arrangement is outside or missing from the standing policy scope."
     try:
         from job_relevance import classify_experience_level
@@ -970,7 +1041,10 @@ def _derive_standing_policy_authorization(job_key,resume_id,application_url):
     if _public_url_for_confirmation(application_url)!=_public_url_for_confirmation(job.get("application_url")):
         return False,"The application URL changed since the saved posting was loaded."
     posting_blocker=_standing_policy_blocker(job)
-    if posting_blocker:return False,posting_blocker
+    if posting_blocker:
+        if any(term in posting_blocker.casefold() for term in ("closed and reopened","no longer verified","inactive","not currently available")):
+            _record_application_attention(job,"posting_review",posting_blocker,eligibility_state="needs_review",form_state="not_checked")
+        return False,posting_blocker
     inspection=None
     with connect() as db:
         row=db.execute("SELECT report_json,inspected_at FROM application_form_inspections WHERE user_id=? AND job_key=? ORDER BY inspected_at DESC LIMIT 1",
@@ -991,17 +1065,33 @@ def _derive_standing_policy_authorization(job_key,resume_id,application_url):
             inspection=inspect_public_application_form(job.get("application_url"))
             inspection=_save_form_inspection(job,inspection,preparation_preflight=True)
         except (HTTPException,ValueError) as error:
-            return False,(str(getattr(error,"detail",error)) or "The public form inspection could not be completed safely.")[:300]
+            reason=(str(getattr(error,"detail",error)) or "The public form inspection could not be completed safely.")[:500]
+            _record_application_attention(job,"employer_clarification",reason,eligibility_state="needs_review",form_state="inspection_blocked")
+            return False,reason[:300]
         except Exception as error:
-            return False,f"The public form inspection failed safely ({type(error).__name__})."
+            reason=f"The public form inspection failed safely ({type(error).__name__})."
+            _record_application_attention(job,"employer_clarification",reason,eligibility_state="needs_review",form_state="inspection_blocked")
+            return False,reason
     try:job,resume,candidate,answers,fields,documents,report,snapshot=_saved_preparation_context(job_key)
     except HTTPException as error:return False,str(error.detail)[:300]
     if _public_url_for_confirmation(application_url)!=_public_url_for_confirmation(job.get("application_url")):
         return False,"The application URL changed since the saved posting was loaded."
     blocker=_standing_policy_blocker(job)
     if blocker:return False,blocker
-    if not report or _preparation_inspection_blocker(report):return False,"The employer form is not verified as supported; human review is required."
-    if _unmapped_requirements_blocker(job_key,resume_id):return False,"Mandatory posting requirements remain unresolved."
+    if not report or _preparation_inspection_blocker(report):
+        reason=(str((report or {}).get("reason") or "The employer form is not verified as supported; human review is required.")[:500])
+        report=report or {}
+        code=("human_verification" if report.get("human_actions_required") or report.get("inspection_outcome")=="needs_human_action"
+              else "unsupported_form" if not report.get("form_detected") or report.get("compatibility_status") in {"unsupported","posting_only"}
+              else "employer_clarification")
+        _record_application_attention(job,code,reason,eligibility_state="needs_review",
+            form_state=str(report.get("compatibility_status") or report.get("inspection_outcome") or "unknown"),report=report)
+        return False,reason
+    if _unmapped_requirements_blocker(job_key,resume_id):
+        reason="Mandatory posting requirements remain unresolved."
+        _record_application_attention(job,"applicant_information",reason,eligibility_state="needs_review",
+                                      form_state=str(report.get("compatibility_status") or "unknown"),report=report)
+        return False,reason
     settings=get_authorization()["settings"]
     available={str(item["key"]) for item in fields}
     approved=set(settings.get("standing_policy_field_keys") or [])
@@ -1125,6 +1215,13 @@ def _save_form_inspection(job,report,*,preparation_preflight=False):
             db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
                 (str(report.get("inspection_id") or uuid.uuid4()),USER,str(job.get("job_key") or "")[:250],str((report.get("provider") or {}).get("provider") or "unknown")[:40],
                  str(report.get("inspection_outcome") or "unsupported")[:40],json.dumps(report,ensure_ascii=False,separators=(",",":")),report["inspected_at"]))
+        blocker=_preparation_inspection_blocker(report) if preparation_preflight else ""
+        if blocker and job.get("job_key") and not str(job.get("job_key")).startswith("standalone:"):
+            code=("human_verification" if report.get("human_actions_required") or report.get("inspection_outcome")=="needs_human_action"
+                  else "unsupported_form" if not report.get("form_detected") or report.get("compatibility_status") in {"unsupported","posting_only"}
+                  else "employer_clarification")
+            _record_application_attention(job,code,blocker,eligibility_state="needs_review",
+                form_state=str(report.get("compatibility_status") or report.get("inspection_outcome") or "unknown"),report=report)
     except sqlite3.Error as exc:
         raise HTTPException(500,"The read-only employer form check ran, but its report could not be saved.") from exc
     return report
@@ -1206,10 +1303,13 @@ def preparation_authorization_plan(job_key:str):
     except (TypeError,json.JSONDecodeError):match_data={}
     try:application_settings=json.loads(settings_row["settings_json"] or "{}") if settings_row else {}
     except (TypeError,json.JSONDecodeError):application_settings={}
+    qualitative_questions=_qualitative_missing_question_keys(match_data)
     missing_questions=list(dict.fromkeys([
-        *[str(value)[:500] for value in match_data.get("missing_information",[]) if str(value or "").strip()],
+        *[str(value)[:500] for value in match_data.get("missing_information",[]) if str(value or "").strip()
+          and str(value).strip().casefold() not in qualitative_questions],
         *[str(item.get("missing_question"))[:500] for item in match_data.get("technical_qualifications",[])
-          if isinstance(item,dict) and item.get("requiredness")=="required" and item.get("status")=="needs_review" and item.get("missing_question")],
+          if isinstance(item,dict) and item.get("requiredness")=="required" and item.get("status")=="needs_review" and item.get("missing_question")
+          and not _is_qualitative_employer_expectation(item.get("requirement"))],
         *([str(match_data.get("availability_assessment",{}).get("missing_question"))[:500]]
           if isinstance(match_data.get("availability_assessment"),dict) and match_data["availability_assessment"].get("missing_question") else [])]))
     blockers=list(eligibility.get("blockers",[]))
@@ -1224,7 +1324,8 @@ def preparation_authorization_plan(job_key:str):
         "posting_verified_at":str(job.get("last_verified_at") or ""),"provider":detect_application_provider(job.get("application_url")),"eligibility":snapshot["classification"],
         "eligibility_assessment":eligibility,"missing_requirements":[
             *[item for field in ("required_skills","required_experience","education_requirements","technical_qualifications")
-              for item in match_data.get(field,[]) if isinstance(item,dict) and item.get("requiredness")!="preferred" and item.get("status") in {"gap","unclear","needs_review","confirmed_mismatch"}],
+              for item in match_data.get(field,[]) if isinstance(item,dict) and item.get("requiredness")!="preferred" and
+              not _is_qualitative_employer_expectation(item.get("requirement")) and item.get("status") in {"gap","unclear","needs_review","confirmed_mismatch"}],
             *([{**match_data["availability_assessment"],"category":"availability"}] if isinstance(match_data.get("availability_assessment"),dict) and
                match_data["availability_assessment"].get("requiredness")=="required" and match_data["availability_assessment"].get("status") in {"needs_review","confirmed_mismatch"} else []),
             *[{"requirement":item,"requiredness":"required","status":"unassessed","explanation":"This explicit mandatory posting item has not been evaluated."}
@@ -1410,11 +1511,14 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
             "job_fingerprint":item.get("job_fingerprint") or "",
             "matching_engine_version":item.get("matching_model_version") or ""}
         review_missing=match_data.get("missing_information") if isinstance(match_data.get("missing_information"),list) else []
+        qualitative_questions=_qualitative_missing_question_keys(match_data)
         employment_unknown=not str(item.get("employment_type") or "").strip()
         role_seniority_unknown=any(entry.get("category")=="employer_metadata_uncertainty" and
             "seniority" in str(entry.get("requirement") or "").casefold()
             for entry in item["eligibility_review_assessment"].get("employer_uncertainties",[]))
-        reviewable_missing=[value for value in review_missing if not (
+        has_qualitative_expectation=any(_is_qualitative_employer_expectation(q.get("requirement"))
+            for q in match_data.get("technical_qualifications",[]) if isinstance(q,dict) and q.get("requiredness")=="required")
+        reviewable_missing=[value for value in review_missing if not _is_qualitative_employer_expectation(value) and str(value).strip().casefold() not in qualitative_questions and not (
             (employment_unknown and re.search(r"employment type.{0,90}(?:not provided|not specified|unknown)",str(value),re.I)) or
             (role_seniority_unknown and re.search(r"experience level.{0,60}(?:not clear|unclear)",str(value),re.I)))]
         item["evidence_review"]={
@@ -1422,7 +1526,7 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
                 not item["eligibility_stale"] and not unresolved and not reviewable_missing and
                 not unmapped_required and
                 bool(item.get("candidate_fingerprint") and item.get("preferences_fingerprint") and item.get("job_fingerprint")) and
-                (employment_unknown or role_seniority_unknown or match_data.get("ai_evidence_diagnostics"))),
+                (employment_unknown or role_seniority_unknown or match_data.get("ai_evidence_diagnostics") or has_qualitative_expectation)),
             "employment_type_unknown":employment_unknown,
             "role_seniority_unknown":role_seniority_unknown,
             "ai_diagnostics":list(dict.fromkeys([
@@ -1743,6 +1847,42 @@ def _confirmed_location(candidate):
     return ", ".join(str(candidate.get(key)).strip() for key in ("city","state_province","country")
                       if candidate.get(key) and str(candidate.get(key)).strip())
 
+_QUALITATIVE_EXPECTATION=re.compile(
+    r"\b(?:customer empathy|product thinking|product builder|founder[- ]level ownership|high ownership|ownership mindset|low ego|"
+    r"self[ -]motivated|curious|curiosity|excellent communicator|communication skills?|collaborat(?:ion|e)|"
+    r"teamwork|team player|interpersonal skills?|fast[ -]paced|passion(?:ate)?|desire to|excited to|"
+    r"culture fit|work ethic|ability to thrive)\b",re.I)
+_OBJECTIVE_QUALIFICATION=re.compile(
+    r"\b(?:minimum of|at least|\d{1,2}(?:\s*[-–]\s*\d{1,2})?\+?\s+years?|"
+    r"degree|bachelor|master|ph\.?d|gpa|graduat(?:e|ion)|available to start|work authorization|"
+    r"authorized to work|visa|sponsorship|citizenship|security clearance|certification|license|"
+    r"intern(?:ship)?(?:/co[ -]?op)? experience|co[ -]?op experience|"
+    r"multiple release cycles|two release cycles|experience (?:with|in|building|developing|delivering|shipping)|"
+    r"proficien(?:t|cy)|fluency (?:with|in)|fundamentals in|knowledge of|"
+    r"on[ -]site|in[ -]office|hybrid schedule|"
+    r"(?:must|required|requires?)\b.{0,80}\b(?:python|typescript|javascript|java|react|node(?:\.js)?|"
+    r"sql|database|cloud|full[ -]?stack|front[ -]?end|back[ -]?end|data structures?|algorithms?)\b)\b",re.I)
+
+def _is_qualitative_employer_expectation(requirement):
+    """Treat broad behavioral/product expectations as review context, not hard prerequisites."""
+    text=str(requirement or "").strip()
+    text=text.translate(str.maketrans({"\u2010":"-","\u2011":"-","\u2012":"-","\u2013":"-","\u2014":"-"}))
+    if not text or _OBJECTIVE_QUALIFICATION.search(text):return False
+    return bool(_QUALITATIVE_EXPECTATION.search(text))
+
+def _qualitative_missing_question_keys(match):
+    """Map saved missing-information prefixes back to qualitative-only questions."""
+    result=set()
+    entries=match.get("technical_qualifications",[]) if isinstance(match,dict) else []
+    for item in entries if isinstance(entries,list) else []:
+        if not isinstance(item,dict) or item.get("requiredness")=="preferred" or not _is_qualitative_employer_expectation(item.get("requirement")):
+            continue
+        question=str(item.get("missing_question") or "").strip()
+        if question:
+            result.add(question.casefold())
+            result.add(("Technical qualification needs confirmation: "+question).casefold())
+    return result
+
 def _unresolved_mandatory(result_json,job_description=""):
     try: result=json.loads(result_json or "{}")
     except (TypeError,json.JSONDecodeError): return True
@@ -1750,14 +1890,20 @@ def _unresolved_mandatory(result_json,job_description=""):
         entries=result.get(key,[])
         if not isinstance(entries,list): continue
         for entry in entries:
+            if key=="required_skills" and isinstance(entry,dict) and _is_qualitative_employer_expectation(entry.get("requirement")):
+                continue
             if isinstance(entry,dict) and str(entry.get("status","")).casefold() in {"gap","unclear","confirmed_mismatch","unknown"}:
                 return True
     technical=result.get("technical_qualifications",[])
     if isinstance(technical,list) and any(isinstance(item,dict) and item.get("requiredness")=="required"
+        and not _is_qualitative_employer_expectation(item.get("requirement"))
         and item.get("status") in {"needs_review","confirmed_mismatch"} for item in technical):
         return True
     missing=result.get("missing_information",[])
     if isinstance(missing,list) and any(re.search(r"work authorization|sponsor|visa|location|graduat|education|professional experience|years of experience",str(item),re.I) for item in missing):
+        return True
+    availability=result.get("availability_assessment")
+    if isinstance(availability,dict) and availability.get("requiredness")=="required" and availability.get("status")!="met":
         return True
     try:
         from job_relevance import extract_experience_requirements
@@ -1788,12 +1934,20 @@ def _unmapped_required_posting_items(description,result):
     text=re.sub(r"<br\s*/?>","\n",text,flags=re.I)
     text=re.sub(r"<[^>]+>"," ",text)
     text=re.sub(r"\s+(?=(?:requirements|required qualifications|minimum qualifications|basic qualifications|what you(?:'|’)ll bring|nice to have|preferred qualifications|what you(?:'|’)ll do)\s*:)","\n",text,flags=re.I)
+    # Preserve date ranges such as "November 2026 - June 2027" while treating
+    # surrounding standalone hyphens as flattened bullet separators.
+    months=r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    text=re.sub(rf"\b({months}\s+\d{{4}})\s+-\s+({months}\s+\d{{4}})\b",r"\1 – \2",text,flags=re.I)
+    text=re.sub(r",\s+(?=ideally\b)","\n",text,flags=re.I)
     text=re.sub(r"\s+[-•]\s+","\n",text)
     text=re.sub(r"\s+(?=we need to hire|we are hiring|candidates? must|applicants? must)\b","\n",text,flags=re.I)
     text=re.sub(r"\s+(?=we are an equal opportunity employer)\b","\n",text,flags=re.I)
+    # Some ATS descriptions flatten headings into the preceding bullet. Split
+    # known section boundaries even when there is no punctuation before them.
+    text=re.sub(r"\s+(?=interesting technical challenges\??\s|what you(?:'|’)ll work on\s)","\n",text,flags=re.I)
     text=re.sub(r"(?<=[.!?])\s+(?=[A-Z])","\n",text)
     lines=[re.sub(r"\s+"," ",line).strip(" \t\r\n•-*") for line in text.splitlines()]
-    heading=re.compile(r"^(requirements|required qualifications|minimum qualifications|basic qualifications|what you(?:'|’)ll bring|nice to haves?|preferred qualifications|preferred experience|responsibilities|what you(?:'|’)ll do|our values|equal opportunity employer)$",re.I)
+    heading=re.compile(r"^(requirements|required qualifications|minimum qualifications|basic qualifications|what you(?:'|’)ll bring|nice to haves?|preferred qualifications|preferred experience|responsibilities|what you(?:'|’)ll do|interesting technical challenges|what you(?:'|’)ll work on|our values|equal opportunity employer)$",re.I)
     required_sections={"requirements","required qualifications","minimum qualifications","basic qualifications","what you'll bring","what you’ll bring"}
     preferred_sections={"nice to have","nice to haves","preferred qualifications","preferred experience"}
     required_items=[];section=""
@@ -1802,7 +1956,7 @@ def _unmapped_required_posting_items(description,result):
         if heading.fullmatch(clean):
             section=clean
             continue
-        if section in required_sections and line and len(line)>8 and not re.search(r"\b(?:nice[-\u2011 ]to[-\u2011 ]have|preferred|bonus|a plus)\b",line,re.I):
+        if section in required_sections and line and len(line)>8 and not re.search(r"\b(?:nice[-\u2011 ]to[-\u2011 ]have|preferred|ideally|preferably|bonus|a plus|no need to have|not required|not a requirement)\b",line,re.I):
             required_items.append(line)
         elif section in preferred_sections or section in {"responsibilities","what you'll do","what you’ll do","our values","equal opportunity employer"}:
             continue
@@ -1815,22 +1969,31 @@ def _unmapped_required_posting_items(description,result):
     assessed=[]
     for key in ("required_skills","required_experience","education_requirements","technical_qualifications"):
         values=result.get(key,[])
-        if isinstance(values,list):assessed.extend(str(item.get("requirement") or "") for item in values if isinstance(item,dict))
+        if isinstance(values,list):
+            for item in values:
+                if not isinstance(item,dict):continue
+                value=str(item.get("requirement") or "").strip()
+                # A flattened whole-section assessment cannot prove that each
+                # qualification inside it was separately evaluated.
+                if len(re.findall(r"\b[\w+#.]+\b",value))>32 or re.search(r"\brequirements?\s*[-:]",value,re.I):
+                    continue
+                if value:assessed.append(value)
     availability=result.get("availability_assessment")
     if isinstance(availability,dict) and availability.get("requirement"):
         assessed.append(str(availability["requirement"]))
-    assessment_text=" ".join(assessed).casefold()
+    availability_requirement=str(availability.get("requirement") or "").casefold() if isinstance(availability,dict) else ""
+    assessment_tokens=[set(re.findall(r"[a-z0-9+#]+",value.casefold())) for value in assessed]
     location_text=str(result.get("location_assessment") or "").casefold()
     unmapped=[]
     for item in dict.fromkeys(required_items):
         lower=item.casefold()
-        if re.search(r"\b(?:degree|b\.\s*s|bachelor|master|graduat|gpa)\b",lower) and result.get("education_requirements"):
+        if _is_qualitative_employer_expectation(item):continue
+        if availability_requirement and "available to start" in lower and "available to start" in availability_requirement:
             continue
-        if re.search(r"\b(?:on.site|work location|office|relocat|in our)\b",lower) and location_text:
+        if re.search(r"\b(?:on.site|in[ -]person|work location|office|relocat|in our)\b",lower) and location_text:
             continue
         tokens={word for word in re.findall(r"[a-z0-9+#]+",lower) if len(word)>2 and word not in {"the","and","for","with","from","that","both","you","your","our","are","not","need","expert","about","into","across"}}
-        assessed_tokens=set(re.findall(r"[a-z0-9+#]+",assessment_text))
-        if not tokens or len(tokens & assessed_tokens)/len(tokens)<0.5:
+        if not tokens or not any(len(tokens & values)/len(tokens)>=0.5 for values in assessment_tokens):
             unmapped.append(item)
     return unmapped[:20]
 
@@ -1890,6 +2053,10 @@ def _eligibility_review_assessment(job, match, *, stale=False, unmapped=None,
         for entry in entries:
             if not isinstance(entry,dict) or entry.get("requiredness")=="preferred":continue
             requirement=str(entry.get("requirement") or "Mandatory qualification").strip()
+            if _is_qualitative_employer_expectation(requirement):
+                employer_uncertainties.append({"category":"qualitative_employer_expectation","requirement":requirement,
+                    "explanation":"This broad behavioral or product expectation remains visible for applicant context, but is not an objective eligibility prerequisite by itself."})
+                continue
             status=str(entry.get("status") or "unclear").casefold()
             if status=="met":mandatory_met.append(requirement)
             elif status=="confirmed_mismatch":
@@ -1907,10 +2074,12 @@ def _eligibility_review_assessment(job, match, *, stale=False, unmapped=None,
         blockers.append({"category":"qualification_extraction_incomplete","requirement":str(value)[:500],
             "explanation":"The saved result did not evaluate this explicit requirement-list item."})
     missing=match.get("missing_information",[])
+    qualitative_questions=_qualitative_missing_question_keys(match)
     if isinstance(missing,list):
         for value in missing:
             text=str(value or "").strip()
-            if not text:continue
+            if not text or text.casefold() in qualitative_questions:continue
+            if _is_qualitative_employer_expectation(text):continue
             country_auth=re.search(r"Work authorization for (.+?) is not confirmed",text,re.I)
             if country_auth:
                 requirement=f"Work authorization or employer sponsorship for {country_auth.group(1).strip()}"
@@ -1967,7 +2136,9 @@ def _eligibility_review_assessment(job, match, *, stale=False, unmapped=None,
     if confirmed_conflicts:
         next_action="This confirmed mandatory conflict blocks preparation. Applicant review cannot override it."
     elif mandatory_unresolved:
-        unresolved_technical=any(isinstance(item,dict) and item.get("requiredness")!="preferred" and item.get("status") in {"gap","unclear","needs_review"} for item in match.get("technical_qualifications",[]))
+        unresolved_technical=any(isinstance(item,dict) and item.get("requiredness")!="preferred" and
+            not _is_qualitative_employer_expectation(item.get("requirement")) and
+            item.get("status") in {"gap","unclear","needs_review"} for item in match.get("technical_qualifications",[]))
         availability=match.get("availability_assessment") if isinstance(match.get("availability_assessment"),dict) else {}
         if availability.get("status")=="needs_review":
             next_action="Confirm your earliest full-time start date or range in Candidate Profile, then review the mandatory technical evidence questions in Applications → Technical Qualifications. Graduation date and notice period are separate facts."
@@ -3182,22 +3353,40 @@ def enqueue_saved_jobs(request:ApplicationQueueRequest):
     prepared=[]; skipped=[]
     for key in keys:
         try: job=_get_job(DryRunRequest(job_key=key))
-        except HTTPException as error: skipped.append({"job_key":key,"reason":str(error.detail)[:300]}); continue
+        except HTTPException as error:
+            if error.status_code in {404,410}:
+                with connect() as db:
+                    stale=db.execute("SELECT * FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
+                if stale:
+                    job=dict(stale);job["application_url"]=job.get("url") or ""
+                    _record_application_attention(job,"posting_review",str(error.detail)[:500],eligibility_state="needs_review",form_state="not_checked")
+            skipped.append({"job_key":key,"reason":str(error.detail)[:300]}); continue
         try: validate_application_url(job.get("application_url"))
         except ValueError as error: skipped.append({"job_key":key,"reason":str(error)}); continue
         if job.get("reopened_review_required"):
-            skipped.append({"job_key":key,"reason":"This requisition closed and reopened. Human review is required before any preparation or reapplication."}); continue
-        if not _mock_allowed(job.get("application_url","")) and not _current_preparation_authorization(key,resume["id"],job.get("application_url")):
-            granted,reason=_derive_standing_policy_authorization(key,resume["id"],job.get("application_url"))
-            if not granted or not _current_preparation_authorization(key,resume["id"],job.get("application_url")):
-                skipped.append({"job_key":key,"reason":reason or "A current job-specific authorization or approved standing policy is required before queueing this real application."}); continue
+            reason="This requisition closed and reopened. Human review is required before any preparation or reapplication."
+            _record_application_attention(job,"posting_review",reason,eligibility_state="needs_review",form_state="not_checked")
+            skipped.append({"job_key":key,"reason":reason}); continue
         with connect() as db:
             match=db.execute("SELECT classification,match_score,result_json FROM job_match_results WHERE user_id=? AND job_key=? AND resume_id=? ORDER BY created_at DESC LIMIT 1",(USER,key,resume["id"])).fetchone()
             posting=db.execute("SELECT discovered_at,location_status,reopened_review_required FROM discovered_openings WHERE user_id=? AND job_key=?",(USER,key)).fetchone()
             gate_class,reviewed,unresolved=_eligibility_gate(db,key,resume["id"])
-        if gate_class=="not_eligible" or gate_class=="not_analyzed" or gate_class in {"rejected","deferred"} or gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
+        if gate_class not in {"potential_match","needs_review"} or unresolved or (gate_class=="needs_review" and not reviewed):
             reason="AI matching marked this opening not eligible." if gate_class=="not_eligible" else "You rejected this opening." if gate_class=="rejected" else "You deferred this opening's review." if gate_class=="deferred" else "Run AI matching first." if gate_class=="not_analyzed" else "Resolve mandatory requirements before queueing." if unresolved else "Review this match before queueing."
+            if unresolved or (gate_class=="needs_review" and not reviewed):
+                _record_application_attention(job,"applicant_information",reason,eligibility_state=gate_class,form_state="not_checked")
             skipped.append({"job_key":key,"reason":reason}); continue
+        unmapped_reason=_unmapped_requirements_blocker(key,resume["id"])
+        if unmapped_reason:
+            _record_application_attention(job,"applicant_information",unmapped_reason,eligibility_state=gate_class,form_state="not_checked")
+            skipped.append({"job_key":key,"reason":unmapped_reason}); continue
+        if not _mock_allowed(job.get("application_url","")) and not _current_preparation_authorization(key,resume["id"],job.get("application_url")):
+            try:granted,reason=_derive_standing_policy_authorization(key,resume["id"],job.get("application_url"))
+            except Exception as error:
+                skipped.append({"job_key":key,"reason":f"Preparation preflight failed safely ({type(error).__name__}); other openings will continue."})
+                continue
+            if not granted or not _current_preparation_authorization(key,resume["id"],job.get("application_url")):
+                skipped.append({"job_key":key,"reason":reason or "A current job-specific authorization or approved standing policy is required before queueing this real application."}); continue
         score=float(match["match_score"] or 0) if match else 0
         recency=0
         try:
@@ -3214,6 +3403,7 @@ def enqueue_saved_jobs(request:ApplicationQueueRequest):
                         if state=="skipped_duplicate" else "Existing application state: "+state.replace("_"," ")+".")
                 skipped.append({"job_key":key,"reason":reason})
         except HTTPException as error: skipped.append({"job_key":key,"reason":str(error.detail)[:300]})
+        except Exception as error: skipped.append({"job_key":key,"reason":f"Queue reservation failed safely ({type(error).__name__}); other openings will continue."})
     scheduled=_schedule_application_queue() if prepared else False
     return {"queued":len(prepared),"scheduled":scheduled,"items":prepared,"skipped":skipped,"mode":"dry_run","submission_enabled":False}
 
@@ -3359,6 +3549,14 @@ def resolve_saved_job_evidence_review(job_key:str,request:TargetedEligibilityRev
         raise HTTPException(409,"Verified evidence confirms a mandatory mismatch; review cannot override it.")
     if _unresolved_mandatory(checked.model_dump_json(),opening.get("description") or ""):
         raise HTTPException(409,"A mandatory fact remains unresolved. Confirm it in Candidate Profile, then use deterministic reassessment.")
+    qualitative_entries=[item for item in checked.technical_qualifications if _is_qualitative_employer_expectation(item.requirement)]
+    qualitative_terms=[item.requirement.casefold() for item in qualitative_entries]
+    qualitative_terms.extend(item.missing_question.casefold() for item in qualitative_entries if item.missing_question)
+    def is_qualitative_review_text(value):
+        text=str(value or "").casefold()
+        return _is_qualitative_employer_expectation(text) or any(term and term in text for term in qualitative_terms)
+    checked.gaps=[value for value in checked.gaps if not is_qualitative_review_text(value)]
+    checked.missing_information=[value for value in checked.missing_information if not is_qualitative_review_text(value)]
     unmapped_required=_unmapped_required_posting_items(opening.get("description") or "",checked.model_dump())
     if unmapped_required:
         raise HTTPException(409,"The saved assessment did not evaluate every explicit mandatory qualification. Reassess the posting and candidate evidence before reviewing it.")
@@ -3550,7 +3748,8 @@ def grouped_application_questions():
             except (TypeError,json.JSONDecodeError):continue
             for qualification in match.get("technical_qualifications",[]) if isinstance(match.get("technical_qualifications"),list) else []:
                 question=str(qualification.get("missing_question") or "").strip()
-                if qualification.get("requiredness")!="required" or qualification.get("status")!="needs_review" or not question:continue
+                if (qualification.get("requiredness")!="required" or qualification.get("status")!="needs_review" or
+                    _is_qualitative_employer_expectation(qualification.get("requirement")) or not question):continue
                 category,context,sensitive=canonical_answer_identity(question)
                 if category!="technical_qualification":continue
                 identity=(category,context)
@@ -3853,6 +4052,23 @@ def list_applications():
         item["status_label"]=item["readiness"]["status_label"]
         result.append(item)
     return result
+
+@router.get("/api/applications/attention")
+def list_application_attention():
+    """Return active human handoffs without creating application attempts."""
+    with connect() as db:
+        rows=db.execute("""SELECT attention_id,job_key,employer,title,posting_url,application_url,blocker_code,reason,
+            applicant_action,eligibility_state,form_state,preparation_state,status,created_at,updated_at,last_seen_at
+            FROM application_attention_items WHERE user_id=? AND status IN ('open','acknowledged')
+            ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,updated_at DESC LIMIT 200""",(USER,)).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        for key in ("posting_url","application_url"):
+            try:item[key]=urlparse(str(item.get(key) or ""))._replace(query="",fragment="").geturl()
+            except ValueError:item[key]=""
+        result.append(item)
+    return {"items":result,"count":len(result)}
 
 
 @router.get("/api/applications/{application_id}/attempts")
@@ -4280,7 +4496,8 @@ function renderAttentionInbox(apps){const box=document.querySelector('#attention
 function renderApps(apps){const box=document.querySelector('#apps');box.replaceChildren();if(!apps.length){box.append(node('div','empty','No application attempts yet. Start a dry run from a saved job or choose a local test form.'));return}for(const app of apps){const card=node('article','app'),head=node('h3','',escapeText(app.title)),company=node('div','sub',escapeText(app.company));const test=String(app.job_key||'').startsWith('local-mock:');const badge=node('span','pill',test?'Local test':'Saved job');const state=node('div','status',labels[app.state]||'Needs review');state.dataset.state=app.state;state.prepend(node('i','dot'));const bar=node('div','bar');const fill=node('i');fill.style.width=(progress[app.state]||15)+'%';bar.append(fill);const timing=node('div','sub','Last updated '+new Date(app.updated_at).toLocaleString()+(app.started_at?' · Attempt started '+new Date(app.started_at).toLocaleString():''));card.append(head,company,badge,state,bar,timing);if(app.diagnostic?.message)card.append(node('p','sub',app.diagnostic.message));if(app.diagnostic?.unanswered_fields?.length){card.append(node('p','sub','Needs your input: '+app.diagnostic.unanswered_fields.join(' · ')));const link=node('a','sub','Review candidate profile and answers');link.href='/candidate-profile';card.append(link)}if(['paused','failed','needs_user_input','unsupported'].includes(app.state)){const btn=node('button','',app.diagnostic?.interrupted?'Review and retry':'Retry dry run');btn.onclick=()=>retry(app.id);card.append(btn)}const detail=document.createElement('details'),summary=node('summary','','Diagnostics and attempt history');const body=node('div');if(app.error)body.append(node('p','', 'Technical error: '+app.error));if(app.diagnostic?.steps)body.append(node('p','', 'Form steps visited: '+app.diagnostic.steps));if(app.diagnostic?.filled_fields?.length)body.append(node('p','', 'Fields filled: '+app.diagnostic.filled_fields.filter(x=>x.result==='filled').length));if(app.diagnostic?.screenshot){const shot=node('a','sub','View private dry-run screenshot');shot.href='/api/applications/'+encodeURIComponent(app.id)+'/screenshot';shot.target='_blank';shot.rel='noopener';body.append(shot)}if(app.diagnostic?.interrupted)body.append(node('p','', 'This attempt was interrupted. It was not automatically retried because its outcome may be uncertain.'));detail.append(summary,body);detail.addEventListener('toggle',async()=>{if(!detail.open||detail.dataset.loaded)return;detail.dataset.loaded='1';try{const attempts=await req('/api/applications/'+encodeURIComponent(app.id)+'/attempts');for(const attempt of attempts){const item=node('p','sub','Attempt '+attempt.attempt_number+' · '+(labels[attempt.state]||attempt.state)+' · '+(attempt.started_at?'started '+new Date(attempt.started_at).toLocaleString():'not started'));body.append(item);if(attempt.diagnostic?.message)body.append(node('p','sub',attempt.diagnostic.message));if(attempt.error)body.append(node('p','sub','Technical error type: '+attempt.error))}}catch(e){body.append(node('p','sub',e.message))}});card.append(detail);box.append(card)}}
 async function retry(id){await runBusy('Starting the selected retry…',async()=>{await req('/api/applications/'+encodeURIComponent(id)+'/resume',{method:'POST'});say('Retry started. Previously completed attempts and diagnostics remain in history.')})}
 async function renderQuestionAttention(){const root=document.getElementById('question-attention');if(!root)return;root.replaceChildren();try{const data=await req('/api/application-questions/attention');if(!data.groups?.length){root.append(node('div','empty','No saved applications currently need additional answers.'));return}for(const group of data.groups){const card=node('article','app'),title=node('h3','',group.question);card.append(title,node('p','sub',(group.jobs.length===1?'1 saved job':'Shared across '+group.jobs.length+' saved jobs')+' · '+group.canonical_category.replaceAll('_',' ')));for(const job of group.jobs){const line=node('p','sub',job.company+' · '+job.title+' — '+job.question);card.append(line)}if(group.sensitive)card.append(node('p','sub','Sensitive or legal answer: stored encrypted, never automatically reused, and the employer may still require your action.'));const answer=document.createElement('textarea');answer.rows=3;answer.maxLength=4000;answer.required=true;answer.setAttribute('aria-label','Confirmed answer for '+group.question);answer.placeholder='Enter only an answer you have confirmed.';const scope=document.createElement('select');scope.setAttribute('aria-label','Answer reuse scope');for(const [value,label] of [['this_job','Use for this job only'],['matching_jobs','Reuse for matching jobs'],['general_preference','Save as a general preference']]){const option=document.createElement('option');option.value=value;option.textContent=label;scope.append(option)}if(group.sensitive||group.canonical_category==='relocation')scope.value='this_job';if(group.sensitive){for(const option of scope.options)if(option.value!=='this_job')option.disabled=true}if(group.canonical_category==='relocation'){for(const option of scope.options)if(option.value!=='this_job')option.disabled=true;card.append(node('p','sub','For future roles, set your structured relocation choice and destinations in Career Preferences.'))}const target=document.createElement('select');target.setAttribute('aria-label','Job for one-job reuse');for(const job of group.jobs){const option=document.createElement('option');option.value=job.job_key;option.textContent=job.company+' · '+job.title;target.append(option)}const confirmLabel=document.createElement('label'),confirm=document.createElement('input');confirm.type='checkbox';confirmLabel.append(confirm,document.createTextNode(' I confirm this answer is accurate.'));const save=node('button','primary','Save confirmed answer');const status=node('p','sub','');status.setAttribute('role','status');save.onclick=async()=>{if(!answer.value.trim()||!confirm.checked){status.textContent='Enter an answer and confirm that it is accurate.';return}save.disabled=true;status.textContent='Saving and verifying…';try{const result=await req('/api/application-questions/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:group.question,answer:answer.value,application_ids:group.jobs.map(x=>x.application_id),reuse_scope:scope.value,job_key:scope.value==='this_job'?target.value:'',confirmed:true})});if(!result.persisted_verified)throw Error('The saved answer could not be verified.');status.textContent=result.requires_manual_action?'Saved encrypted for this job only. It will not be auto-filled; enter it yourself in the employer form when asked.':'Saved. No application was resumed; choose a dry run in Application history when ready.';say(result.message);await renderQuestionAttention()}catch(error){status.textContent=error.message;save.disabled=false}};card.append(answer,scope);if(!group.sensitive&&group.canonical_category!=='relocation'){const profileLink=node('a','sub','Review your profile and permissions');profileLink.href='/candidate-profile';card.append(profileLink)}if(group.jobs.length>1)card.append(target);card.append(confirmLabel,save,status);root.append(card)}}catch(error){root.append(node('p','sub','Could not load grouped application questions: '+error.message))}}
-async function refresh(){try{const [apps,p]=await Promise.all([req('/api/applications'),req('/api/applications/progress')]);renderSummary(apps,p);renderAttentionInbox(apps);renderApps(apps);await renderQuestionAttention()}catch(e){say(e.message)}}
+function renderHandoffs(items){const box=document.querySelector('#attention-inbox');if(!box)return;if(items.length)box.querySelector('.empty')?.remove();for(const item of items){const card=node('article','app');card.dataset.attentionId=item.attention_id;card.append(node('h3','',escapeText(item.title)),node('div','sub',escapeText(item.employer)),node('div','status','Needs Your Attention'));card.append(node('p','sub',escapeText(item.reason)));card.append(node('p','sub','Next action: '+escapeText(item.applicant_action)));card.append(node('p','sub','Eligibility: '+escapeText(item.eligibility_state)+' · Form: '+escapeText(item.form_state)+' · Preparation: '+escapeText(item.preparation_state==='not_prepared'?'not started':item.preparation_state.replaceAll('_',' '))));const link=node('a','sub','Open official employer application ↗');link.href=item.application_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link);if(item.posting_url&&item.posting_url!==item.application_url){const posting=node('a','sub','View official posting ↗');posting.href=item.posting_url;posting.target='_blank';posting.rel='noopener noreferrer';posting.style.marginLeft='12px';card.append(posting)}card.append(node('p','sub',item.preparation_state==='not_prepared'?'No application attempt or preparation was created for this handoff.':'Review the existing preparation in Application history; this handoff did not create another attempt.'));box.append(card)}}
+async function refresh(){try{const [apps,p,handoffs]=await Promise.all([req('/api/applications'),req('/api/applications/progress'),req('/api/applications/attention')]);renderSummary(apps,p);renderAttentionInbox(apps);renderHandoffs(handoffs.items||[]);renderApps(apps);await renderQuestionAttention()}catch(e){say(e.message)}}
 document.querySelectorAll('.toolbar button').forEach(button=>button.addEventListener('click',()=>{if(busy)button.disabled=true}));refresh();setInterval(refresh,15000);const localTestHeading=[...document.querySelectorAll('.section-head')].find(x=>x.querySelector('h2')?.textContent==='Local test forms'),localTestToolbar=localTestHeading?.nextElementSibling;if(localTestToolbar){const answerTest=node('button','','Test AI-written answer');answerTest.onclick=()=>mock('written');localTestToolbar.append(answerTest)}
 Object.assign(labels,{opening:'Opening employer website',inspecting:'Finding application form',filling:'Filling candidate details'});if(!document.querySelector('nav a[href="/application-settings"]')){const settingsNav=document.createElement('a');settingsNav.href='/application-settings';settingsNav.textContent='Application settings';document.querySelector('nav')?.append(settingsNav)}
 const baseRenderApps=renderApps;renderApps=function(apps){baseRenderApps(apps);const cards=document.querySelectorAll('#apps .app');apps.forEach((app,index)=>{const drafts=app.diagnostic?.draft_answers;if(!Array.isArray(drafts)||!drafts.length)return;const card=cards[index];if(!card)return;const panel=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Review AI-drafted answers';panel.append(summary);for(const draft of drafts){const question=node('p','sub',draft.question||'Application question'),answer=document.createElement('textarea');answer.value=draft.answer||'';answer.rows=4;answer.maxLength=1200;answer.setAttribute('aria-label','Edit AI-drafted answer');const reuse=document.createElement('label'),check=document.createElement('input');check.type='checkbox';reuse.append(check,document.createTextNode(' Allow automatic reuse after confirming'));const save=node('button','','Confirm and save answer');save.onclick=async()=>{try{save.disabled=true;await req('/api/application-answers/ai-'+Date.now().toString(36),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:draft.question,answer:answer.value,confirmed:true,sensitive:false,answer_type:'generated',auto_reuse:check.checked})});save.textContent='Saved';say('Your reviewed answer was saved to the active profile.')}catch(e){save.disabled=false;say(e.message)}};panel.append(question,answer,reuse,save)}card.append(panel)})};
@@ -4973,5 +5190,18 @@ renderSavedJobs=async function(silent=false){
       card.append(open);
     });
   }catch(error){say('Preparation readiness could not be refreshed: '+readableApiError(error.message))}
+};
+</script></body></html>""")
+
+# Keep handoff cards wired through the final stable-polling wrapper. Later
+# dashboard additions wrap ``refresh`` to preserve open forms and scroll; this
+# final adapter refreshes only the read-only inbox after those guards run.
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</body></html>", """<script>
+const phase151StableRefresh=refresh;
+refresh=async function(){
+  await phase151StableRefresh();if(busy)return;
+  try{const [apps,handoffs]=await Promise.all([req('/api/applications'),req('/api/applications/attention')]);
+    const active=document.activeElement;if(!(active&&active!==document.body&&active.closest('#attention-inbox'))){renderAttentionInbox(apps);renderHandoffs(handoffs.items||[])}
+  }catch(error){say(readableApiError(error.message))}
 };
 </script></body></html>""")

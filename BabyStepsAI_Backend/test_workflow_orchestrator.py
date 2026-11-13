@@ -49,6 +49,37 @@ class WorkflowOrchestratorTests(unittest.TestCase):
         content=b"".join(message.get("body",b"") for message in messages if message["type"]=="http.response.body")
         return start["status"],json.loads(content) if content else {}
 
+    def _seed_cancelled_pointer_workflow(self,session_status="cancelled",session_workflow="",owner=""):
+        workflow_keys=[f"job:{index}" for index in range(138)]
+        legacy_keys=[f"legacy:{index}" for index in range(5)]
+        diagnostics={"failure":"{'code': 'workflow_session_mismatch'}"}
+        with workflow.database() as db:
+            db.execute("""UPDATE user_workflows SET status='failed',current_stage='failed',resume_id='resume-1',
+                job_keys_json=?,discovered_count=138,matching_session_id='legacy-session',diagnostics_json=?
+                WHERE workflow_id='wf-test'""",(json.dumps(workflow_keys),json.dumps(diagnostics)))
+            db.execute("""CREATE TABLE job_match_sessions(session_id TEXT,user_id TEXT,resume_id TEXT,status TEXT,
+                job_keys_json TEXT,total_jobs INTEGER,workflow_id TEXT,owner_token TEXT,owner_pid INTEGER,
+                owner_host TEXT,lease_expires_at TEXT,error TEXT)""")
+            db.execute("""INSERT INTO job_match_sessions VALUES('legacy-session',?,'resume-1',?,?,5,?,?,NULL,'',NULL,?)""",
+                (workflow.USER,session_status,json.dumps(legacy_keys),session_workflow,owner,
+                 "explicitly_cancelled_by_applicant" if session_status=="cancelled" else ""))
+        return workflow_keys,legacy_keys
+
+    def _seed_interrupted_worker_workflow(self,*,owner="",status="interrupted",provider="groq"):
+        keys=[f"job:{index}" for index in range(138)]
+        diagnostics={"failure":"The matching worker could not start. Its checkpoint is saved; resume matching to retry."}
+        with workflow.database() as db:
+            db.execute("""UPDATE user_workflows SET status='failed',current_stage='failed',resume_id='resume-1',
+                job_keys_json=?,discovered_count=138,matching_session_id='',diagnostics_json=? WHERE workflow_id='wf-test'""",
+                (json.dumps(keys),json.dumps(diagnostics)))
+            db.execute("""CREATE TABLE job_match_sessions(session_id TEXT,user_id TEXT,resume_id TEXT,status TEXT,
+                job_keys_json TEXT,total_jobs INTEGER,workflow_id TEXT,owner_token TEXT,owner_pid INTEGER,
+                owner_host TEXT,lease_expires_at TEXT,error TEXT,provider TEXT,provider_model TEXT,updated_at TEXT)""")
+            db.execute("""INSERT INTO job_match_sessions VALUES('worker-session',?,'resume-1',?,?,138,'wf-test',?,NULL,'',NULL,?,'groq','openai/gpt-oss-20b','now')""",
+                (workflow.USER,status,json.dumps(keys),owner,
+                 "RuntimeError: matching worker could not start; retry may resume from this checkpoint."))
+        return keys
+
     def test_start_workflow_asgi_persists_using_real_preferences_schema(self):
         # Mirror the actual career_preferences schema: preference_version exists,
         # updated_at does not. This exercises the exact failure in the user's DB.
@@ -332,6 +363,8 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             db.execute("UPDATE user_workflows SET status='running',current_stage='matching',job_keys_json='[\"job:one\"]' WHERE workflow_id='wf-test'")
         with patch.object(workflow,"_authorization",return_value={}), \
              patch.object(workflow,"_versions",return_value=("resume-1","rv1","pv1",3,{})), \
+             patch.object(workflow.application_agent,"pause_applications"), \
+             patch.object(workflow.application_agent,"resume_processing"), \
              patch.object(workflow,"_submit"):
             status,paused=self.asgi_request("POST","/api/workflows/wf-test/pause")
             self.assertEqual(status,200)
@@ -346,6 +379,146 @@ class WorkflowOrchestratorTests(unittest.TestCase):
             self.assertEqual(status,200)
             self.assertEqual(current["workflow"]["job_keys"],["job:one"] if current["workflow"]["workflow_id"]=="wf-test" else [])
             self.assertEqual(current["workflow"]["status"],"cancelled")
+
+    def test_match_conflict_keeps_blocking_legacy_session_out_of_workflow_link(self):
+        from fastapi import HTTPException
+        with workflow.database() as db:
+            db.execute("CREATE TABLE discovered_openings(user_id TEXT,job_key TEXT,description TEXT)")
+            db.execute("INSERT INTO discovered_openings VALUES(?,?,?)",(workflow.USER,"job:one","A complete synthetic job description."))
+            db.execute("UPDATE user_workflows SET status='running',current_stage='matching',job_keys_json='[\"job:one\"]',discovered_count=1,matching_session_id='' WHERE workflow_id='wf-test'")
+        def blocked_match(_request):
+            raise HTTPException(409,{"code":"legacy_checkpoint_overlap","message":"Paused legacy session overlaps selected jobs.",
+                                     "session_id":"legacy-session","recovery_available":True,"overlap_count":1})
+        with patch.object(workflow,"_ensure_snapshot"),patch.object(workflow,"_checkpoint",return_value=True), \
+             patch.object(workflow,"_authorization",return_value={}), \
+             patch.object(workflow.job_description_enricher,"connect",workflow.database), \
+             patch.object(workflow.job_description_enricher,"usable_description",return_value=True):
+            workflow.run_workflow("wf-test",match_fn=blocked_match)
+        row=workflow._row("wf-test")
+        diagnostics=json.loads(row["diagnostics_json"])
+        self.assertEqual(row["status"],"paused")
+        self.assertEqual(row["matching_session_id"],"")
+        self.assertEqual(diagnostics["matching"]["session_id"],"legacy-session")
+
+    def test_stale_cancelled_session_pointer_is_detached_transactionally(self):
+        workflow_keys,legacy_keys=self._seed_cancelled_pointer_workflow()
+        before=workflow._row("wf-test")
+        result=workflow.detach_cancelled_matching_pointer("wf-test","legacy-session")
+        after=workflow._row("wf-test")
+        self.assertEqual(result["preserved_job_count"],138)
+        self.assertEqual(after["matching_session_id"],"")
+        self.assertEqual(json.loads(after["job_keys_json"]),workflow_keys)
+        self.assertEqual(after["discovery_run_id"],before["discovery_run_id"])
+        self.assertEqual(after["status"],"failed")
+        with workflow.database() as db:
+            session=db.execute("SELECT status,job_keys_json,workflow_id,error FROM job_match_sessions WHERE session_id='legacy-session'").fetchone()
+        self.assertEqual(tuple(session),("cancelled",json.dumps(legacy_keys),"","explicitly_cancelled_by_applicant"))
+
+    def test_checkpoint_repair_refuses_a_valid_active_workflow_session(self):
+        from fastapi import HTTPException
+        self._seed_cancelled_pointer_workflow(session_status="running",session_workflow="wf-test",owner="lease")
+        with self.assertRaises(HTTPException):workflow.detach_cancelled_matching_pointer("wf-test","legacy-session")
+        self.assertEqual(workflow._row("wf-test")["matching_session_id"],"legacy-session")
+
+    def test_checkpoint_repair_refuses_foreign_session_ownership(self):
+        from fastapi import HTTPException
+        self._seed_cancelled_pointer_workflow(session_workflow="other-workflow")
+        with self.assertRaises(HTTPException):workflow.detach_cancelled_matching_pointer("wf-test","legacy-session")
+        self.assertEqual(workflow._row("wf-test")["matching_session_id"],"legacy-session")
+
+    def test_detached_checkpoint_mismatch_can_resume_only_at_saved_matching_stage(self):
+        self._seed_cancelled_pointer_workflow()
+        workflow.detach_cancelled_matching_pointer("wf-test","legacy-session")
+        with patch.object(workflow,"_authorization",return_value={}), \
+             patch.object(workflow,"_ensure_snapshot"), \
+             patch.object(workflow.application_agent,"resume_processing"), \
+             patch.object(workflow,"_submit",return_value=True) as submit:
+            status,result=self.asgi_request("POST","/api/workflows/wf-test/resume")
+        self.assertEqual(status,200)
+        self.assertEqual(result["workflow"]["status"],"queued")
+        self.assertEqual(result["workflow"]["current_stage"],"matching")
+        self.assertEqual(result["workflow"]["job_keys"],[f"job:{index}" for index in range(138)])
+        submit.assert_called_once_with("wf-test")
+
+    def test_interrupted_worker_checkpoint_requires_exact_owned_workflow_and_current_groq_consent(self):
+        self._seed_interrupted_worker_workflow()
+        settings={"allow_ai_matching":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b",
+                  "allow_groq_cloud_ai":True,"standing_policy_enabled":True,"standing_policy_allow_groq":True}
+        with patch.object(workflow.application_answer_assistant,"get_authorization",return_value={"settings":settings}), \
+             patch.object(workflow,"_standing_policy_current",return_value=True), \
+             patch.object(workflow.resume_job_matcher,"_groq_authorization_blocker",return_value=""), \
+             patch.object(workflow.resume_job_matcher,"database",workflow.database):
+            self.assertEqual(workflow._recoverable_interrupted_match_checkpoint(workflow._row("wf-test"),
+                json.loads(workflow._row("wf-test")["diagnostics_json"])),"worker-session")
+        with workflow.database() as db:
+            db.execute("UPDATE job_match_sessions SET owner_token='live-lease' WHERE session_id='worker-session'")
+        with patch.object(workflow.application_answer_assistant,"get_authorization",return_value={"settings":settings}), \
+             patch.object(workflow,"_standing_policy_current",return_value=True), \
+             patch.object(workflow.resume_job_matcher,"_groq_authorization_blocker",return_value=""), \
+             patch.object(workflow.resume_job_matcher,"database",workflow.database):
+            self.assertIsNone(workflow._recoverable_interrupted_match_checkpoint(workflow._row("wf-test"),
+                json.loads(workflow._row("wf-test")["diagnostics_json"])))
+
+    def test_resume_arms_single_three_job_batch_only_for_safe_interrupted_checkpoint(self):
+        self._seed_interrupted_worker_workflow()
+        settings={"allow_ai_matching":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b",
+                  "allow_groq_cloud_ai":True,"standing_policy_enabled":True,"standing_policy_allow_groq":True}
+        with patch.object(workflow.application_answer_assistant,"get_authorization",return_value={"settings":settings}), \
+             patch.object(workflow,"_standing_policy_current",return_value=True), \
+             patch.object(workflow.resume_job_matcher,"_groq_authorization_blocker",return_value=""), \
+             patch.object(workflow.resume_job_matcher,"database",workflow.database), \
+             patch.object(workflow,"_authorization",return_value=settings), \
+             patch.object(workflow,"_ensure_snapshot"), \
+             patch.object(workflow.application_agent,"resume_processing"), \
+             patch.object(workflow,"_submit",return_value=True):
+            status,result=self.asgi_request("POST","/api/workflows/wf-test/resume")
+        self.assertEqual(status,200)
+        self.assertEqual(result["workflow"]["current_stage"],"matching")
+        with workflow.database() as db:
+            row=db.execute("SELECT status,current_stage,diagnostics_json FROM user_workflows WHERE workflow_id='wf-test'").fetchone()
+        self.assertEqual(tuple(row[:2]),("queued","matching"))
+        self.assertTrue(json.loads(row["diagnostics_json"])["matching_stop_after_batch"])
+        self.assertTrue(json.loads(row["diagnostics_json"])["matching_preserve_failed"])
+        self.assertTrue(json.loads(row["diagnostics_json"])["matching_bounded_resume"])
+
+    def test_cancel_does_not_cancel_a_foreign_paused_matching_checkpoint(self):
+        with workflow.database() as db:
+            db.execute("CREATE TABLE job_match_sessions(session_id TEXT,user_id TEXT,workflow_id TEXT)")
+            db.execute("INSERT INTO job_match_sessions VALUES('legacy-session',?,'')",(workflow.USER,))
+            db.execute("UPDATE user_workflows SET status='paused',current_stage='matching',matching_session_id='legacy-session' WHERE workflow_id='wf-test'")
+        with patch.object(workflow.resume_job_matcher,"database",workflow.database), \
+             patch.object(workflow.resume_job_matcher,"_progress",return_value={"status":"paused","workflow_id":"","owner_state":"unowned","total":1,"completed":0,"pending":1}), \
+             patch.object(workflow.resume_job_matcher,"cancel_matches") as cancel_match, \
+             patch.object(workflow.application_agent,"pause_applications"):
+            status,result=self.asgi_request("POST","/api/workflows/wf-test/cancel")
+        self.assertEqual(status,200)
+        self.assertEqual(result["workflow"]["status"],"cancelled")
+        cancel_match.assert_not_called()
+
+    def test_pause_does_not_pause_a_foreign_matching_checkpoint(self):
+        with workflow.database() as db:
+            db.execute("CREATE TABLE job_match_sessions(session_id TEXT,user_id TEXT,workflow_id TEXT)")
+            db.execute("INSERT INTO job_match_sessions VALUES('legacy-session',?,'')",(workflow.USER,))
+            db.execute("UPDATE user_workflows SET status='running',current_stage='matching',matching_session_id='legacy-session' WHERE workflow_id='wf-test'")
+        with patch.object(workflow.resume_job_matcher,"database",workflow.database), \
+             patch.object(workflow.resume_job_matcher,"_progress",return_value={"status":"paused","workflow_id":"","owner_state":"unowned","total":1,"completed":0,"pending":1}), \
+             patch.object(workflow.resume_job_matcher,"pause_matches") as pause_match, \
+             patch.object(workflow.application_agent,"pause_applications"):
+            status,result=self.asgi_request("POST","/api/workflows/wf-test/pause")
+        self.assertEqual(status,200)
+        self.assertEqual(result["workflow"]["status"],"paused")
+        pause_match.assert_not_called()
+
+    def test_scheduler_keeps_an_unfinished_paused_workflow_as_the_active_run(self):
+        with workflow.database() as db:
+            db.execute("UPDATE user_workflows SET status='paused',current_stage='matching' WHERE workflow_id='wf-test'")
+        with patch.object(workflow.application_answer_assistant,"get_authorization",return_value={"settings":{"standing_policy_enabled":True}}), \
+             patch.object(workflow,"_standing_policy_current",return_value=True), \
+             patch.object(workflow,"start_workflow") as start:
+            self.assertEqual(workflow.run_auto_apply_scheduler_cycle(),"active_workflow_preserved")
+        start.assert_not_called()
+        with workflow.database() as db:
+            self.assertIsNone(db.execute("SELECT last_started_at FROM auto_apply_scheduler_state WHERE user_id=?",(workflow.USER,)).fetchone())
 
     def test_prompt_conflicts_are_reported_without_overriding_saved_preferences(self):
         prefs={"location":"Canada","employment_types":["Full-time"],"levels":["Entry Level"]}

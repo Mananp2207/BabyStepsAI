@@ -359,6 +359,78 @@ def _row(workflow_id):
     return dict(row) if row else None
 
 
+def detach_cancelled_matching_pointer(workflow_id,session_id,*,expected_jobs=138,expected_legacy_jobs=5):
+    """Detach only a cancelled ownerless legacy checkpoint from its failed workflow."""
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        workflow=db.execute("SELECT * FROM user_workflows WHERE workflow_id=? AND user_id=?",
+                            (workflow_id,USER)).fetchone()
+        if not workflow:raise HTTPException(404,"Workflow not found.")
+        try:workflow_keys=json.loads(workflow["job_keys_json"] or "[]")
+        except (TypeError,json.JSONDecodeError):workflow_keys=[]
+        if (workflow["status"]!="failed" or workflow["current_stage"]!="failed" or
+            int(workflow["discovered_count"] or 0)!=expected_jobs or len(workflow_keys)!=expected_jobs or
+            workflow["matching_session_id"]!=session_id):
+            raise HTTPException(409,"Workflow state or matching checkpoint changed; no pointer was detached.")
+        try:diagnostics=json.loads(workflow["diagnostics_json"] or "{}")
+        except (TypeError,json.JSONDecodeError):diagnostics={}
+        if "workflow_session_mismatch" not in str(diagnostics.get("failure","")):
+            raise HTTPException(409,"The workflow does not contain the expected stale-checkpoint failure.")
+        session=db.execute("SELECT * FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                           (session_id,USER)).fetchone()
+        try:session_keys=json.loads(session["job_keys_json"] or "[]") if session else []
+        except (TypeError,json.JSONDecodeError):session_keys=[]
+        if (not session or session["status"]!="cancelled" or session["owner_token"] or
+            session["workflow_id"] or session["resume_id"]!=workflow["resume_id"] or
+            int(session["total_jobs"] or 0)!=expected_legacy_jobs or len(session_keys)!=expected_legacy_jobs or
+            session["error"]!="explicitly_cancelled_by_applicant"):
+            raise HTTPException(409,"The referenced session is not the exact cancelled legacy checkpoint; no pointer was detached.")
+        active=db.execute("""SELECT session_id FROM job_match_sessions WHERE user_id=? AND
+            (status IN ('queued','running') OR (status='paused' AND owner_token<>'')) LIMIT 1""",(USER,)).fetchone()
+        if active:raise HTTPException(409,"Another matching worker is active; no pointer was detached.")
+        changed=db.execute("UPDATE user_workflows SET matching_session_id='' WHERE workflow_id=? AND user_id=? AND matching_session_id=? AND status='failed'",
+                           (workflow_id,USER,session_id)).rowcount
+        if changed!=1:raise HTTPException(409,"Workflow checkpoint changed during repair; no pointer was detached.")
+    return {"workflow_id":workflow_id,"detached_session_id":session_id,"preserved_job_count":expected_jobs}
+
+
+def _recoverable_interrupted_match_checkpoint(workflow_row,diagnostics):
+    """Recognize only this workflow's ownerless session from a worker-start failure."""
+    if workflow_row is not None:workflow_row=dict(workflow_row)
+    if (not workflow_row or workflow_row.get("status")!="failed" or
+        workflow_row.get("current_stage")!="failed" or workflow_row.get("matching_session_id") or
+        "The matching worker could not start" not in str(diagnostics.get("failure",""))):
+        return None
+    try:keys=json.loads(workflow_row.get("job_keys_json") or "[]")
+    except (TypeError,json.JSONDecodeError):return None
+    if not keys or len(keys)!=int(workflow_row.get("discovered_count") or 0):return None
+    settings=application_answer_assistant.get_authorization()["settings"]
+    if (not settings.get("allow_ai_matching") or settings.get("matching_provider")!="groq" or
+        settings.get("groq_model")!="openai/gpt-oss-20b" or _groq_consent_blocked(settings)):
+        return None
+    if not _standing_policy_current():return None
+    with resume_job_matcher.database() as db:
+        row=db.execute("""SELECT * FROM job_match_sessions WHERE user_id=? AND workflow_id=?
+            AND status='interrupted' ORDER BY updated_at DESC LIMIT 1""",(USER,workflow_row["workflow_id"])).fetchone()
+        if not row:return None
+        try:session_keys=json.loads(row["job_keys_json"] or "[]")
+        except (TypeError,json.JSONDecodeError):return None
+        if (row["owner_token"] or row["owner_pid"] or row["owner_host"] or row["lease_expires_at"] or
+            row["resume_id"]!=workflow_row["resume_id"] or session_keys!=keys or
+            int(row["total_jobs"] or 0)!=len(keys) or row["provider"]!="groq" or
+            row["provider_model"]!=settings.get("groq_model") or
+            "matching worker could not start" not in str(row["error"] or "")):
+            return None
+        active=db.execute("""SELECT 1 FROM job_match_sessions WHERE user_id=? AND
+            (status IN ('queued','running') OR (status='paused' AND owner_token<>'')) LIMIT 1""",(USER,)).fetchone()
+        if active:return None
+    return row["session_id"]
+
+
+def _groq_consent_blocked(settings):
+    return bool(resume_job_matcher._groq_authorization_blocker(settings))
+
+
 def _is_stopped(workflow_id):
     row=_row(workflow_id)
     return not row or bool(row["pause_requested"] or row["cancel_requested"])
@@ -487,7 +559,14 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
                 _save_diagnostics(workflow_id,enrichment={"total":0,"attempted":0,"succeeded":0,
                     "failed":0,"available":0,"error":f"Description enrichment could not run ({type(error).__name__})."})
             settings=_authorization()
-            request=resume_job_matcher.MatchRequest(job_keys=keys,batch_size=3)
+            try:matching_options=json.loads(row["diagnostics_json"] or "{}")
+            except (TypeError,json.JSONDecodeError):matching_options={}
+            stop_after_batch=bool(matching_options.get("matching_stop_after_batch"))
+            preserve_failed=bool(matching_options.get("matching_preserve_failed"))
+            bounded_resume=bool(matching_options.get("matching_bounded_resume"))
+            request=resume_job_matcher.MatchRequest(job_keys=keys,batch_size=3,
+                stop_after_batch=stop_after_batch,preserve_failed=preserve_failed,
+                bounded_resume=bounded_resume)
             _save_diagnostics(workflow_id,matching={"status":"running","total":len(keys),"completed":0})
             if match_fn is resume_job_matcher.analyze_matches:
                 match_response=match_fn(request,workflow_id=workflow_id)
@@ -534,6 +613,8 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
                             "error":progress.get("error")})
                     _write(workflow_id,matched_count=matches,failed_count=sum(item["status"]=="failed" for item in rows))
                     if progress.get("status")=="paused" and progress.get("pending",0)>0:
+                        if progress.get("error")=="bounded_initial_batch_complete":
+                            _save_diagnostics(workflow_id,matching_stop_after_batch=False)
                         _write(workflow_id,status="paused",current_stage="matching",pause_requested=1)
                         return
                     if len(completed)>=len(keys):break
@@ -595,8 +676,6 @@ def run_workflow(workflow_id,*,discover_fn=None,match_fn=None,queue_fn=None,poll
         stage=current.get("current_stage","unknown")
         if error.status_code==409 and stage=="matching" and conflict_code in {
                 "active_worker","legacy_unowned","stale_lease_owner_alive","stale_lease_owner_unknown","legacy_checkpoint_overlap"}:
-            if error.detail.get("session_id"):
-                _write(workflow_id,matching_session_id=error.detail["session_id"])
             _save_diagnostics(workflow_id,matching={"status":"blocked","error":error.detail.get("message"),
                 "session_id":error.detail.get("session_id"),"recovery_available":bool(error.detail.get("recovery_available"))},
                 recovery="Discovery completed and its saved jobs are preserved. Resolve the matching session, then resume this workflow without repeating discovery.")
@@ -1118,7 +1197,24 @@ def current_workflow(request:Request):
     return {"workflow":item,"submission_enabled":False}
 
 
-def _control(request,workflow_id,action):
+def _owned_matching_session_id(workflow_row):
+    """Return a match checkpoint only when the session explicitly belongs to this workflow."""
+    try:
+        session_id=workflow_row["matching_session_id"]
+        workflow_id=workflow_row["workflow_id"]
+    except (KeyError,TypeError):
+        return None
+    if not session_id or not workflow_id:return None
+    try:
+        with resume_job_matcher.database() as db:
+            row=db.execute("SELECT workflow_id FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                           (session_id,USER)).fetchone()
+        return session_id if row and row["workflow_id"]==workflow_id else None
+    except (sqlite3.Error,TypeError):
+        return None
+
+
+def _control(request,workflow_id,action,*,bounded_batch=False):
     _local_only(request)
     with database() as db:row=db.execute("SELECT * FROM user_workflows WHERE workflow_id=? AND user_id=?",(workflow_id,USER)).fetchone()
     if not row:raise HTTPException(404,"Workflow not found.")
@@ -1132,15 +1228,22 @@ def _control(request,workflow_id,action):
                 if discovery_id:job_search_agent.pause_discovery(discovery_id)
             except Exception:pass
         elif row["current_stage"]=="matching":
-            try:resume_job_matcher.pause_matches(session_id=row["matching_session_id"] or None)
-            except Exception:pass
+            matching_session_id=_owned_matching_session_id(row)
+            if matching_session_id:
+                try:resume_job_matcher.pause_matches(session_id=matching_session_id)
+                except Exception:pass
         try:application_agent.pause_applications()
         except Exception:pass
     elif action=="resume":
         try:existing_diagnostics=json.loads(row["diagnostics_json"] or "{}")
         except (TypeError,json.JSONDecodeError):existing_diagnostics={}
+        failure_text=str(existing_diagnostics.get("failure",""))
+        interrupted_checkpoint_id=_recoverable_interrupted_match_checkpoint(row,existing_diagnostics)
         resumable_match_failure=(row["status"]=="failed" and row["current_stage"]=="failed" and
-            row["discovered_count"]>0 and "Another match analysis is already active" in str(existing_diagnostics.get("failure","")))
+            row["discovered_count"]>0 and (
+                "Another match analysis is already active" in failure_text or
+                ("workflow_session_mismatch" in failure_text and not row["matching_session_id"]) or
+                bool(interrupted_checkpoint_id)))
         if row["status"] not in {"paused","needs_clarification"} and not resumable_match_failure:
             raise HTTPException(409,"Workflow cannot be resumed in its current state.")
         _authorization()
@@ -1152,11 +1255,46 @@ def _control(request,workflow_id,action):
         if row["status"]=="needs_clarification":raise HTTPException(409,"Update the saved preferences or start a new prompt after resolving the conflict.")
         with database() as db:
             db.execute("BEGIN IMMEDIATE")
-            fresh=db.execute("SELECT status,current_stage FROM user_workflows WHERE workflow_id=? AND user_id=?",
+            fresh=db.execute("SELECT * FROM user_workflows WHERE workflow_id=? AND user_id=?",
                               (workflow_id,USER)).fetchone()
             can_recover_failed=(fresh and fresh["status"]=="failed" and resumable_match_failure)
             if not fresh or (fresh["status"]!="paused" and not can_recover_failed):
                 raise HTTPException(409,"Another request already resumed or changed this workflow; view its current status.")
+            if interrupted_checkpoint_id:
+                session=db.execute("SELECT status,workflow_id,resume_id,job_keys_json,total_jobs,owner_token,owner_pid,owner_host,lease_expires_at,provider,provider_model,error FROM job_match_sessions WHERE session_id=? AND user_id=?",
+                                   (interrupted_checkpoint_id,USER)).fetchone()
+                try:workflow_keys=json.loads(fresh["job_keys_json"] or "[]")
+                except (TypeError,json.JSONDecodeError):workflow_keys=[]
+                try:session_keys=json.loads(session["job_keys_json"] or "[]") if session else []
+                except (TypeError,json.JSONDecodeError):session_keys=[]
+                if (not session or session["status"]!="interrupted" or session["workflow_id"]!=workflow_id or
+                    session["resume_id"]!=fresh["resume_id"] or session_keys!=workflow_keys or
+                    int(session["total_jobs"] or 0)!=len(workflow_keys) or session["owner_token"] or
+                    session["owner_pid"] or session["owner_host"] or session["lease_expires_at"] or
+                    session["provider"]!="groq" or session["provider_model"]!="openai/gpt-oss-20b" or
+                    "matching worker could not start" not in str(session["error"] or "")):
+                    raise HTTPException(409,"The interrupted matching checkpoint changed; no recovery was started.")
+                active=db.execute("""SELECT 1 FROM job_match_sessions WHERE user_id=? AND
+                    (status IN ('queued','running') OR (status='paused' AND owner_token<>'')) LIMIT 1""",(USER,)).fetchone()
+                if active:raise HTTPException(409,"Another matching worker became active; no recovery was started.")
+                try:fresh_diagnostics=json.loads(fresh["diagnostics_json"] or "{}")
+                except (TypeError,json.JSONDecodeError):fresh_diagnostics={}
+                fresh_diagnostics["matching_stop_after_batch"]=True
+                fresh_diagnostics["matching_preserve_failed"]=True
+                fresh_diagnostics["matching_bounded_resume"]=True
+                db.execute("UPDATE user_workflows SET diagnostics_json=? WHERE workflow_id=? AND user_id=?",
+                           (json.dumps(fresh_diagnostics,sort_keys=True),workflow_id,USER))
+            elif fresh and fresh["current_stage"]=="matching":
+                try:fresh_diagnostics=json.loads(fresh["diagnostics_json"] or "{}")
+                except (TypeError,json.JSONDecodeError):fresh_diagnostics={}
+                # Resuming a saved matching checkpoint continues pending work;
+                # failed results require the separate explicit retry action.
+                fresh_diagnostics["matching_preserve_failed"]=True
+                if bounded_batch:
+                    fresh_diagnostics["matching_stop_after_batch"]=True
+                    fresh_diagnostics["matching_bounded_resume"]=True
+                db.execute("UPDATE user_workflows SET diagnostics_json=? WHERE workflow_id=? AND user_id=?",
+                           (json.dumps(fresh_diagnostics,sort_keys=True),workflow_id,USER))
             target_stage="matching" if can_recover_failed else fresh["current_stage"]
             changed=db.execute("UPDATE user_workflows SET pause_requested=0,status='queued',current_stage=?,updated_at=? WHERE workflow_id=? AND user_id=? AND status=?",
                                (target_stage,now(),workflow_id,USER,fresh["status"])).rowcount
@@ -1179,7 +1317,8 @@ def _control(request,workflow_id,action):
             if discovery_id:job_search_agent.cancel_discovery(discovery_id)
         except Exception:pass
         try:
-            if row["matching_session_id"]:resume_job_matcher.cancel_matches(session_id=row["matching_session_id"])
+            matching_session_id=_owned_matching_session_id(row)
+            if matching_session_id:resume_job_matcher.cancel_matches(session_id=matching_session_id)
         except Exception:pass
         try:application_agent.pause_applications()
         except Exception:pass
@@ -1193,7 +1332,8 @@ def pause_workflow(workflow_id:str,request:Request):return _control(request,work
 
 
 @router.post("/api/workflows/{workflow_id}/resume")
-def resume_workflow(workflow_id:str,request:Request):return _control(request,workflow_id,"resume")
+def resume_workflow(workflow_id:str,request:Request,bounded_batch:bool=False):
+    return _control(request,workflow_id,"resume",bounded_batch=bounded_batch)
 
 
 @router.post("/api/workflows/{workflow_id}/cancel")

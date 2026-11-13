@@ -38,14 +38,16 @@ class ExactSyntheticTransport:
     """Allow one exact local form target; reject every other destination."""
     def __init__(self, origin, path):
         self.origin = origin.rstrip("/")
-        self.path = path
-        self.url = self.origin + path
+        ordered_paths=list(path if isinstance(path,(list,tuple,set)) else [path])
+        self.paths = set(ordered_paths)
+        self.path = ordered_paths[0]
+        self.url = self.origin + self.path
 
     def permits(self, url):
         parsed = urlparse(str(url or ""))
         return (parsed.scheme == "http" and
                 f"{parsed.scheme}://{parsed.netloc}" == self.origin and
-                parsed.path == self.path and not parsed.query and
+                parsed.path in self.paths and not parsed.query and
                 not parsed.fragment and not parsed.username and not parsed.password)
 
     def activate(self, stack):
@@ -74,8 +76,10 @@ class ExactSyntheticTransport:
             trusted = original_source_url(value, source)
             parsed = urlparse(trusted or "")
             if (trusted and parsed.hostname == "jobs.ashbyhq.com" and
-                    parsed.path.rstrip("/") == "/synthetic-board/req-42"):
-                return self.url
+                    parsed.path.startswith("/synthetic-board/req-") and
+                    self.origin + "/synthetic-employer/apply/req-" + parsed.path.rsplit("req-",1)[-1] in
+                    {self.origin+path for path in self.paths}):
+                return self.origin + "/synthetic-employer/apply/req-" + parsed.path.rsplit("req-",1)[-1]
             return trusted
 
         stack.enter_context(patch.object(app_agent, "validate_application_url", side_effect=validate))
@@ -148,9 +152,25 @@ class ContinuousAutoApplyTests(unittest.TestCase):
         <label>Phone <input name="phone" required></label>
         <label>Resume <input type="file" name="resume" accept=".pdf" required></label>
         <button type="submit">Submit application</button></form></body></html>'''
+        unsupported = b'''<!doctype html><html><body><h1>Entry Level Software Engineer</h1>
+        <h2>Job Description</h2><p>Qualifications and responsibilities.</p><a href="/apply">Apply Now</a></body></html>'''
+        human_form = b'''<!doctype html><html><head><title>Synthetic application</title></head><body>
+        <h1>Software Engineer Application</h1><form><label>Full Name <input name="name" required></label>
+        <label>Email <input name="email" required></label><label>Resume <input type="file" name="resume" required></label>
+        <div class="g-recaptcha" data-sitekey="synthetic-site-key"></div></form></body></html>'''
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.path=="/dashboard":
+                    payload=app_agent.apply_ui_theme(app_agent.APPLICATIONS_PAGE).encode("utf-8")
+                    self.send_response(200);self.send_header("Content-Type","text/html; charset=utf-8");self.end_headers();self.wfile.write(payload);return
+                if self.path in {"/api/applications","/api/applications/progress","/api/applications/attention","/api/application-questions/attention"}:
+                    if self.path=="/api/applications": payload=app_agent.list_applications()
+                    elif self.path=="/api/applications/progress": payload=app_agent.application_progress()
+                    elif self.path=="/api/applications/attention": payload=app_agent.list_application_attention()
+                    else: payload=app_agent.grouped_application_questions()
+                    body=json.dumps(payload,default=str).encode("utf-8")
+                    self.send_response(200);self.send_header("Content-Type","application/json");self.end_headers();self.wfile.write(body);return
                 if self.path == "/synthetic-employer/apply/req-42":
                     if self.headers.get("X-Synthetic-Redirect") == "1":
                         redirect_served.append(self.path)
@@ -162,6 +182,10 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
                     self.wfile.write(form)
+                elif self.path == "/synthetic-employer/apply/req-43":
+                    self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(unsupported)
+                elif self.path == "/synthetic-employer/apply/req-44":
+                    self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers(); self.wfile.write(human_form)
                 else:
                     self.send_error(404)
 
@@ -178,7 +202,9 @@ class ContinuousAutoApplyTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         adapter = ExactSyntheticTransport(f"http://127.0.0.1:{port}",
-                                          "/synthetic-employer/apply/req-42")
+            ["/synthetic-employer/apply/req-42","/synthetic-employer/apply/req-43","/synthetic-employer/apply/req-44",
+             "/dashboard","/api/applications","/api/applications/progress","/api/applications/attention",
+             "/api/application-questions/attention"])
         try:
             # Verify unchanged production guards before injecting the narrow test transport.
             with self.assertRaises(ValueError):
@@ -239,7 +265,7 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     "standing_policy_locations": ["Anywhere"],
                     "standing_policy_work_arrangements": ["Remote"],
                     "standing_policy_experience_levels": ["Entry Level"],
-                    "standing_policy_daily_limit": 1,
+                    "standing_policy_daily_limit": 3,
                     "standing_policy_field_keys": ["full_name", "email", "phone"],
                     "standing_policy_document_types": ["resume"],
                     "standing_policy_reuse_confirmed_answers": False,
@@ -269,13 +295,13 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     db.execute("UPDATE employers SET source_fingerprint=? WHERE employer_id=?",
                                (jobs._source_fingerprint(dict(source)), "ashby:synthetic-board"))
 
-                raw_job = {"id": "req-42", "title": "Entry Level Software Engineer",
+                raw_jobs = [{"id": f"req-4{number}", "title": "Entry Level Software Engineer",
                     "location": "Remote, United States", "country": "United States",
                     "employmentType": "Full-time", "workplaceType": "Remote", "isListed": True,
                     "descriptionHtml": "Entry level full-time software engineer. Build and maintain web software using Python. Apply to this current role.",
-                    "jobUrl": "https://jobs.ashbyhq.com/synthetic-board/req-42",
-                    "applyUrl": "https://jobs.ashbyhq.com/synthetic-board/req-42"}
-                feed_fetch = patch.object(jobs, "fetch_source", return_value=([raw_job], None))
+                    "jobUrl": f"https://jobs.ashbyhq.com/synthetic-board/req-4{number}",
+                    "applyUrl": f"https://jobs.ashbyhq.com/synthetic-board/req-4{number}"} for number in (3,4,2)]
+                feed_fetch = patch.object(jobs, "fetch_source", return_value=(raw_jobs, None))
                 stack.enter_context(feed_fetch)
 
                 def synthetic_match(request, **_kwargs):
@@ -342,13 +368,22 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     app = db.execute("SELECT id,state,attempt_number,diagnostic_json FROM applications WHERE job_key=?",
                                      ("ashby:synthetic-board:req-42",)).fetchone()
                     if not app:
-                        self.fail("Scheduler workflow did not create an application: " + json.dumps(workflow_rows))
+                        details={"urls":[dict(row) for row in db.execute("SELECT job_key,url,job_url FROM discovered_openings")],
+                                 "attention":[dict(row) for row in db.execute("SELECT job_key,blocker_code,reason,application_url FROM application_attention_items")],
+                                 "inspections":[dict(row) for row in db.execute("SELECT job_key,report_json FROM application_form_inspections")],
+                                 "workflow":workflow_rows}
+                        self.fail("Scheduler workflow did not create an application: " + json.dumps(details))
                     grant = db.execute("SELECT authorization_source,field_keys_json,document_types_json FROM application_preparation_authorizations WHERE job_key=? AND revoked_at IS NULL",
                                        ("ashby:synthetic-board:req-42",)).fetchone()
                     reservation_count = db.execute("SELECT COUNT(*) FROM application_opening_reservations WHERE application_id=?",
                                                     (app["id"],)).fetchone()[0]
                     policy_job_count = db.execute("SELECT COUNT(DISTINCT job_key) FROM standing_policy_events WHERE user_id=?",
                                                   (app_agent.USER,)).fetchone()[0]
+                    routed = [dict(row) for row in db.execute("SELECT job_key,blocker_code,form_state,preparation_state,status FROM application_attention_items ORDER BY job_key")]
+                    form_inspection_count = db.execute("SELECT COUNT(*) FROM application_form_inspections").fetchone()[0]
+                    other_states = {row["job_key"]:row["availability_status"] for row in db.execute(
+                        "SELECT job_key,availability_status FROM discovered_openings WHERE job_key IN (?,?)",
+                        ("ashby:synthetic-board:req-43","ashby:synthetic-board:req-44"))}
                 self.assertIsNotNone(opening)
                 self.assertEqual(opening["availability_status"], "current")
                 self.assertEqual(opening["url"], adapter.url)
@@ -373,6 +408,16 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                 self.assertEqual(browser_inputs[0]["readback"], {"name":"Synthetic Candidate",
                     "email":"synthetic@example.test","phone":"555-0102"})
                 self.assertEqual(browser_inputs[0]["resume_upload_count"], 1)
+                self.assertEqual(other_states,{"ashby:synthetic-board:req-43":"current","ashby:synthetic-board:req-44":"current"})
+                self.assertEqual(len(routed),2,routed)
+                self.assertEqual({item["job_key"] for item in routed},{"ashby:synthetic-board:req-43","ashby:synthetic-board:req-44"})
+                self.assertEqual({item["blocker_code"] for item in routed},{"unsupported_form","human_verification"})
+                self.assertTrue(all(item["preparation_state"]=="not_prepared" and item["status"]=="open" for item in routed))
+                with jobs.database() as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM applications WHERE job_key IN (?,?)",
+                        ("ashby:synthetic-board:req-43","ashby:synthetic-board:req-44")).fetchone()[0],0)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts a JOIN applications x ON x.id=a.application_id WHERE x.job_key IN (?,?)",
+                        ("ashby:synthetic-board:req-43","ashby:synthetic-board:req-44")).fetchone()[0],0)
                 self.assertFalse(posts)
 
                 # Rediscovery and a second scheduler pass cannot create another reservation or attempt.
@@ -392,6 +437,9 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                                                 ("ashby:synthetic-board:req-42",)).fetchone()[0], 1)
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts a JOIN applications x ON x.id=a.application_id WHERE x.job_key=?",
                                                 ("ashby:synthetic-board:req-42",)).fetchone()[0], 1)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attention_items WHERE status IN ('open','acknowledged')").fetchone()[0],2)
+                    self.assertEqual(db.execute("SELECT COUNT(DISTINCT identity_hash||':'||blocker_code) FROM application_attention_items").fetchone()[0],2)
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM application_form_inspections").fetchone()[0],form_inspection_count)
 
                 app_id = app["id"]
                 outcome = app_agent.record_manual_submission_outcome(app_id,
@@ -433,6 +481,31 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     browser.close()
                 self.assertTrue(redirect_served)
                 self.assertEqual(guarded_requests, [adapter.url])
+                with sync_playwright() as p:
+                    browser=p.chromium.launch(headless=True)
+                    context=browser.new_context(viewport={"width":1280,"height":900})
+                    page=context.new_page();page_errors=[];api_responses=[]
+                    page.on("pageerror",lambda error:page_errors.append(str(error)))
+                    page.on("response",lambda response:api_responses.append((response.url,response.status)) if "/api/" in response.url else None)
+                    page.route("**/*",lambda route:app_agent._guard_browser_request(route,{}))
+                    page.goto(adapter.origin+"/dashboard",wait_until="domcontentloaded")
+                    page.wait_for_timeout(1000)
+                    self.assertEqual(page.locator("#attention-inbox [data-attention-id]").count(),2,
+                        json.dumps({"url":page.url,"errors":page_errors,"responses":api_responses,
+                            "has_handoff_script":"function renderHandoffs" in page.content(),
+                            "has_attention_fetch":"/api/applications/attention" in page.content(),
+                            "render_handoffs_type":page.evaluate("typeof renderHandoffs"),
+                            "inbox":page.locator("#attention-inbox").inner_text() if page.locator("#attention-inbox").count() else "missing"}))
+                    self.assertIn("Ready for your review",page.locator("#attention-inbox").inner_text())
+                    self.assertIn("No application attempt or preparation was created",page.locator("#attention-inbox").inner_text())
+                    for width in (1280,768,390):
+                        page.set_viewport_size({"width":width,"height":844})
+                        self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"),width)
+                    for theme in ("light","dark"):
+                        page.evaluate("theme=>document.documentElement.setAttribute('data-bsa-theme',theme)",theme)
+                        self.assertEqual(page.locator("html").get_attribute("data-bsa-theme"),theme)
+                    self.assertFalse(page_errors,page_errors)
+                    context.close();browser.close()
 
             # After adapter destruction the production guard still rejects the synthetic loopback form.
             with self.assertRaises(ValueError):
