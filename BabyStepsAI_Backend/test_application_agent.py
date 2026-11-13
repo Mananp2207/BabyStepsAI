@@ -1270,6 +1270,29 @@ class ApplicationAgentTests(unittest.TestCase):
                     allow_ai_answers=True,allow_cloud_ai=False))
         self.assertEqual(caught.exception.status_code,409)
 
+    def test_groq_preparation_requires_groq_specific_settings_and_job_consent(self):
+        key,url=self._make_external_eligible_job()
+        base=dict(allow_automated_form_preparation=True,allow_ai_drafting=True,
+            matching_provider="groq",groq_model="openai/gpt-oss-20b")
+        with patch.dict(os.environ,{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(app_agent,"validate_application_url"):
+            answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(**base))
+            plan=app_agent.preparation_authorization_plan(key)
+            request=app_agent.PreparationAuthorizationRequest(confirmed=True,confirmed_employer=plan["employer"],
+                confirmed_title=plan["title"],confirmed_application_url=plan["application_url"],
+                field_keys=["full_name"],document_types=["resume"],allow_ai_answers=True,allow_cloud_ai=True)
+            with self.assertRaises(HTTPException) as caught:
+                app_agent.authorize_saved_job_preparation(key,request)
+            self.assertEqual(caught.exception.status_code,409)
+            answer_assistant.update_authorization(answer_assistant.AuthorizationUpdate(**{**base,"allow_groq_cloud_ai":True}))
+            plan=app_agent.preparation_authorization_plan(key)
+            saved=app_agent.authorize_saved_job_preparation(key,app_agent.PreparationAuthorizationRequest(
+                confirmed=True,confirmed_employer=plan["employer"],confirmed_title=plan["title"],
+                confirmed_application_url=plan["application_url"],field_keys=["full_name"],
+                document_types=["resume"],allow_ai_answers=True,allow_cloud_ai=True))
+        self.assertTrue(saved["cloud_ai_authorized"])
+        self.assertTrue(plan["groq_cloud_permission_available"])
+        self.assertFalse(plan["live_submission_enabled"])
+
     def test_authorized_real_job_runs_a_fresh_read_only_preflight_before_filling(self):
         key,url=self._make_external_eligible_job()
         with patch.object(app_agent,"validate_application_url"):

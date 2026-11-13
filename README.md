@@ -13,6 +13,7 @@ BabyStepsAI is a local-first job discovery and application preparation prototype
 - Job normalization, duplicate detection, eligibility matching, and match freshness checks.
 - Grounded application answer drafting and a persistent dry-run queue.
 - One-prompt workflow orchestration from authorized discovery through eligibility matching and sequential application preparation, with persisted progress and pause/resume/cancel controls.
+- Optional Auto Apply scheduling under a versioned, bounded standing policy. The policy is disabled by default, can be revoked, and queues only supported, current openings that pass eligibility and duplicate checks.
 - Conservative browser preparation that pauses for authentication, CAPTCHA, missing facts, or other human-required steps.
 - No paid AI service is required. Ollama can provide local model inference.
 
@@ -59,7 +60,7 @@ ollama pull qwen2.5:3b
 ollama serve
 ```
 
-The default matching provider is local Ollama. Matching supports optional Google Gemini from **Application Settings**; Gemini sends the confirmed candidate profile and saved job content to Google. To use it, set `GEMINI_API_KEY` in the server process environment before startup. The key is never saved in SQLite or returned by the settings API. `GEMINI_MODEL` optionally selects another supported Gemini model; the default is `gemini-2.5-flash`. No API key is required for local Ollama operation, and the server does not automatically load `.env` files.
+The default matching provider is local Ollama. Google Gemini remains optional and uses a separate Gemini permission. Groq is another optional cloud provider selected in **Application Settings**; it never receives candidate data unless Groq cloud processing is explicitly enabled. Ollama remains the local option when cloud use is not authorized or available. The server reads only `GROQ_API_KEY` and `GROQ_MODEL` from the ignored project-root `.env` file (which must have owner-only permissions) or from the server environment; neither value is stored in SQLite or returned to the browser. The default Groq model is `openai/gpt-oss-20b`; only models listed for Groq Free Plan limits are accepted, and changing providers never selects a different cloud model automatically. Keep the Groq account on its Free plan to avoid usage billing; Groq itself enforces free-plan rate limits. `GEMINI_API_KEY` and `GEMINI_MODEL` retain their existing server-environment configuration and independent permission. No API key is required for local Ollama operation.
 
 The workflow dashboard can retry failed saved-job analyses in one matching-only run. It reuses stored openings and does not repeat employer discovery. Provider, model, resume, confirmed profile, preferences, job content, and matching-engine version are tracked for match freshness.
 
@@ -100,7 +101,7 @@ python -m unittest discover -v
 python -m py_compile *.py
 ```
 
-The unified workflow requires automatic discovery and AI matching permissions. Automatic dry-run preparation also requires its separate setting in Application settings. These permissions never enable live employer submission.
+Auto Apply is enabled from Application settings only after defining its job, location, field, document, and daily-limit scope. Approval enables routine discovery, matching, and preparation under that scope. Sensitive or legal fields, unsupported forms, CAPTCHA, and final submission remain human-only. Live submission stays disabled.
 
 Mocked tests use deterministic local responses. Live source verification requires network access and is separate from the test suite.
 

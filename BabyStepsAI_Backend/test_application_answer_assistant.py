@@ -22,6 +22,12 @@ class FakeGeminiResponse:
     def raise_for_status(self): pass
     def json(self): return {"candidates":[{"content":{"parts":[{"text":json.dumps(self.value)}]}}]}
 
+class FakeGroqResponse:
+    status_code=200
+    def __init__(self,value): self.value=value
+    def raise_for_status(self): pass
+    def json(self): return self.value
+
 
 class ApplicationAnswerAssistantTests(unittest.TestCase):
     def setUp(self):
@@ -120,6 +126,93 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
             assistant.update_authorization(assistant.AuthorizationUpdate(
                 allow_automated_form_preparation=True,standing_policy_enabled=True))
         self.assertEqual(caught.exception.status_code,422)
+
+    def test_standing_policy_missing_location_returns_field_specific_422_without_saving(self):
+        from fastapi import HTTPException
+        scope={"standing_policy_enabled":True,"standing_policy_categories":["Software Development"],
+            "standing_policy_employment_types":["Full-time"],"standing_policy_countries":["United States"],
+            "standing_policy_work_arrangements":["Remote"],"standing_policy_experience_levels":["New Graduate"],
+            "standing_policy_field_keys":["full_name","email"],"standing_policy_document_types":["resume"]}
+        before=assistant.get_authorization()["version"]
+        with patch("career_preferences.get_preferences",return_value={"categories":["Software Development"],"roles":["Software Engineer"]}):
+            with self.assertRaises(HTTPException) as caught:
+                assistant.update_authorization(assistant.AuthorizationUpdate(**scope))
+        self.assertEqual(caught.exception.status_code,422)
+        self.assertEqual(caught.exception.detail,{"errors":[{"field":"standing_policy_locations",
+            "message":"Enter ‘Anywhere’ to allow any location within the selected countries, or choose at least one city or region.",
+            "label":"Allowed locations"}]})
+        self.assertEqual(assistant.get_authorization()["version"],before)
+
+    def test_settings_page_serializes_policy_and_prevents_duplicate_saves_in_chromium(self):
+        if os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")!="1":
+            self.skipTest("Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to run Chromium settings verification.")
+        from urllib.parse import urlparse
+        from playwright.sync_api import sync_playwright
+        from fastapi import HTTPException
+        requests={"get":0,"put":0}
+        page_html=assistant.application_settings_page().body.decode()
+        def transport(route):
+            parsed=urlparse(route.request.url)
+            if parsed.path=="/application-settings":
+                route.fulfill(status=200,content_type="text/html",body=page_html)
+                return
+            if parsed.path!="/api/application-authorization":
+                route.abort();return
+            if route.request.method=="GET":
+                requests["get"]+=1
+                route.fulfill(status=200,json=assistant.authorization_status())
+                return
+            requests["put"]+=1
+            try:
+                payload=route.request.post_data_json
+                saved=assistant.update_authorization(assistant.AuthorizationUpdate(**payload))
+                route.fulfill(status=200,json=saved)
+            except HTTPException as error:
+                route.fulfill(status=error.status_code,json={"detail":error.detail})
+        with patch("career_preferences.get_preferences",return_value={"categories":["Software Development"],"roles":["Software Engineer"]}):
+            with sync_playwright() as playwright:
+                browser=playwright.chromium.launch(headless=True)
+                page=browser.new_page()
+                page.route("**/*",transport)
+                page.goto("http://app.test/application-settings",wait_until="domcontentloaded")
+                for key,value in {
+                    "standing_policy_categories":"Software Development",
+                    "standing_policy_employment_types":"Full-time",
+                    "standing_policy_countries":"United States",
+                    "standing_policy_locations":"Anywhere",
+                    "standing_policy_work_arrangements":"Remote, Hybrid, Onsite",
+                    "standing_policy_experience_levels":"New Graduate, Early Career",
+                    "standing_policy_field_keys":"full_name, email, phone",
+                    "standing_policy_document_types":"resume",
+                    "standing_policy_daily_limit":"1",
+                    "max_applications_per_24_hours":"7",
+                }.items():
+                    page.locator(f'[name="{key}"]').fill(value)
+                page.locator('[name="standing_policy_enabled"]').check()
+                page.locator("#settings").evaluate("form=>{const e=new SubmitEvent('submit',{bubbles:true,cancelable:true});form.dispatchEvent(e);form.dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true}))}")
+                page.get_by_text("Saved and read back authorization version",exact=False).wait_for(timeout=5000)
+                self.assertEqual(requests["put"],1)
+                saved=assistant.get_authorization()
+                self.assertTrue(saved["settings"]["standing_policy_enabled"])
+                self.assertEqual(saved["settings"]["standing_policy_locations"],["Anywhere"])
+                self.assertEqual(saved["settings"]["standing_policy_field_keys"],["full_name","email","phone"])
+                self.assertEqual(saved["settings"]["standing_policy_document_types"],["resume"])
+                self.assertEqual(saved["settings"]["standing_policy_daily_limit"],1)
+                self.assertEqual(saved["settings"]["max_applications_per_24_hours"],7)
+                self.assertFalse(saved["settings"]["live_submission_enabled"])
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_function("document.querySelector('#status').textContent.includes('Authorization version')")
+                self.assertTrue(page.locator('[name="standing_policy_enabled"]').is_checked())
+                self.assertEqual(page.locator('[name="standing_policy_locations"]').input_value(),"Anywhere")
+                page.locator('[name="standing_policy_locations"]').fill("")
+                page.locator("#settings").evaluate("form=>form.dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true}))")
+                page.get_by_text("Allowed locations",exact=False).wait_for(timeout=3000)
+                self.assertEqual(requests["put"],1,"The browser must block incomplete policy scope before sending a save.")
+                page.locator('[name="standing_policy_enabled"]').uncheck()
+                page.locator("#settings").evaluate("form=>form.dispatchEvent(new SubmitEvent('submit',{bubbles:true,cancelable:true}))")
+                page.get_by_text("Saved and read back authorization version",exact=False).wait_for(timeout=5000)
+                self.assertFalse(assistant.get_authorization()["settings"]["standing_policy_enabled"])
+                browser.close()
         scope={"allow_automated_form_preparation":True,"allow_ai_drafting":True,"matching_provider":"ollama",
             "standing_policy_enabled":True,"standing_policy_categories":["Software Engineering"],
             "standing_policy_employment_types":["Full-time"],"standing_policy_countries":["United States"],
@@ -250,6 +343,54 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
                         {"title":"Engineer"},"Python software role.")
         self.assertIn("GEMINI_API_KEY",str(caught.exception.detail))
         mocked.assert_not_called()
+
+    def test_groq_provider_health_uses_models_endpoint_without_candidate_data(self):
+        payload={"data":[{"id":"openai/gpt-oss-20b"}]}
+        with patch.dict(os.environ,{"GROQ_API_KEY":"synthetic-groq-secret","GROQ_MODEL":"openai/gpt-oss-20b"}), \
+             patch.object(assistant.requests,"get",return_value=FakeGroqResponse(payload)) as get:
+            result=assistant.groq_provider_health()
+        self.assertEqual(result,{"provider":"groq","configured":True,"model":"openai/gpt-oss-20b","available":True,"reason":"ready"})
+        self.assertEqual(get.call_args.args[0],"https://api.groq.com/openai/v1/models")
+        self.assertEqual(get.call_args.kwargs["headers"]["Authorization"],"Bearer synthetic-groq-secret")
+        self.assertNotIn("synthetic-groq-secret",json.dumps(result))
+        self.assertNotIn("synthetic-groq-secret",json.dumps(get.call_args.kwargs.get("json",{})))
+
+    def test_groq_structured_json_response_uses_allowlisted_model_and_server_key(self):
+        assistant._DRAFT_CACHE.clear()
+        answer={"answer":"","needs_user_input":True,"evidence_used":[]}
+        with patch.dict(os.environ,{"GROQ_API_KEY":"synthetic-groq-secret","GROQ_MODEL":"openai/gpt-oss-20b"}):
+            saved=assistant.update_authorization(assistant.AuthorizationUpdate(allow_ai_drafting=True,
+                matching_provider="groq",groq_model="openai/gpt-oss-20b",allow_groq_cloud_ai=True))
+            with patch.object(assistant.requests,"post",return_value=FakeGroqResponse({
+                    "choices":[{"message":{"content":json.dumps(answer)}}]})) as post:
+                result=assistant.generate_draft("What additional detail is needed?",{"technical_skills":["Python"]},
+                    {},{"title":"Synthetic Engineer"},"Synthetic job description.",regenerate=True)
+        self.assertTrue(saved["settings"]["groq_configured"])
+        self.assertTrue(result["needs_user_input"])
+        self.assertEqual(post.call_args.args[0],"https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(post.call_args.kwargs["json"]["model"],"openai/gpt-oss-20b")
+        self.assertEqual(post.call_args.kwargs["json"]["response_format"],{"type":"json_object"})
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"],"Bearer synthetic-groq-secret")
+        self.assertNotIn("synthetic-groq-secret",json.dumps(saved))
+        self.assertNotIn("synthetic-groq-secret",json.dumps(assistant.authorization_status()))
+        with assistant.connect() as db:
+            persisted=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()[0]
+        self.assertNotIn("synthetic-groq-secret",persisted)
+
+    def test_groq_cloud_consent_is_separate_and_invalid_model_is_rejected(self):
+        from fastapi import HTTPException
+        with patch.dict(os.environ,{"GROQ_API_KEY":""}):
+            assistant.update_authorization(assistant.AuthorizationUpdate(allow_ai_drafting=True,matching_provider="groq"))
+            with patch.object(assistant.requests,"post") as post:
+                with self.assertRaises(HTTPException) as caught:
+                    assistant.generate_draft("Why this role?",{"technical_skills":["Python"]},{},
+                        {"title":"Synthetic Engineer"},"Synthetic description.")
+            self.assertEqual(caught.exception.status_code,403)
+            post.assert_not_called()
+        with self.assertRaises(HTTPException) as invalid:
+            assistant.update_authorization(assistant.AuthorizationUpdate(matching_provider="groq",groq_model="paid/model"))
+        self.assertEqual(invalid.exception.status_code,422)
+        self.assertEqual(invalid.exception.detail["field"],"groq_model")
 
     def test_ollama_connection_failure_returns_clear_local_service_error(self):
         import requests

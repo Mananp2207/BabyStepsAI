@@ -34,11 +34,14 @@ from job_relevance import (evaluate_location, evaluate_relocation_preference, ex
                            extract_sponsorship_requirement)
 from job_connectors import EmployerSource, fetch_source, normalize_job as normalize_source_job
 from matching_versions import fingerprint as stable_fingerprint, profile_fingerprint, job_fingerprint
+from provider_config import GROQ_FREE_MODELS, configured_groq_model, groq_api_key, groq_model_allowed
 
 router = APIRouter()
 MODEL = "qwen2.5:3b"
 MATCHING_ENGINE_VERSION = f"ollama:{MODEL}/job-match-v23-early-career-sponsorship-review"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_TIMEOUT = (5, 45)
 def _bounded_env_float(name,default,minimum,maximum):
     try:value=float(os.getenv(name,str(default)))
     except (TypeError,ValueError):value=float(default)
@@ -1400,6 +1403,10 @@ def _provider_model(provider,model=None):
         selected=model or GEMINI_MODEL
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}",selected):raise ValueError("Gemini model name contains unsupported characters.")
         return selected
+    if provider=="groq":
+        selected=model or configured_groq_model()
+        if not groq_model_allowed(selected):raise ValueError("The selected Groq model is not on the free-tier allowlist.")
+        return selected
     raise ValueError("Unsupported matching provider.")
 
 
@@ -1409,9 +1416,20 @@ def current_provider_config():
             row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()
         settings=json.loads(row["settings_json"] or "{}") if row else {}
         provider=settings.get("matching_provider","ollama")
-    except (sqlite3.OperationalError,TypeError,json.JSONDecodeError):provider="ollama"
-    if provider not in {"ollama","gemini"}:provider="ollama"
-    return provider,_provider_model(provider)
+        model=settings.get("groq_model") if provider=="groq" else None
+    except (sqlite3.OperationalError,TypeError,json.JSONDecodeError):provider="ollama";model=None
+    if provider not in {"ollama","gemini","groq"}:provider="ollama";model=None
+    return provider,_provider_model(provider,model)
+
+
+def _groq_authorization_blocker(settings):
+    if not groq_api_key():
+        return "Groq is selected, but GROQ_API_KEY is unavailable. No matching request was sent."
+    if not settings.get("allow_groq_cloud_ai"):
+        return "Explicit Groq cloud-processing permission is required. No candidate data was sent to Groq."
+    if settings.get("standing_policy_enabled") and not settings.get("standing_policy_allow_groq"):
+        return "The standing Auto Apply policy does not explicitly allow Groq. No candidate data was sent to Groq."
+    return ""
 
 
 def matching_engine_version(provider=None,model=None):
@@ -1420,14 +1438,28 @@ def matching_engine_version(provider=None,model=None):
 
 
 def _provider_result(profile,profile_status,prefs,job,provider,model):
+    if provider == "groq":
+        if not groq_api_key():
+            raise RuntimeError("Groq matching is selected, but GROQ_API_KEY is not configured on this server.")
+        with database() as db:
+            row=db.execute("SELECT settings_json FROM application_authorizations WHERE user_id=?",(USER,)).fetchone()
+        try:settings=json.loads(row["settings_json"] or "{}") if row else {}
+        except (TypeError,json.JSONDecodeError):settings={}
+        selected_model=settings.get("groq_model",configured_groq_model())
+        if (settings.get("matching_provider")!="groq" or not settings.get("allow_ai_matching") or
+                not settings.get("allow_groq_cloud_ai") or selected_model!=model or
+                (settings.get("standing_policy_enabled") and not settings.get("standing_policy_allow_groq"))):
+            raise RuntimeError("Explicit Groq cloud-processing consent is not current. No candidate data was sent to Groq.")
     prompt=build_prompt(profile,profile_status,prefs,job)
     last_error=None
     repair_details=""
     api_key=os.getenv("GEMINI_API_KEY","").strip() if provider=="gemini" else ""
     if provider=="gemini" and not api_key:
         raise RuntimeError("Gemini matching is selected, but GEMINI_API_KEY is not configured in the server environment.")
-    if provider not in {"ollama","gemini"}:raise RuntimeError("Unsupported matching provider.")
-    for attempt in range(max(1,min(int(OLLAMA_ATTEMPTS),3))):
+    if provider not in {"ollama","gemini","groq"}:raise RuntimeError("Unsupported matching provider.")
+    if provider=="groq" and not groq_model_allowed(model):raise RuntimeError("The selected Groq model is not on the free-tier allowlist.")
+    attempts=max(1,min(int(OLLAMA_ATTEMPTS),2 if provider=="groq" else 3))
+    for attempt in range(attempts):
         request_prompt=prompt if not repair_details else prompt+"\n\n"+MATCHING_JSON_REPAIR_INSTRUCTION+"\nValidation issue: "+repair_details
         try:
             if provider=="ollama":
@@ -1436,6 +1468,20 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
                         "format":MatchResult.model_json_schema(),
                         "options":{"temperature":0,"num_ctx":8192,"num_predict":1800}},timeout=OLLAMA_TIMEOUT)
                     return _parse_match_response(response)
+            if provider=="groq":
+                groq_response=requests.post(GROQ_URL,headers={"Authorization":"Bearer "+groq_api_key()},json={
+                    "model":model,"messages":[{"role":"user","content":request_prompt}],
+                    "temperature":0,"response_format":{"type":"json_object"}},timeout=GROQ_TIMEOUT)
+                if groq_response.status_code in {401,403}:
+                    raise RuntimeError("Groq rejected the configured credentials or model access.")
+                groq_response.raise_for_status()
+                envelope=groq_response.json()
+                choices=envelope.get("choices") if isinstance(envelope,dict) else None
+                message=choices[0].get("message") if isinstance(choices,list) and choices else None
+                content=message.get("content") if isinstance(message,dict) else None
+                if not isinstance(content,str) or not content.strip():
+                    raise ValueError("Groq returned no structured match content.")
+                return _parse_match_text(content,"Groq")
             response=requests.post(GEMINI_URL.format(model=model),headers={"x-goog-api-key":api_key},json={
                 "contents":[{"role":"user","parts":[{"text":request_prompt}]}],
                 "generationConfig":{"temperature":0,"responseMimeType":"application/json",
@@ -1474,10 +1520,15 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
                 last_error=f"Ollama service error (HTTP {code})" if code else "Ollama service error"
             elif provider=="gemini" and isinstance(error,requests.RequestException):
                 last_error=f"network or service error ({type(error).__name__})"
+            elif provider=="groq" and isinstance(error,requests.RequestException):
+                code=getattr(getattr(error,"response",None),"status_code",None)
+                last_error=(f"Groq rate limit (HTTP {code})" if code==429 else
+                            f"Groq provider error (HTTP {code})" if code else
+                            f"Groq network or service error ({type(error).__name__})")
             else:last_error=error
             if isinstance(error,ValueError):repair_details=str(error)[:240]
-            if isinstance(error,RuntimeError) and provider=="gemini" and ("HTTP " in str(error) or "rejected the configured API key" in str(error)):break
-            if attempt+1<OLLAMA_ATTEMPTS:time.sleep(min(0.5*(2**attempt),2))
+            if isinstance(error,RuntimeError) and provider in {"gemini","groq"} and ("HTTP " in str(error) or "rejected the configured" in str(error)):break
+            if attempt+1<attempts:time.sleep(min(0.5*(2**attempt),2))
     if provider=="ollama":
         if isinstance(last_error,ValueError):
             raise MatchingProviderError("invalid_response","Ollama returned malformed match JSON after bounded repair attempts. Retry the selected job; no application action was taken.")
@@ -1485,7 +1536,7 @@ def _provider_result(profile,profile_status,prefs,job,provider,model):
             r"Ollama is not reachable|Ollama connection timed out|Ollama service error(?: \(HTTP [1-5][0-9]{2}\))?",last_error) else "Ollama provider failure"
         category="connection" if "reachable" in reason.casefold() or "connection timed out" in reason.casefold() else "provider_failure"
         raise MatchingProviderError(category,f"Ollama matching failed after {max(1,min(int(OLLAMA_ATTEMPTS),3))} bounded attempts ({reason}). Retry this job after checking the local model.")
-    raise RuntimeError(f"{provider.title()} matching failed after {OLLAMA_ATTEMPTS} attempts: {last_error}")
+    raise RuntimeError(f"{provider.title()} matching failed after {attempts} bounded attempts ({last_error}).")
 
 
 def analyze_with_provider(profile,profile_status,prefs,job,provider=None,model=None):
@@ -2268,7 +2319,10 @@ def retry_failed_match(request:FailedMatchRetryRequest):
     if not settings.get("allow_ai_matching",False):
         raise HTTPException(403,"AI matching is not enabled in Application settings.")
     provider=settings.get("matching_provider","ollama")
-    if provider not in {"ollama","gemini"}:provider="ollama"
+    if provider not in {"ollama","gemini","groq"}:provider="ollama"
+    if provider=="groq":
+        blocker=_groq_authorization_blocker(settings)
+        if blocker:raise HTTPException(403 if groq_api_key() else 503,blocker)
     model=_provider_model(provider)
     if provider=="gemini" and not os.getenv("GEMINI_API_KEY","").strip():
         raise HTTPException(503,"Gemini is selected, but its server key is unavailable. No retry was started.")
@@ -2340,7 +2394,10 @@ def analyze_matches(request: MatchRequest, workflow_id=None):
     if not allowed:
         raise HTTPException(403, "Enable AI job matching in Application settings first.")
     provider=authorization_settings.get("matching_provider","ollama")
-    if provider not in {"ollama","gemini"}:provider="ollama"
+    if provider not in {"ollama","gemini","groq"}:provider="ollama"
+    if provider=="groq":
+        blocker=_groq_authorization_blocker(authorization_settings)
+        if blocker:raise HTTPException(403 if groq_api_key() else 503,blocker)
     provider_model=_provider_model(provider)
     if provider=="gemini" and not os.getenv("GEMINI_API_KEY","").strip():
         raise HTTPException(503,"Gemini is selected, but GEMINI_API_KEY is not configured in the server environment.")

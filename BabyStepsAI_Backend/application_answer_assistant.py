@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from candidate_verification import verified_profile_facts, validate_application_answer
 from job_search_agent import DB, USER, fetch_board
 from ollama_runtime import OLLAMA_LOCK
+from provider_config import configured_groq_model, groq_api_key, groq_model_allowed
 from ui_theme import apply_ui_theme
 from candidate_verification import verified_values_from_json
 
@@ -27,6 +28,8 @@ MODEL = "qwen2.5:3b"
 OLLAMA = "http://127.0.0.1:11434/api/generate"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = configured_groq_model()
 TIMEOUT = (5, 90)
 ATTEMPTS = 2
 _DRAFT_CACHE = OrderedDict()
@@ -38,6 +41,8 @@ DEFAULT_SETTINGS = {
     "allow_automatic_discovery": False,
     "allow_ai_matching": False,
     "matching_provider": "ollama",
+    "groq_model": GROQ_MODEL,
+    "allow_groq_cloud_ai": False,
     "allow_automated_form_preparation": False,
     "allow_auto_use_confirmed_answers": False,
     "allow_demographic_reuse": False,
@@ -58,6 +63,7 @@ DEFAULT_SETTINGS = {
     "standing_policy_reuse_confirmed_answers": False,
     "standing_policy_allow_ai_answers": False,
     "standing_policy_allow_cloud_ai": False,
+    "standing_policy_allow_groq": False,
     "live_submission_enabled": False,
 }
 
@@ -101,7 +107,10 @@ def get_authorization():
     with connect() as db:
         row = db.execute("SELECT version,settings_json,updated_at FROM application_authorizations WHERE user_id=?", (USER,)).fetchone()
     if not row:
-        return {"version": 1, "settings": dict(DEFAULT_SETTINGS), "updated_at": None}
+        settings=dict(DEFAULT_SETTINGS)
+        settings.update(gemini_configured=bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            groq_configured=bool(groq_api_key()),live_submission_enabled=False)
+        return {"version": 1, "settings": settings, "updated_at": None}
     try:
         settings = dict(DEFAULT_SETTINGS)
         settings.update(json.loads(row["settings_json"] or "{}"))
@@ -109,7 +118,10 @@ def get_authorization():
         settings = dict(DEFAULT_SETTINGS)
     settings["live_submission_enabled"] = False
     settings["gemini_configured"] = bool(os.getenv("GEMINI_API_KEY", "").strip())
-    if settings.get("matching_provider") not in {"ollama", "gemini"}:
+    settings["groq_configured"] = bool(groq_api_key())
+    if not groq_model_allowed(settings.get("groq_model")):
+        settings["groq_model"] = GROQ_MODEL
+    if settings.get("matching_provider") not in {"ollama", "gemini", "groq"}:
         settings["matching_provider"] = "ollama"
     return {"version": row["version"], "settings": settings, "updated_at": row["updated_at"]}
 
@@ -117,7 +129,9 @@ def get_authorization():
 class AuthorizationUpdate(BaseModel):
     allow_automatic_discovery: bool = False
     allow_ai_matching: bool = False
-    matching_provider: Literal["ollama", "gemini"] = "ollama"
+    matching_provider: Literal["ollama", "gemini", "groq"] = "ollama"
+    groq_model: str = GROQ_MODEL
+    allow_groq_cloud_ai: bool = False
     allow_automated_form_preparation: bool = False
     allow_auto_use_confirmed_answers: bool = False
     allow_demographic_reuse: bool = False
@@ -138,6 +152,23 @@ class AuthorizationUpdate(BaseModel):
     standing_policy_reuse_confirmed_answers: bool = False
     standing_policy_allow_ai_answers: bool = False
     standing_policy_allow_cloud_ai: bool = False
+    standing_policy_allow_groq: bool = False
+
+
+STANDING_POLICY_SCOPE_LABELS = {
+    "standing_policy_categories": "Job categories",
+    "standing_policy_employment_types": "Employment types",
+    "standing_policy_countries": "Allowed countries",
+    "standing_policy_locations": "Allowed locations",
+    "standing_policy_work_arrangements": "Work arrangements",
+    "standing_policy_experience_levels": "Experience levels",
+    "standing_policy_field_keys": "Allowed candidate fields",
+    "standing_policy_document_types": "Allowed documents",
+}
+
+
+def _authorization_field_error(field, message):
+    raise HTTPException(422, detail={"field": field, "message": message})
 
 
 @router.get("/api/application-authorization")
@@ -148,15 +179,27 @@ def authorization_status():
 @router.put("/api/application-authorization")
 def update_authorization(payload: AuthorizationUpdate):
     settings = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    if not groq_model_allowed(settings["groq_model"]):
+        _authorization_field_error("groq_model", "Choose a Groq model explicitly listed for free-tier use.")
+    if settings["allow_groq_cloud_ai"] and settings["matching_provider"] != "groq":
+        _authorization_field_error("allow_groq_cloud_ai", "Select Groq before authorizing Groq cloud processing.")
+    if settings["standing_policy_allow_groq"] and (
+            settings["matching_provider"] != "groq" or not settings["allow_groq_cloud_ai"]):
+        _authorization_field_error("standing_policy_allow_groq",
+            "Select Groq and separately enable Groq cloud processing before allowing it in Auto Apply.")
     ordinary_fields={"full_name","preferred_name","email","phone","phone_country_code","location","city",
         "state_province","country","postal_code","linkedin","github","portfolio","website","university",
         "education","degree","major","graduation_date","graduation_month","graduation_year","work_experience",
         "internships","technical_skills","projects","certifications","availability","earliest_available_date",
         "reusable_confirmed_answers"}
-    if set(settings["standing_policy_field_keys"])-ordinary_fields:
-        raise HTTPException(422,"The standing policy includes a field that requires job-specific or human approval.")
-    if set(settings["standing_policy_document_types"])-{"resume","transcript","certificate","cover_letter","portfolio"}:
-        raise HTTPException(422,"The standing policy includes an unsupported document type.")
+    invalid_fields=sorted(set(settings["standing_policy_field_keys"])-ordinary_fields)
+    if invalid_fields:
+        _authorization_field_error("standing_policy_field_keys",
+            "Remove fields that need job-specific or human approval: "+", ".join(invalid_fields[:8])+".")
+    invalid_documents=sorted(set(settings["standing_policy_document_types"])-{"resume","transcript","certificate","cover_letter","portfolio"})
+    if invalid_documents:
+        _authorization_field_error("standing_policy_document_types",
+            "Choose only supported document types: resume, transcript, certificate, cover letter, or portfolio.")
     for key in ("standing_policy_categories","standing_policy_employment_types","standing_policy_countries","standing_policy_locations",
                 "standing_policy_work_arrangements","standing_policy_experience_levels","standing_policy_excluded_employers"):
         settings[key]=list(dict.fromkeys(str(item).strip()[:120] for item in settings[key] if str(item).strip()))
@@ -164,8 +207,16 @@ def update_authorization(payload: AuthorizationUpdate):
         required_scope=("standing_policy_categories","standing_policy_employment_types","standing_policy_countries",
                         "standing_policy_locations","standing_policy_work_arrangements","standing_policy_experience_levels","standing_policy_field_keys",
                         "standing_policy_document_types")
-        if any(not settings.get(key) for key in required_scope):
-            raise HTTPException(422,"Enable the standing policy only after choosing job scope, fields, and documents.")
+        missing_scope=[key for key in required_scope if not settings.get(key)]
+        if missing_scope:
+            errors=[]
+            for key in missing_scope:
+                label=STANDING_POLICY_SCOPE_LABELS[key]
+                message=("Enter ‘Anywhere’ to allow any location within the selected countries, or choose at least one city or region."
+                         if key=="standing_policy_locations" else
+                         "Choose at least one value before enabling the standing policy.")
+                errors.append({"field":key,"message":message,"label":label})
+            raise HTTPException(422,detail={"errors":errors})
         # One explicit Auto Apply approval enables the internal workflow
         # permissions; the UI does not ask users to approve each routine stage.
         settings["allow_automatic_discovery"]=True
@@ -177,12 +228,22 @@ def update_authorization(payload: AuthorizationUpdate):
             raise HTTPException(422,"Enable AI drafting before allowing policy-scoped AI answers.")
         if settings["standing_policy_allow_cloud_ai"] and (not settings["standing_policy_allow_ai_answers"] or
                 settings["matching_provider"]!="gemini" or not os.getenv("GEMINI_API_KEY","" ).strip()):
-            raise HTTPException(422,"Cloud AI requires a separate policy choice, Gemini selection, and a configured key.")
+            _authorization_field_error("standing_policy_allow_cloud_ai",
+                "Cloud AI requires AI answers, Gemini as the selected provider, and a configured Gemini key.")
+        if settings["matching_provider"] == "groq":
+            if not groq_api_key():
+                _authorization_field_error("groq_model", "Groq is selected, but GROQ_API_KEY is not configured on this server.")
+            if not settings["allow_groq_cloud_ai"] or not settings["standing_policy_allow_groq"]:
+                _authorization_field_error("standing_policy_allow_groq",
+                    "Auto Apply using Groq requires separate explicit Groq cloud consent.")
+            if settings["standing_policy_allow_ai_answers"] and not settings["allow_ai_drafting"]:
+                _authorization_field_error("standing_policy_allow_ai_answers", "Enable AI drafting before allowing policy-scoped AI answers.")
         try:
             from career_preferences import get_preferences
             prefs=get_preferences() or {}
             if not prefs.get("categories") and not prefs.get("roles"):
-                raise HTTPException(409,"Save career preferences before approving automatic preparation.")
+                raise HTTPException(409,detail={"field":"standing_policy_categories",
+                    "message":"Save a role or category in Career Preferences before enabling Auto Apply."})
             settings["standing_policy_preferences_fingerprint"]=hashlib.sha256(
                 json.dumps(prefs,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
         except HTTPException:
@@ -211,6 +272,7 @@ def update_authorization(payload: AuthorizationUpdate):
             pass
     public_settings=dict(settings)
     public_settings["gemini_configured"]=bool(os.getenv("GEMINI_API_KEY","").strip())
+    public_settings["groq_configured"]=bool(groq_api_key())
     return {"version": version, "settings": public_settings, "updated_at": stamp, "saved": True}
 
 
@@ -398,7 +460,37 @@ def _draft_schema():
     },"required":["answer","needs_user_input","evidence_used"]}
 
 
-def _model_draft(prompt, provider):
+def groq_provider_health():
+    """Check model access using only the key; no applicant/job data is sent."""
+    api_key = groq_api_key()
+    model = get_authorization()["settings"].get("groq_model", GROQ_MODEL)
+    if not api_key:
+        return {"provider": "groq", "configured": False, "model": model,
+                "available": False, "reason": "GROQ_API_KEY is not configured."}
+    try:
+        response = requests.get("https://api.groq.com/openai/v1/models",
+            headers={"Authorization": "Bearer " + api_key}, timeout=(5, 12))
+        if response.status_code in {401, 403}:
+            return {"provider": "groq", "configured": True, "model": model,
+                    "available": False, "reason": "Groq rejected the configured credentials."}
+        response.raise_for_status()
+        envelope = response.json()
+        data = envelope.get("data") if isinstance(envelope, dict) else None
+        ids = {item.get("id") for item in data if isinstance(item, dict)} if isinstance(data, list) else set()
+        return {"provider": "groq", "configured": True, "model": model,
+                "available": model in ids,
+                "reason": "ready" if model in ids else "The selected free-tier model is not available to this key."}
+    except (requests.RequestException, ValueError, TypeError):
+        return {"provider": "groq", "configured": True, "model": model,
+                "available": False, "reason": "Groq provider health could not be verified."}
+
+
+@router.get("/api/ai-providers/groq/health")
+def groq_health_status():
+    return groq_provider_health()
+
+
+def _model_draft(prompt, provider, model=None):
     if provider=="gemini":
         api_key=os.getenv("GEMINI_API_KEY","").strip()
         if not api_key:
@@ -423,6 +515,37 @@ def _model_draft(prompt, provider):
         if not isinstance(result,dict):
             raise ValueError("Gemini answer content was not a JSON object.")
         return result
+    if provider == "groq":
+        current=get_authorization()["settings"]
+        selected_model=current.get("groq_model",GROQ_MODEL)
+        if (current.get("matching_provider")!="groq" or not current.get("allow_ai_drafting") or
+                not current.get("allow_groq_cloud_ai") or (current.get("standing_policy_enabled") and
+                not current.get("standing_policy_allow_groq")) or (model and model!=selected_model)):
+            raise RuntimeError("Explicit Groq consent is not current. No applicant data was sent to Groq.")
+        api_key = groq_api_key()
+        if not api_key:
+            raise RuntimeError("Groq is selected, but GROQ_API_KEY is not configured on this server.")
+        model = model or selected_model
+        if not groq_model_allowed(model):
+            raise RuntimeError("The selected Groq model is not on the free-tier allowlist.")
+        response = requests.post(GROQ_URL, headers={"Authorization": "Bearer " + api_key},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0, "response_format": {"type": "json_object"}}, timeout=TIMEOUT)
+        if response.status_code == 429:
+            raise RuntimeError("Groq free-tier rate limit reached; no paid model was selected.")
+        if response.status_code in {401, 403}:
+            raise RuntimeError("Groq rejected the configured credentials or model access.")
+        response.raise_for_status()
+        envelope = response.json()
+        choices = envelope.get("choices") if isinstance(envelope, dict) else None
+        message = choices[0].get("message") if isinstance(choices, list) and choices else None
+        text = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Groq returned no structured answer content.")
+        result = json.loads(text)
+        if not isinstance(result, dict):
+            raise ValueError("Groq answer content was not a JSON object.")
+        return result
     if provider!="ollama":
         raise RuntimeError("Unsupported application answer provider.")
     with OLLAMA_LOCK:
@@ -445,8 +568,10 @@ def generate_draft(question, facts, preferences, job, description, max_chars=Non
     word_limit=max_words if max_words and max_words>0 else None
     authorization=get_authorization()["settings"]
     provider=authorization.get("matching_provider","ollama")
-    if provider not in {"ollama","gemini"}:provider="ollama"
-    model=GEMINI_MODEL if provider=="gemini" else MODEL
+    if provider not in {"ollama","gemini","groq"}:provider="ollama"
+    if provider == "groq" and not authorization.get("allow_groq_cloud_ai"):
+        raise HTTPException(403, "Explicit Groq cloud-processing permission is required before sending data to Groq.")
+    model=GEMINI_MODEL if provider=="gemini" else (authorization.get("groq_model", GROQ_MODEL) if provider=="groq" else MODEL)
     context={"question":question,"facts":facts,"preferences":preferences,"reusable":reusable,"job":job,"description":description,"max_chars":limit,"max_words":word_limit,"avoid_answer":avoid_answer or "","provider":provider,"model":model}
     cache_key=hashlib.sha256(json.dumps(context,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
     with _DRAFT_CACHE_LOCK:
@@ -468,7 +593,7 @@ Previously confirmed non-sensitive application answers: {json.dumps(reusable,ens
     last = None
     for attempt in range(ATTEMPTS):
         try:
-            result=_model_draft(prompt,provider)
+            result=_model_draft(prompt,provider,model)
             answer = result.get("answer") if isinstance(result, dict) else None
             if result.get("needs_user_input") or not isinstance(answer,str) or not answer.strip():
                 outcome={"answer":"","needs_user_input":True,"evidence_used":[],"max_chars":limit,"max_words":word_limit,"validation":{"valid":False,"problems":["The model reported insufficient evidence."],"sources":[]}}
@@ -483,7 +608,7 @@ Previously confirmed non-sensitive application answers: {json.dumps(reusable,ens
                 while len(_DRAFT_CACHE)>MAX_CACHED_DRAFTS: _DRAFT_CACHE.popitem(last=False)
             return outcome
         except (requests.RequestException, ValueError, TypeError, RuntimeError) as error:
-            last = type(error).__name__
+            last = "rate limit" if isinstance(error,RuntimeError) and "rate limit" in str(error).casefold() else type(error).__name__
             if isinstance(error,RuntimeError) and ("not configured" in str(error) or "rejected" in str(error) or "invalid" in str(error)):
                 raise HTTPException(503,str(error)+" No answer was generated.") from error
             if attempt + 1 < ATTEMPTS: time.sleep(.35 * (attempt + 1))
@@ -528,7 +653,29 @@ def application_settings_page():
         '<label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label>',
     ):
         page=page.replace(fragment,"")
+    page=page.replace("<button>Save permissions</button>",
+        '<button id="save-permissions" type="submit">Save permissions</button>')
+    page=page.replace("Allowed cities or regions <input name=\"standing_policy_locations\"",
+        "Allowed cities or regions (or Anywhere within selected countries) <input name=\"standing_policy_locations\"")
+    page=page.replace("</script></html>","</script>"+SETTINGS_POLICY_SCRIPT+"</html>")
     return HTMLResponse(apply_ui_theme(page))
+
+
+SETTINGS_POLICY_SCRIPT = r'''<script>(function(){
+const form=document.querySelector('#settings'),status=document.querySelector('#status'),button=document.querySelector('#save-permissions');
+if(!form||!status||!button)return;
+let saving=false;
+const listFields=new Set(['standing_policy_categories','standing_policy_employment_types','standing_policy_countries','standing_policy_locations','standing_policy_work_arrangements','standing_policy_experience_levels','standing_policy_excluded_employers','standing_policy_field_keys','standing_policy_document_types']);
+const labels={standing_policy_categories:'Job categories',standing_policy_employment_types:'Employment types',standing_policy_countries:'Allowed countries',standing_policy_locations:'Allowed locations',standing_policy_work_arrangements:'Work arrangements',standing_policy_experience_levels:'Experience levels',standing_policy_field_keys:'Allowed candidate fields',standing_policy_document_types:'Allowed documents',standing_policy_daily_limit:'Daily preparation limit',max_applications_per_24_hours:'Rolling 24-hour application limit',standing_policy_allow_cloud_ai:'Cloud AI permission'};
+function formatError(detail){const items=Array.isArray(detail)?detail:(detail&&Array.isArray(detail.errors)?detail.errors:[detail]);return items.map(item=>{if(typeof item==='string')return item;item=item||{};const path=Array.isArray(item.loc)?item.loc.filter(x=>x!=='body').join('.'):(item.field||'');const field=item.field||path;const message=item.message||item.msg||'The value is invalid.';return (labels[field]||field?((labels[field]||field)+': '):'')+message}).filter(Boolean).join('\n')||'The settings could not be saved. Review the highlighted policy fields.'}
+function showProviderStatus(){const provider=form.elements.matching_provider.value,status=document.querySelector('#provider-status');if(!status)return;status.textContent=provider==='groq'?(window.groqConfigured?'Groq selected ('+form.elements.groq_model.value+'). Candidate/job data is sent to Groq only with the separate permission below.':'Groq selected, but GROQ_API_KEY is not configured. No cloud request can run.'):(provider==='gemini'?(window.geminiConfigured?'Google Gemini selected; data is sent to Google only with Gemini permission.':'Google Gemini requires GEMINI_API_KEY on this server.'):'Matching requests use local Ollama.')}
+form.elements.matching_provider.onchange=showProviderStatus;form.elements.groq_model.onchange=showProviderStatus;
+async function readback(){const response=await fetch('/api/application-authorization');const data=await response.json();if(!response.ok)throw Error(formatError(data.detail));window.geminiConfigured=!!data.settings.gemini_configured;window.groqConfigured=!!data.settings.groq_configured;for(const [key,value] of Object.entries(data.settings)){const control=form.elements[key];if(control)control.type==='checkbox'?control.checked=!!value:control.value=Array.isArray(value)?value.join(', '):value}showProviderStatus();return data}
+readback().then(data=>{status.textContent='Authorization version '+data.version+' · updated '+(data.updated_at||'not yet')}).catch(error=>{status.textContent=error.message||'Provider settings could not be loaded.'});
+function makePayload(){const body={};for(const control of form.elements){if(!control.name)continue;if(control.type==='checkbox')body[control.name]=control.checked;else if(control.type==='number'){const value=control.value.trim();if(!/^\d+$/.test(value))throw Error((labels[control.name]||control.name)+': Enter a whole number.');body[control.name]=Number(value)}else if(listFields.has(control.name))body[control.name]=control.value.split(/[\n,]/).map(value=>value.trim()).filter(Boolean);else body[control.name]=control.value}return body}
+function missingScope(body){if(!body.standing_policy_enabled)return [];const required=['standing_policy_categories','standing_policy_employment_types','standing_policy_countries','standing_policy_locations','standing_policy_work_arrangements','standing_policy_experience_levels','standing_policy_field_keys','standing_policy_document_types'];return required.filter(key=>!body[key]?.length).map(key=>labels[key]+(key==='standing_policy_locations'?': enter “Anywhere” to allow any location within the selected countries.':': choose at least one value.'))}
+form.onsubmit=async event=>{event.preventDefault();if(saving)return;saving=true;button.disabled=true;status.textContent='Saving permissions…';try{const body=makePayload(),missing=missingScope(body);if(missing.length){status.textContent=missing.join('\n');return}if(body.max_applications_per_24_hours<1||body.max_applications_per_24_hours>200){status.textContent='Rolling 24-hour application limit: Enter a whole number from 1 to 200.';return}if(body.standing_policy_daily_limit<1||body.standing_policy_daily_limit>20){status.textContent='Daily preparation limit: Enter a whole number from 1 to 20.';return}const response=await fetch('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await response.json();if(!response.ok)throw Error(formatError(data.detail));const savedVersion=data.version;const verified=await readback();status.textContent='Saved and read back authorization version '+verified.version+'. Live submission remains disabled.';if(verified.version!==savedVersion)throw Error('The saved version could not be verified after readback.')}catch(error){status.textContent=error.message||'The settings could not be saved.'}finally{saving=false;button.disabled=false}};
+})();</script>'''
 
 
 ONBOARDING_PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BabyStepsAI onboarding</title>
@@ -544,4 +691,4 @@ ONBOARDING_PAGE = ONBOARDING_PAGE.replace(
 
 
 SETTINGS_PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Application settings — BabyStepsAI</title>
-<style>body{margin:0;background:#f4f7fb;color:#17263b;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:36px auto;padding:0 18px}.panel{background:white;border:1px solid #dfe7f1;border-radius:15px;padding:22px;margin:16px 0}label{display:block;padding:9px 0}input[type=checkbox]{margin-right:9px}input[type=number]{font:inherit;padding:8px;border:1px solid #cbd6e4;border-radius:7px}button{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #cbd6e4;background:#2563eb;color:white;cursor:pointer}a{color:#2455a5}#status{min-height:25px}.warning{background:#fff7e7;padding:12px;border-radius:8px}</style><main class="wrap"><nav><a href="/onboarding">Onboarding</a> · <a href="/candidate-profile">Candidate profile</a> · <a href="/applications">Applications</a></nav><h1>Application authorization</h1><p>Permissions are versioned and can be changed or revoked at any time. Employer requirements still apply.</p><section class="panel"><form id="settings"><label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label><label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label><label for="matching-provider">Matching provider<select id="matching-provider" name="matching_provider"><option value="ollama">Ollama (local)</option><option value="gemini">Google Gemini (API key required)</option></select></label><p id="provider-status" class="muted">Ollama runs locally.</p><label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label><label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label><label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label><label><input type="checkbox" name="require_review_uncertain_answers">Require review for uncertain answers</label><label>Maximum applications per rolling 24 hours <input name="max_applications_per_24_hours" type="number" min="1" max="200"></label><h2>Standing preparation policy</h2><p class="muted">Approve a bounded policy once. Jobs outside this scope stay untouched. Preference edits invalidate policy grants until you save again.</p><label>Job categories <input name="standing_policy_categories" placeholder="software engineering"></label><label>Employment types <input name="standing_policy_employment_types" placeholder="full-time"></label><label>Allowed countries <input name="standing_policy_countries" placeholder="United States"></label><label>Allowed cities or regions <input name="standing_policy_locations" placeholder="San Francisco, California"></label><label>Work arrangements <input name="standing_policy_work_arrangements" placeholder="remote, hybrid, onsite"></label><label>Experience levels <input name="standing_policy_experience_levels" placeholder="new graduate, entry level, junior"></label><label>Excluded employers <input name="standing_policy_excluded_employers" placeholder="comma-separated names"></label><label>Maximum automatic preparations per day <input name="standing_policy_daily_limit" type="number" min="1" max="20"></label><label>Allowed candidate field keys <input name="standing_policy_field_keys" placeholder="full_name, email, education, projects"></label><label>Allowed document types <input name="standing_policy_document_types" placeholder="resume"></label><label><input type="checkbox" name="standing_policy_reuse_confirmed_answers">Reuse only individually confirmed, reusable ordinary answers</label><label><input type="checkbox" name="standing_policy_allow_ai_answers">Allow AI answers within this policy</label><label><input type="checkbox" name="standing_policy_allow_cloud_ai">Separately allow cloud AI processing (Gemini)</label><label><input type="checkbox" name="standing_policy_enabled">Approve and enable this standing policy</label><p class="muted">This policy cannot authorize legal declarations, work authorization, sponsorship, salary, demographics, terms, CAPTCHA, unspecified documents, or final submission.</p><p class="warning"><strong>Live submission is disabled.</strong> These permissions do not override legal declarations, employer restrictions, CAPTCHA, login challenges, or human verification.</p><button>Save permissions</button></form><p id="status" role="status" aria-live="polite"></p></section></main><script>async function req(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}const form=document.querySelector('#settings'),status=document.querySelector('#status'),providerStatus=document.querySelector('#provider-status'),provider=form.elements.matching_provider;function updateProviderStatus(configured){providerStatus.textContent=provider.value==='gemini'?(configured?'Google Gemini selected: confirmed profile and job text are sent to Google. GEMINI_API_KEY remains on this server.':'Google Gemini sends confirmed profile and job text to Google and requires GEMINI_API_KEY on this server; the key is never stored in settings.'):'Matching requests will use the local Ollama service.'}provider.onchange=()=>updateProviderStatus(window.geminiConfigured);async function load(){const d=await req('/api/application-authorization');window.geminiConfigured=!!d.settings.gemini_configured;for(const [k,v] of Object.entries(d.settings)){const el=form.elements[k];if(el)el.type==='checkbox'?el.checked=!!v:el.value=Array.isArray(v)?v.join(', '):v}updateProviderStatus(window.geminiConfigured);status.textContent='Authorization version '+d.version+' · updated '+(d.updated_at||'not yet')};form.onsubmit=async e=>{e.preventDefault();try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):(['standing_policy_categories','standing_policy_employment_types','standing_policy_countries','standing_policy_locations','standing_policy_work_arrangements','standing_policy_experience_levels','standing_policy_excluded_employers','standing_policy_field_keys','standing_policy_document_types'].includes(el.name)?el.value.split(',').map(x=>x.trim()).filter(Boolean):el.value));const d=await req('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});window.geminiConfigured=!!d.settings.gemini_configured;updateProviderStatus(window.geminiConfigured);status.textContent='Saved. Authorization version '+d.version+'. Live submission remains disabled.'}catch(e){status.textContent=e.message}};load().catch(e=>status.textContent=e.message)</script></html>'''
+<style>body{margin:0;background:#f4f7fb;color:#17263b;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:36px auto;padding:0 18px}.panel{background:white;border:1px solid #dfe7f1;border-radius:15px;padding:22px;margin:16px 0}label{display:block;padding:9px 0}input[type=checkbox]{margin-right:9px}input[type=number]{font:inherit;padding:8px;border:1px solid #cbd6e4;border-radius:7px}button{font:inherit;padding:9px 13px;border-radius:8px;border:1px solid #cbd6e4;background:#2563eb;color:white;cursor:pointer}a{color:#2455a5}#status{min-height:25px}.warning{background:#fff7e7;padding:12px;border-radius:8px}</style><main class="wrap"><nav><a href="/onboarding">Onboarding</a> · <a href="/candidate-profile">Candidate profile</a> · <a href="/applications">Applications</a></nav><h1>Application authorization</h1><p>Permissions are versioned and can be changed or revoked at any time. Employer requirements still apply.</p><section class="panel"><form id="settings"><label><input type="checkbox" name="allow_automatic_discovery">Allow automatic job discovery</label><label><input type="checkbox" name="allow_ai_matching">Allow AI job matching</label><label for="matching-provider">Matching provider<select id="matching-provider" name="matching_provider"><option value="ollama">Ollama (local)</option><option value="gemini">Google Gemini (API key required)</option><option value="groq">Groq cloud (explicit consent required)</option></select></label><label>Groq free-tier model <select name="groq_model"><option value="openai/gpt-oss-20b">OpenAI GPT-OSS 20B</option><option value="openai/gpt-oss-120b">OpenAI GPT-OSS 120B</option><option value="qwen/qwen3.8-27b">Qwen 3.8 27B</option></select></label><p id="provider-status" class="muted">Ollama runs locally.</p><label><input type="checkbox" name="allow_groq_cloud_ai">I explicitly allow confirmed candidate and job information to be processed by Groq when Groq is selected</label><label><input type="checkbox" name="allow_automated_form_preparation">Allow automated form preparation for jobs I select</label><label><input type="checkbox" name="allow_auto_use_confirmed_answers">Allow automatic use of my confirmed factual answers</label><label><input type="checkbox" name="allow_ai_drafting">Allow AI drafting of ordinary written responses</label><label><input type="checkbox" name="require_review_uncertain_answers">Require review for uncertain answers</label><label>Maximum applications per rolling 24 hours <input name="max_applications_per_24_hours" type="number" min="1" max="200"></label><h2>Standing preparation policy</h2><p class="muted">Approve a bounded policy once. Jobs outside this scope stay untouched. Preference edits invalidate policy grants until you save again.</p><label>Job categories <input name="standing_policy_categories" placeholder="software engineering"></label><label>Employment types <input name="standing_policy_employment_types" placeholder="full-time"></label><label>Allowed countries <input name="standing_policy_countries" placeholder="United States"></label><label>Allowed cities or regions <input name="standing_policy_locations" placeholder="San Francisco, California"></label><label>Work arrangements <input name="standing_policy_work_arrangements" placeholder="remote, hybrid, onsite"></label><label>Experience levels <input name="standing_policy_experience_levels" placeholder="new graduate, entry level, junior"></label><label>Excluded employers <input name="standing_policy_excluded_employers" placeholder="comma-separated names"></label><label>Maximum automatic preparations per day <input name="standing_policy_daily_limit" type="number" min="1" max="20"></label><label>Allowed candidate field keys <input name="standing_policy_field_keys" placeholder="full_name, email, education, projects"></label><label>Allowed document types <input name="standing_policy_document_types" placeholder="resume"></label><label><input type="checkbox" name="standing_policy_reuse_confirmed_answers">Reuse only individually confirmed, reusable ordinary answers</label><label><input type="checkbox" name="standing_policy_allow_ai_answers">Allow AI answers within this policy</label><label><input type="checkbox" name="standing_policy_allow_cloud_ai">Separately allow cloud AI processing (Gemini)</label><label><input type="checkbox" name="standing_policy_allow_groq">Separately allow Groq for this standing Auto Apply policy</label><label><input type="checkbox" name="standing_policy_enabled">Approve and enable this standing policy</label><p class="muted">This policy cannot authorize legal declarations, work authorization, sponsorship, salary, demographics, terms, CAPTCHA, unspecified documents, or final submission.</p><p class="warning"><strong>Live submission is disabled.</strong> These permissions do not override legal declarations, employer restrictions, CAPTCHA, login challenges, or human verification.</p><button>Save permissions</button></form><p id="status" role="status" aria-live="polite"></p></section></main><script>async function req(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Request failed');return d}const form=document.querySelector('#settings'),status=document.querySelector('#status'),providerStatus=document.querySelector('#provider-status'),provider=form.elements.matching_provider;function updateProviderStatus(configured){providerStatus.textContent=provider.value==='gemini'?(configured?'Google Gemini selected: confirmed profile and job text are sent to Google. GEMINI_API_KEY remains on this server.':'Google Gemini sends confirmed profile and job text to Google and requires GEMINI_API_KEY on this server; the key is never stored in settings.'):'Matching requests will use the local Ollama service.'}provider.onchange=()=>updateProviderStatus(window.geminiConfigured);async function load(){const d=await req('/api/application-authorization');window.geminiConfigured=!!d.settings.gemini_configured;for(const [k,v] of Object.entries(d.settings)){const el=form.elements[k];if(el)el.type==='checkbox'?el.checked=!!v:el.value=Array.isArray(v)?v.join(', '):v}updateProviderStatus(window.geminiConfigured);status.textContent='Authorization version '+d.version+' · updated '+(d.updated_at||'not yet')};form.onsubmit=async e=>{e.preventDefault();try{const body={};for(const el of form.elements)if(el.name)body[el.name]=el.type==='checkbox'?el.checked:(el.type==='number'?Number(el.value):(['standing_policy_categories','standing_policy_employment_types','standing_policy_countries','standing_policy_locations','standing_policy_work_arrangements','standing_policy_experience_levels','standing_policy_excluded_employers','standing_policy_field_keys','standing_policy_document_types'].includes(el.name)?el.value.split(',').map(x=>x.trim()).filter(Boolean):el.value));const d=await req('/api/application-authorization',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});window.geminiConfigured=!!d.settings.gemini_configured;updateProviderStatus(window.geminiConfigured);status.textContent='Saved. Authorization version '+d.version+'. Live submission remains disabled.'}catch(e){status.textContent=e.message}};load().catch(e=>status.textContent=e.message)</script></html>'''

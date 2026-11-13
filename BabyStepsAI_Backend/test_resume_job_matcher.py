@@ -950,6 +950,47 @@ class ResumeJobMatcherTests(unittest.TestCase):
                 matcher.analyze_with_provider({},"user_reviewed",{}, {"title":"Role","content":"Description"},provider="gemini")
         post.assert_not_called()
 
+    def test_groq_matching_uses_free_model_and_validates_structured_json(self):
+        response=Mock();response.status_code=200
+        response.json.return_value={"choices":[{"message":{"content":valid_result().model_dump_json()}}]}
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret","GROQ_MODEL":"openai/gpt-oss-20b"}), \
+             patch.object(matcher.requests,"post",return_value=response) as post:
+            result=matcher.analyze_with_provider({"technical_skills":["Python"]},"synthetic-review",{},
+                {"title":"Synthetic Engineer","content":"Synthetic role description."},provider="groq")
+        self.assertEqual(result.classification,"potential_match")
+        self.assertEqual(post.call_args.args[0],"https://api.groq.com/openai/v1/chat/completions")
+        self.assertEqual(post.call_args.kwargs["json"]["model"],"openai/gpt-oss-20b")
+        self.assertEqual(post.call_args.kwargs["json"]["response_format"],{"type":"json_object"})
+        self.assertEqual(post.call_args.kwargs["timeout"],matcher.GROQ_TIMEOUT)
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"],"Bearer synthetic-groq-secret")
+
+    def test_groq_matching_without_separate_consent_sends_nothing(self):
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":False,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.requests,"post") as post:
+            with self.assertRaisesRegex(RuntimeError,"No candidate data was sent"):
+                matcher.analyze_with_provider({"email":"synthetic@example.test"},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        post.assert_not_called()
+
+    def test_groq_rate_limit_retries_are_bounded_and_never_change_provider(self):
+        rate_limit=Mock();rate_limit.status_code=429
+        rate_limit.raise_for_status.side_effect=matcher.requests.HTTPError(response=rate_limit)
+        with jobs.database() as db:
+            db.execute("UPDATE application_authorizations SET settings_json=? WHERE user_id=?",
+                (json.dumps({"allow_ai_matching":True,"allow_groq_cloud_ai":True,"matching_provider":"groq","groq_model":"openai/gpt-oss-20b"}),jobs.USER))
+        with patch.dict("os.environ",{"GROQ_API_KEY":"synthetic-groq-secret"}),patch.object(matcher.time,"sleep"), \
+             patch.object(matcher.requests,"post",return_value=rate_limit) as post:
+            with self.assertRaisesRegex(RuntimeError,r"Groq rate limit \(HTTP 429\)"):
+                matcher.analyze_with_provider({},"synthetic-review",{},
+                    {"title":"Synthetic Engineer","content":"Synthetic description."},provider="groq")
+        self.assertEqual(post.call_count,2)
+        self.assertTrue(all(call.kwargs["json"]["model"]=="openai/gpt-oss-20b" for call in post.call_args_list))
+
     def test_gemini_retries_malformed_json_with_repair_instruction(self):
         bad=Mock();bad.status_code=200;bad.json.return_value={"candidates":[{"content":{"parts":[{"text":"not json"}]}}]}
         good=Mock();good.status_code=200;good.json.return_value={"candidates":[{"content":{"parts":[{"text":valid_result().model_dump_json()}]}}]}

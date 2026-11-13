@@ -36,6 +36,7 @@ from job_relevance import evaluate_relocation_preference, normalize_text
 from application_browser import (apply_targets, classify_control, detect_application_provider,
                                  page_interruption, submission_controls, summarize_form_metadata)
 from application_answer_assistant import get_authorization, generate_draft, draft_safe_profile, ORDINARY_PROMPT, SENSITIVE_PROMPT, MAX_ANSWER_CHARS
+from provider_config import groq_api_key
 from ui_theme import apply_ui_theme
 
 DB = JOB_DB
@@ -1014,8 +1015,10 @@ def _derive_standing_policy_authorization(job_key,resume_id,application_url):
     if "resume" not in allowed_docs:return False,"The active resume is not authorized by the standing policy."
     ai=bool(settings.get("standing_policy_allow_ai_answers") and settings.get("allow_ai_drafting") and
         (settings.get("matching_provider")=="ollama" or
-         (settings.get("matching_provider")=="gemini" and settings.get("standing_policy_allow_cloud_ai"))))
-    cloud=bool(ai and settings.get("standing_policy_allow_cloud_ai") and settings.get("matching_provider")=="gemini" and os.getenv("GEMINI_API_KEY","" ).strip())
+         (settings.get("matching_provider")=="gemini" and settings.get("standing_policy_allow_cloud_ai")) or
+         (settings.get("matching_provider")=="groq" and settings.get("allow_groq_cloud_ai") and settings.get("standing_policy_allow_groq"))))
+    cloud=bool(ai and ((settings.get("standing_policy_allow_cloud_ai") and settings.get("matching_provider")=="gemini" and os.getenv("GEMINI_API_KEY","" ).strip()) or
+        (settings.get("allow_groq_cloud_ai") and settings.get("standing_policy_allow_groq") and settings.get("matching_provider")=="groq" and groq_api_key())))
     stamp=now();authorization_id=str(uuid.uuid4())
     with connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -1236,7 +1239,9 @@ def preparation_authorization_plan(job_key:str):
         "ai_drafting_enabled":bool(settings.get("allow_ai_drafting")),
         "provider_selected":settings.get("matching_provider","ollama"),
         "local_ai_answer_permission_available":bool(settings.get("allow_ai_drafting") and settings.get("matching_provider","ollama")=="ollama"),
-        "cloud_provider_configured":bool(os.getenv("GEMINI_API_KEY","" ).strip()) if settings.get("matching_provider")=="gemini" else False,
+        "cloud_provider_configured":(bool(os.getenv("GEMINI_API_KEY","" ).strip()) if settings.get("matching_provider")=="gemini" else
+            bool(groq_api_key()) if settings.get("matching_provider")=="groq" else False),
+        "groq_cloud_permission_available":bool(settings.get("allow_groq_cloud_ai")),
         "cloud_ai_authorized":False,"human_only_actions":(report.get("human_actions_required",[]) if isinstance(report,dict) else []) or
             ([] if isinstance(report,dict) and report.get("form_detected") else ["Employer application form controls and final submission boundary remain unverified."]),
         "authorization_version":snapshot["settings_version"]}
@@ -1269,8 +1274,14 @@ def authorize_saved_job_preparation(job_key:str,request:PreparationAuthorization
         raise HTTPException(403,"Enable AI drafting in Application settings before authorizing generated answers.")
     if request.allow_ai_answers and provider=="gemini" and not request.allow_cloud_ai:
         raise HTTPException(409,"Gemini would process the selected facts and job description in the cloud. Authorize that explicitly or turn off AI answers for this job.")
-    if request.allow_cloud_ai and (provider!="gemini" or not os.getenv("GEMINI_API_KEY","" ).strip()):
-        raise HTTPException(409,"Cloud AI authorization requires Gemini to be selected and GEMINI_API_KEY configured.")
+    if request.allow_ai_answers and provider=="groq" and not request.allow_cloud_ai:
+        raise HTTPException(409,"Groq would process the selected facts and job description in the cloud. Authorize Groq explicitly for this job or turn off AI answers.")
+    if request.allow_cloud_ai and provider=="gemini" and not os.getenv("GEMINI_API_KEY","" ).strip():
+        raise HTTPException(409,"Gemini cloud AI authorization requires GEMINI_API_KEY configured.")
+    if request.allow_cloud_ai and provider=="groq" and (not groq_api_key() or not settings.get("allow_groq_cloud_ai")):
+        raise HTTPException(409,"Groq cloud AI requires explicit Groq permission in Application Settings and a configured GROQ_API_KEY.")
+    if request.allow_cloud_ai and provider not in {"gemini","groq"}:
+        raise HTTPException(409,"Cloud AI authorization requires an explicitly selected cloud provider.")
     if request.allow_cloud_ai and not request.allow_ai_answers:
         raise HTTPException(422,"Authorize AI-generated answers before authorizing cloud AI processing.")
     stamp=now();authorization_id=str(uuid.uuid4())
@@ -2342,8 +2353,9 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
                 continue
             provider=settings.get("matching_provider","ollama")
             scoped_ai=bool(local_mock or (scope and scope.get("allow_ai_answers") and
-                (provider!="gemini" or scope.get("allow_cloud_ai"))) or
-                (not scope and settings.get("allow_ai_drafting")))
+                (provider=="ollama" or scope.get("allow_cloud_ai"))) or
+                (not scope and settings.get("allow_ai_drafting") and
+                 (provider=="ollama" or settings.get("allow_groq_cloud_ai") if provider=="groq" else provider!="gemini")))
             if value is None and _ordinary_open_question(info) and settings.get("allow_ai_drafting") and scoped_ai:
                 try:
                     question=info.get("label") or info.get("placeholder") or "Application question"
@@ -4471,8 +4483,12 @@ function addAuthorizationControl(card,job){
       for(const item of plan.available_documents||[]){const label=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.dataset.documentType=item.type;label.append(check,document.createTextNode(' '+item.label));docs.append(label)}
       panel.append(docs);
       const aiLabel=document.createElement('label'),ai=document.createElement('input');ai.type='checkbox';ai.disabled=!plan.ai_drafting_enabled;aiLabel.append(ai,document.createTextNode(' Allow grounded AI answers to be inserted for ordinary written questions'+(plan.ai_drafting_enabled?'':' · enable AI drafting in Application Settings first')));panel.append(aiLabel);
-      if(plan.provider_selected==='gemini'){
-        const cloudLabel=document.createElement('label'),cloud=document.createElement('input');cloud.type='checkbox';cloud.disabled=!plan.cloud_provider_configured;cloudLabel.append(cloud,document.createTextNode(' Separately authorize sending the selected facts and this job description to Google Gemini'+(plan.cloud_provider_configured?'':' · Gemini is not configured')));panel.append(cloudLabel);
+      if(['gemini','groq'].includes(plan.provider_selected)){
+        const cloudLabel=document.createElement('label'),cloud=document.createElement('input');cloud.type='checkbox';cloud.dataset.cloudAi='true';
+        cloud.disabled=!plan.cloud_provider_configured||(plan.provider_selected==='groq'&&!plan.groq_cloud_permission_available);
+        const providerLabel=plan.provider_selected==='groq'?'Groq':'Google Gemini';
+        const unavailable=!plan.cloud_provider_configured?' · '+providerLabel+' is not configured':(plan.provider_selected==='groq'&&!plan.groq_cloud_permission_available?' · separately enable Groq cloud permission in Application Settings first':'');
+        cloudLabel.append(cloud,document.createTextNode(' Separately authorize sending the selected facts and this job description to '+providerLabel+unavailable));panel.append(cloudLabel);
       }
       const confirmLabel=document.createElement('label'),confirm=document.createElement('input');confirm.type='checkbox';confirmLabel.append(confirm,document.createTextNode(' I authorize BabyStepsAI to use only the selected fields and files for this employer and exact URL, and to stop before final submission. I will handle legal acknowledgments and human verification.'));panel.append(confirmLabel);
       const status=node('p','sub','This authorization expires when the job URL, match, resume/profile, confirmed answers, documents, or settings version changes.');panel.append(status);
