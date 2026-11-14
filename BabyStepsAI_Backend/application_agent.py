@@ -531,14 +531,40 @@ def _safe_request(url):
     except ValueError: return False
 
 
+def _record_blocked_request(policy_state, request):
+    """Keep bounded endpoint diagnostics without reading request data."""
+    if policy_state is None:
+        return
+    policy_state["blocked_non_read_only_request_count"] = int(
+        policy_state.get("blocked_non_read_only_request_count",0)) + 1
+    records=policy_state.setdefault("blocked_non_read_only_requests",[])
+    if len(records)>=8:
+        return
+    try:
+        parsed=urlparse(str(getattr(request,"url","") or ""))
+        host=(parsed.hostname or "").casefold().rstrip(".")
+        known_hosts={"jobs.ashbyhq.com","api.ashbyhq.com","job-boards.greenhouse.io",
+                     "boards-api.greenhouse.io","jobs.lever.co","api.lever.co"}
+        host=host if host in known_hosts else "other"
+        endpoint=(parsed.path.rstrip("/").rsplit("/",1)[-1] or "root").casefold()
+        if (len(endpoint)>48 or not re.fullmatch(r"[a-z0-9_-]+",endpoint) or
+                re.fullmatch(r"(?:[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9]{5,})",endpoint)):
+            endpoint="other"
+        resource=str(getattr(request,"resource_type","other") or "other").casefold()
+        if resource not in {"document","script","xhr","fetch","image","stylesheet","font"}:
+            resource="other"
+        records.append({"method":str(getattr(request,"method","unknown") or "unknown").upper()[:12],
+                        "host":host,"endpoint":endpoint,"resource_type":resource})
+    except Exception:
+        records.append({"method":"unknown","host":"other","endpoint":"other","resource_type":"other"})
+
 def _guard_browser_request(route,policy_state=None):
     request=route.request
     if request.method.upper() not in {"GET","HEAD","OPTIONS"}:
         if policy_state is not None:
+            _record_blocked_request(policy_state,request)
             if getattr(request,"is_navigation_request",lambda:False)():
                 policy_state.update({"category":"read_only_method_blocked","reason":"A page navigation attempted a non-read-only HTTP method. No application interaction was performed."})
-            else:
-                policy_state["blocked_non_read_only_request_count"]=int(policy_state.get("blocked_non_read_only_request_count",0))+1
         try:route.abort()
         except (Exception,asyncio.CancelledError):pass
         return
@@ -2821,6 +2847,7 @@ def inspect_public_application_form(url):
                                              interruption=interruption, expired=expired)
             report["page_metadata"]=_public_page_metadata(page)
             report["blocked_non_read_only_request_count"]=int(policy_state.get("blocked_non_read_only_request_count",0))
+            report["blocked_non_read_only_requests"]=policy_state.get("blocked_non_read_only_requests",[])[:8]
             report["form_detected"]=application_form
             report["page_classification"]=page_classification
             if not application_form and _posting_redirected_away(clean_url, page.url):
@@ -3079,7 +3106,7 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                  "required_control_count","total_dom_control_count","visible_form_control_count","required_dom_control_count","unique_question_count","unique_required_question_count","unique_optional_question_count","unique_unknown_requirement_question_count",
                  "questions","unresolved_controls","ignored_controls","ignored_control_count","conditional_questions","conditional_detection_note",
                  "file_upload_controls","upload_prompts","upload_control_details","human_actions_required","multi_step_detected","submission_control_detected","submission_controls",
-                 "submission_control_status","blocked_non_read_only_request_count","robots_policy","form_fingerprint","reason")}
+                 "submission_control_status","blocked_non_read_only_request_count","blocked_non_read_only_requests","robots_policy","form_fingerprint","reason")}
             if blocker:
                 diagnostic["message"]=blocker
                 diagnostic["human_actions_required"]=list(preflight.get("human_actions_required") or [])

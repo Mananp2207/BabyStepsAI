@@ -4,6 +4,7 @@ from resume_job_matcher import router as match_router
 from candidate_verification import router as verification_router
 from application_agent import router as application_router
 from application_answer_assistant import router as answer_assistant_router
+from sarathi import router as sarathi_router
 from workflow_orchestrator import router as workflow_router
 from onboarding import router as onboarding_router
 from job_description_enricher import router as enrichment_router
@@ -42,6 +43,7 @@ app.include_router(match_router)
 app.include_router(verification_router)
 app.include_router(application_router)
 app.include_router(answer_assistant_router)
+app.include_router(sarathi_router)
 app.include_router(onboarding_router)
 app.include_router(enrichment_router)
 app.include_router(workflow_router)

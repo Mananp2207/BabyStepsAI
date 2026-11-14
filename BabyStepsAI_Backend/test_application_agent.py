@@ -2279,14 +2279,109 @@ class ApplicationAgentTests(unittest.TestCase):
 
     def test_inspection_aborts_background_post_without_treating_it_as_page_navigation(self):
         class Request:
-            method="POST";url="https://jobs.ashbyhq.com/telemetry"
+            method="POST";url="https://jobs.ashbyhq.com/api/non-user-graphql?token=private-query"
+            resource_type="fetch"
+            @property
+            def post_data(self):raise AssertionError("inspection must not read request bodies")
             def is_navigation_request(self):return False
         class Route:
             request=Request();aborted=False
             def abort(self):self.aborted=True
         state={};route=Route();app_agent._guard_browser_request(route,state)
         self.assertTrue(route.aborted)
-        self.assertEqual(state,{"blocked_non_read_only_request_count":1})
+        self.assertEqual(state["blocked_non_read_only_request_count"],1)
+        self.assertEqual(state["blocked_non_read_only_requests"],[{
+            "method":"POST","host":"jobs.ashbyhq.com","endpoint":"non-user-graphql","resource_type":"fetch"}])
+        self.assertNotIn("private-query",json.dumps(state))
+        self.assertNotIn("post_data",json.dumps(state))
+
+    def test_blocked_request_diagnostics_are_bounded_and_redact_unknown_hosts_and_ids(self):
+        class Request:
+            method="POST";url="https://private.example/93a43fde-f3e0-4a7d-ae11-cc7a8e167861?secret=synthetic"
+            resource_type="websocket"
+            def is_navigation_request(self):return False
+        class Route:
+            request=Request()
+            def abort(self):pass
+        state={}
+        for _ in range(10):app_agent._guard_browser_request(Route(),state)
+        self.assertEqual(state["blocked_non_read_only_request_count"],10)
+        self.assertEqual(len(state["blocked_non_read_only_requests"]),8)
+        self.assertEqual(state["blocked_non_read_only_requests"][0],{
+            "method":"POST","host":"other","endpoint":"other","resource_type":"other"})
+        self.assertNotIn("private.example",json.dumps(state))
+        self.assertNotIn("synthetic",json.dumps(state))
+
+    @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM") == "1",
+                         "Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to run the synthetic ATS browser fixture.")
+    def test_synthetic_ashby_and_greenhouse_rendering_posts_are_blocked_in_real_chromium(self):
+        received=[];get_hits=[]
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self,*_args):pass
+            def do_GET(self):
+                get_hits.append(self.path)
+                provider="Ashby" if self.path.startswith("/ashby/") else "Greenhouse"
+                endpoint="non-user-graphql" if provider=="Ashby" else "application-form-metadata"
+                html=f'''<!doctype html><html><body><h1>{provider} Synthetic Application</h1>
+                <form><label>Full name *<input name="name" required></label>
+                <label>Email *<input type="email" name="email" required></label>
+                <label>Resume *<input type="file" name="resume" required></label>
+                <label>Employment type<select name="employment" required><option>Full-time</option></select></label>
+                <div data-conditional-question hidden><label>Additional detail<textarea name="detail"></textarea></label></div>
+                <button type="submit">Submit application</button></form>
+                <script>fetch('/api/{endpoint}?synthetic_query_marker=do-not-log',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+                body:JSON.stringify({{operationName:'SyntheticFormMetadata',candidate:'Synthetic Fixture Only'}})}}).catch(()=>{{}});</script>
+                </body></html>'''
+                body=html.encode();self.send_response(200);self.send_header("Content-Type","text/html; charset=utf-8")
+                self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            def do_POST(self):
+                received.append((self.path,self.rfile.read(int(self.headers.get("Content-Length","0")))))
+                self.send_response(204);self.end_headers()
+        server=ThreadingHTTPServer(("127.0.0.1",0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        origin=f"http://127.0.0.1:{server.server_address[1]}"
+        old_validate=app_agent.validate_application_url
+        def validate(url):
+            if str(url).startswith(origin+"/"):return url
+            return old_validate(url)
+        self.patch_playwright.stop()
+        try:
+            with patch.object(app_agent,"validate_application_url",side_effect=validate), \
+                 patch.object(app_agent,"_safe_request",side_effect=lambda url:str(url).startswith(origin+"/")), \
+                 patch.object(app_agent,"_robots_permission",return_value=(True,"synthetic fixture","test_allow")):
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser=p.chromium.launch(headless=True)
+                    context=browser.new_context();page=context.new_page()
+                    try:
+                        for path,expected_endpoint in (("/ashby/application","non-user-graphql"),
+                                                       ("/greenhouse/application","application-form-metadata")):
+                            state={};page.route("**/*",lambda route,_request,s=state:app_agent._guard_browser_request(route,s))
+                            response=page.goto(origin+path,wait_until="domcontentloaded",timeout=5000)
+                            self.assertEqual(response.status,200)
+                            page.wait_for_timeout(100)
+                            fields=app_agent._visible_form_metadata(page)
+                            controls=app_agent._inspect_public_controls(page)
+                            detected,_=app_agent._classify_inspected_page(page.url,fields,controls,
+                                page.locator("body").inner_text())
+                            self.assertTrue(detected,json.dumps(fields))
+                            labels={str(item.get("label") or item.get("question") or "").casefold() for item in fields}
+                            self.assertTrue(any("name" in label for label in labels),json.dumps(fields))
+                            self.assertTrue(any("email" in label for label in labels),json.dumps(fields))
+                            self.assertTrue(any("resume" in label for label in labels),json.dumps(fields))
+                            self.assertTrue(any(item.get("action")=="final_submission" for item in controls),json.dumps(controls))
+                            self.assertGreaterEqual(state.get("blocked_non_read_only_request_count",0),1)
+                            events=state.get("blocked_non_read_only_requests",[])
+                            self.assertTrue(any(item.get("endpoint")==expected_endpoint for item in events),json.dumps(events))
+                            self.assertNotIn("do-not-log",json.dumps(state))
+                            self.assertNotIn("Synthetic Fixture Only",json.dumps(state))
+                            page.unroute_all(behavior="wait")
+                    finally:
+                        context.close();browser.close()
+            self.assertEqual(get_hits,["/ashby/application","/greenhouse/application"])
+            self.assertEqual(received,[],"The route guard must abort synthetic POSTs before server receipt.")
+        finally:
+            self.patch_playwright.start()
+            server.shutdown();server.server_close();thread.join(timeout=2)
 
     def test_inspection_stops_when_non_read_only_request_is_top_level_navigation(self):
         class Request:

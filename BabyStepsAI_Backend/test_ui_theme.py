@@ -9,7 +9,7 @@ import application_agent
 class UIThemeTests(unittest.TestCase):
     def test_shared_navigation_theme_toggle_and_accessible_mode_persist(self):
         page=apply_ui_theme('<!doctype html><html><head></head><body><main>Home</main></body></html>')
-        for text in ('Dashboard','My Resume','Candidate Profile','Career Preferences','Find Jobs','Applications','Settings'):
+        for text in ('Dashboard','Sarathi','My Resume','Candidate Profile','Career Preferences','Find Jobs','Applications','Settings'):
             self.assertIn(text,page)
         self.assertIn('data-bsa-theme="dark"',page)
         self.assertIn('aria-pressed',page)
@@ -20,6 +20,9 @@ class UIThemeTests(unittest.TestCase):
         self.assertIn('<body><aside class="bsa-sidebar"',page)
         self.assertIn('sidebar.inert=mobile&&!open',page)
         self.assertIn("addEventListener('hashchange',syncActive)",page)
+        self.assertIn('id="bsa-sarathi-launcher"',page)
+        self.assertIn('id="bsa-sarathi-panel"',page)
+        self.assertIn("type:'bsa-theme'",page)
 
     def test_every_major_page_can_use_shared_responsive_shell(self):
         from main import home
