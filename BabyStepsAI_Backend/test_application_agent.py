@@ -258,6 +258,100 @@ class ApplicationAgentTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM applications").fetchone()[0],0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts").fetchone()[0],0)
 
+    def _human_verification_attempt(self, *, outcome=None, resume_count=0):
+        job={"job_key":"greenhouse:synthetic:resume-123","company":"Synthetic Employer",
+            "title":"Entry Level Software Engineer","job_url":"https://jobs.example.test/jobs/123",
+            "application_url":"https://jobs.example.test/apply/123","content_fingerprint":"synthetic-v1"}
+        resume,_,_=app_agent._candidate()
+        with patch.object(app_agent,"validate_application_url"):
+            app_id,_,created=app_agent._create(job,resume)
+        self.assertTrue(created)
+        diagnostic={"mode":"dry_run","phase":"form_filling","steps":1,
+            "filled_fields":[{"field":"Full Name","result":"filled","source":"full_name"},
+                             {"field":"Resume upload","result":"filled","source":"active_resume"}],
+            "documents_uploaded":1,"submission_performed":False}
+        report={"compatibility_status":"compatible","form_fingerprint":"synthetic-form-v1",
+            "canonical_application_url":job["application_url"]}
+        app_agent._save_human_action_checkpoint(app_id,job,
+            {"field_keys":["full_name","email"],"document_types":["resume"]},report,diagnostic,
+            "human_verification","Human verification detected. No bypass was attempted.")
+        # Reinitialization models a server restart: only the durable, value-free checkpoint remains.
+        app_agent.initialize()
+        with app_agent.connect() as db:
+            if outcome:
+                db.execute("INSERT INTO manual_submission_events(event_id,application_id,user_id,attempt_number,outcome,confirmed_by_applicant,recorded_at) VALUES(?,?,?,?,?,1,?)",
+                    ("synthetic-human-outcome",app_id,USER,1,outcome,app_agent.now()))
+            if resume_count:
+                saved=json.loads(db.execute("SELECT diagnostic_json FROM applications WHERE id=?",(app_id,)).fetchone()[0])
+                saved["browser_checkpoint"]["resume_count"]=resume_count
+                encoded=json.dumps(saved)
+                db.execute("UPDATE applications SET diagnostic_json=? WHERE id=?",(encoded,app_id))
+                db.execute("UPDATE application_attempts SET diagnostic_json=? WHERE application_id=? AND attempt_number=1",(encoded,app_id))
+        return job,app_id
+
+    def test_human_verification_checkpoint_is_value_free_and_reuses_existing_attempt(self):
+        job,app_id=self._human_verification_attempt()
+        with app_agent.connect() as db:
+            saved=json.loads(db.execute("SELECT diagnostic_json FROM applications WHERE id=?",(app_id,)).fetchone()[0])
+            attempts=db.execute("SELECT COUNT(*) FROM application_attempts WHERE application_id=?",(app_id,)).fetchone()[0]
+        checkpoint=saved["browser_checkpoint"]
+        self.assertEqual(checkpoint["authorized_field_identifiers"],["email","full_name"])
+        self.assertTrue(checkpoint["resume_upload_verified"])
+        self.assertFalse(checkpoint["browser_session"]["available"])
+        self.assertFalse(checkpoint["browser_session"]["persisted"])
+        self.assertNotIn("Synthetic Candidate",json.dumps(checkpoint))
+        self.assertNotIn("synthetic@example.test",json.dumps(checkpoint))
+        self.assertEqual(app_agent.list_application_attention()["count"],1)
+        scope={"authorization_id":"synthetic-grant","field_keys":["full_name","email"],"document_types":["resume"],
+               "allow_ai_answers":False,"allow_cloud_ai":False,"authorized_at":app_agent.now()}
+        scheduled=[]
+        with patch.object(app_agent,"_mock_allowed",return_value=False), \
+             patch.object(app_agent,"_get_job",return_value=job), \
+             patch.object(app_agent,"validate_application_url"), \
+             patch.object(app_agent,"_eligibility_gate",return_value=("potential_match",True,False)), \
+             patch.object(app_agent,"_current_preparation_authorization",return_value=scope), \
+             patch.object(app_agent,"_schedule_application_queue",side_effect=lambda:scheduled.append(True) or True):
+            response=app_agent.resume_after_human_verification(app_id)
+        self.assertTrue(response["resumed_existing_attempt"])
+        self.assertFalse(response["new_attempt_created"])
+        self.assertFalse(response["browser_session_restored"])
+        self.assertTrue(response["fresh_browser_context"])
+        self.assertEqual(scheduled,[True])
+        with app_agent.connect() as db:
+            current=db.execute("SELECT state,attempt_number,diagnostic_json FROM applications WHERE id=?",(app_id,)).fetchone()
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts WHERE application_id=?",(app_id,)).fetchone()[0],attempts)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM application_opening_reservations WHERE application_id=?",(app_id,)).fetchone()[0],1)
+        self.assertEqual(current["state"],"queued")
+        self.assertEqual(current["attempt_number"],1)
+        self.assertEqual(json.loads(current["diagnostic_json"])["browser_checkpoint"]["resume_count"],1)
+
+    def test_human_verification_resume_blocks_revocation_uncertain_outcome_and_expired_checkpoint(self):
+        job,app_id=self._human_verification_attempt()
+        with patch.object(app_agent,"_mock_allowed",return_value=False), \
+             patch.object(app_agent,"_get_job",return_value=job), \
+             patch.object(app_agent,"validate_application_url"), \
+             patch.object(app_agent,"_eligibility_gate",return_value=("potential_match",True,False)), \
+             patch.object(app_agent,"_current_preparation_authorization",return_value=None):
+            with self.assertRaises(HTTPException) as revoked:
+                app_agent.resume_after_human_verification(app_id)
+        self.assertEqual(revoked.exception.status_code,403)
+        with app_agent.connect() as db:
+            self.assertEqual(db.execute("SELECT state FROM applications WHERE id=?",(app_id,)).fetchone()[0],"needs_user_input")
+        job2,app_id2=self._human_verification_attempt(outcome="outcome_unknown")
+        scope={"authorization_id":"synthetic-grant","field_keys":["full_name","email"],"document_types":["resume"]}
+        with patch.object(app_agent,"_mock_allowed",return_value=False), \
+             patch.object(app_agent,"_get_job",return_value=job2), \
+             patch.object(app_agent,"validate_application_url"), \
+             patch.object(app_agent,"_eligibility_gate",return_value=("potential_match",True,False)), \
+             patch.object(app_agent,"_current_preparation_authorization",return_value=scope):
+            with self.assertRaises(HTTPException) as unknown:
+                app_agent.resume_after_human_verification(app_id2)
+        self.assertEqual(unknown.exception.status_code,409)
+        job3,app_id3=self._human_verification_attempt(resume_count=3)
+        with self.assertRaises(HTTPException) as expired:
+            app_agent.resume_after_human_verification(app_id3)
+        self.assertEqual(expired.exception.status_code,429)
+
     def _save_evidence_review_fixture(self, description, *, years=0):
         key="review-authentic-"+str(time.time_ns())
         with app_agent.connect() as db:
@@ -2166,10 +2260,15 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(app["state"],"needs_user_input")
         self.assertTrue(any("Human confirmation" in x for x in app["diagnostic"]["unanswered_fields"]))
 
-    def test_human_challenge_is_unsupported_and_url_guard_blocks_private_targets(self):
+    def test_human_challenge_pauses_with_checkpoint_and_url_guard_blocks_private_targets(self):
         response=self.post("/api/applications/dry-run",json={"job":{"job_key":"mock-captcha","company":"Test Co","title":"Engineer","application_url":"http://127.0.0.1:8000/mock-apps/captcha"}})
         app=next(x for x in self.get("/api/applications") if x["title"]=="Engineer")
-        self.assertEqual(app["state"],"unsupported")
+        self.assertEqual(app["state"],"needs_user_input")
+        checkpoint=app["diagnostic"]["browser_checkpoint"]
+        self.assertEqual(checkpoint["human_action_blocker"],"human_verification")
+        self.assertFalse(checkpoint["browser_session"]["available"])
+        self.assertFalse(checkpoint["browser_session"]["persisted"])
+        self.assertEqual(app_agent.list_application_attention()["count"],1)
         for url in ("http://127.0.0.1/private","https://127.0.0.1/","file:///etc/passwd"):
             with self.assertRaises(ValueError): app_agent.validate_application_url(url)
 

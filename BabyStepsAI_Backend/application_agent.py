@@ -98,8 +98,10 @@ def _record_application_attention(job, blocker_code, reason, *, eligibility_stat
     blocker_code=str(blocker_code or "human_review")[:60]
     reason=str(reason or "Review this opening manually.")[:600]
     actions={"unsupported_form":"Open the official employer application and complete it manually.",
-        "human_verification":"Complete the requested human verification on the employer site, then return here.",
+        "human_verification":"Complete verification yourself on the official employer site, then return here to recheck. BabyStepsAI will open a fresh browser session; it does not retain the prior session or its entered values.",
+        "authentication_required":"Complete authentication yourself on the official employer site. BabyStepsAI will only recheck in a fresh session and will not store credentials.",
         "applicant_information":"Confirm the missing applicant information before preparation.",
+        "human_review":"Complete the required employer-only confirmation manually. BabyStepsAI will not accept terms or declarations.",
         "employer_clarification":"Review the official posting or contact the employer to clarify the requirement.",
         "posting_review":"Verify the current posting and requisition status on the official employer site.",
         "preparation_failure":"Review the preparation details and retry only after resolving the listed issue."}
@@ -134,6 +136,86 @@ def _record_application_attention(job, blocker_code, reason, *, eligibility_stat
              posting_url[:2048],application_url[:2048],blocker_code,reason,action,str(eligibility_state)[:40],
              str(form_state)[:40],preparation_state,form_fingerprint,posting_fingerprint,stamp,stamp,stamp))
     return attention_id
+
+
+def _browser_checkpoint(job, scope, report, diagnostic, blocker_code, *, resume_count=0):
+    """Return a value-free, restart-safe checkpoint; never persist browser state."""
+    report=report if isinstance(report,dict) else {}
+    scope=scope if isinstance(scope,dict) else {}
+    diagnostic=diagnostic if isinstance(diagnostic,dict) else {}
+    fields=scope.get("field_keys") if isinstance(scope.get("field_keys"),list) else []
+    documents=scope.get("document_types") if isinstance(scope.get("document_types"),list) else []
+    completed=[]
+    for item in diagnostic.get("filled_fields",[]):
+        if not isinstance(item,dict) or item.get("result")!="filled":
+            continue
+        source=str(item.get("source") or "")
+        if source in fields:
+            completed.append(source)
+        elif source in {"active_resume","private_document"}:
+            completed.append("document:"+("resume" if source=="active_resume" else "authorized_document"))
+    return {
+        "version":1,
+        "job_key":str(job.get("job_key") or "")[:250],
+        "employer":str(job.get("company") or job.get("employer") or "")[:160],
+        "requisition_id":str((str(job.get("job_key") or "").rsplit(":",1)[-1]))[:120],
+        "verified_form_url":_sanitized_inspection_url(report.get("canonical_application_url") or report.get("application_url") or job.get("application_url") or ""),
+        "authorized_field_identifiers":sorted({str(value)[:80] for value in fields if isinstance(value,str)}),
+        "authorized_document_types":sorted({str(value)[:40] for value in documents if isinstance(value,str)}),
+        "progress":{"phase":str(diagnostic.get("phase") or "")[:40],
+            "completed_authorized_identifiers":sorted(set(completed)),
+            "completed_field_count":len(completed),"step_count":max(0,min(20,int(diagnostic.get("steps") or 0)))},
+        "human_action_blocker":str(blocker_code or "human_verification")[:60],
+        "browser_session":{"available":False,"valid":False,"persisted":False,
+            "resume_behavior":"fresh_context_recheck"},
+        "resume_upload_verified":bool(int(diagnostic.get("documents_uploaded") or 0)>0 or any(
+            isinstance(item,dict) and item.get("source")=="active_resume" and item.get("result")=="filled"
+            for item in diagnostic.get("filled_fields",[])) or any(x=="document:resume" for x in completed)),
+        "last_verified_form_fingerprint":str(report.get("form_fingerprint") or "")[:128],
+        "resume_count":max(0,min(3,int(resume_count or 0))),
+        "checkpointed_at":now(),
+        "submission_performed":False,
+    }
+
+
+def _save_human_action_checkpoint(app_id, job, scope, report, diagnostic, blocker_code, reason, *, resume_count=None):
+    """Persist a sanitized checkpoint and one canonical human-action item."""
+    try:
+        with connect() as db:
+            row=db.execute("SELECT diagnostic_json FROM applications WHERE id=? AND user_id=?",(app_id,USER)).fetchone()
+        previous=json.loads(row["diagnostic_json"] or "{}") if row else {}
+    except (TypeError,ValueError,json.JSONDecodeError,sqlite3.Error):
+        previous={}
+    checkpoint=previous.get("browser_checkpoint") if isinstance(previous.get("browser_checkpoint"),dict) else {}
+    if resume_count is None:resume_count=checkpoint.get("resume_count",0)
+    diagnostic["browser_checkpoint"]=_browser_checkpoint(job,scope,report,diagnostic,blocker_code,
+        resume_count=resume_count)
+    diagnostic["message"]=str(reason or "Human action is required before preparation can continue.")[:500]
+    diagnostic["human_actions_required"]=[diagnostic["message"]]
+    diagnostic["unanswered_fields"]=[diagnostic["message"]]
+    diagnostic["screenshot"]=None
+    diagnostic["submission_performed"]=False
+    _update(app_id,"needs_user_input",diagnostic)
+    _record_application_attention(job,blocker_code,diagnostic["message"],eligibility_state="needs_review",
+        form_state=("human_verification_required" if blocker_code=="human_verification" else
+            "authentication_required" if blocker_code=="authentication_required" else
+            str((report or {}).get("compatibility_status") or (report or {}).get("inspection_outcome") or "human_action")),
+        report=report if isinstance(report,dict) else {})
+
+
+def _resolve_application_attention(job_key, blocker_codes=("human_verification","authentication_required"), preparation_state="ready_for_review"):
+    if not job_key:return 0
+    try:
+        with connect() as db:
+            rows=db.execute("SELECT attention_id FROM application_attention_items WHERE user_id=? AND job_key=? AND status IN ('open','acknowledged') AND blocker_code IN (%s)" % ",".join("?" for _ in blocker_codes),
+                (USER,job_key,*blocker_codes)).fetchall()
+            if not rows:return 0
+            stamp=now()
+            db.executemany("UPDATE application_attention_items SET status='resolved',preparation_state=?,resolved_at=?,updated_at=? WHERE attention_id=? AND status IN ('open','acknowledged')",
+                [(preparation_state,stamp,stamp,row["attention_id"]) for row in rows])
+            return len(rows)
+    except sqlite3.Error:
+        return 0
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try: return super().__exit__(exc_type, exc_value, traceback)
@@ -2440,6 +2522,8 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
     try: semantic_fields=[item for item in _visible_form_metadata(page) if isinstance(item,dict) and not item.get("__inspection_meta__")]
     except Exception: semantic_fields=[]
     for i in range(min(fields.count(),150)):
+        if report and _interruption(page) in {"human_verification","authentication_required"}:
+            break
         field=fields.nth(i); info={}
         try:
             try: file_input=field.get_attribute("type")=="file"
@@ -3066,9 +3150,21 @@ def _screenshot(page,app_id):
 def _process_application_inner(app_id,job,resume,candidate,answers):
     if "__is_local_mock" not in answers:
         answers=_application_context(job,answers)
+    try:
+        with connect() as db:
+            prior_row=db.execute("SELECT diagnostic_json FROM applications WHERE id=? AND user_id=?",(app_id,USER)).fetchone()
+        prior_diagnostic=json.loads(prior_row["diagnostic_json"] or "{}") if prior_row else {}
+    except (TypeError,ValueError,json.JSONDecodeError,sqlite3.Error):
+        prior_diagnostic={}
+    prior_checkpoints=prior_diagnostic.get("browser_checkpoint_history") if isinstance(prior_diagnostic.get("browser_checkpoint_history"),list) else []
+    active_checkpoint=prior_diagnostic.get("browser_checkpoint") if isinstance(prior_diagnostic.get("browser_checkpoint"),dict) else None
+    checkpoint_resume_count=int(active_checkpoint.get("resume_count") or 0) if active_checkpoint else 0
+    if active_checkpoint:
+        prior_checkpoints=(prior_checkpoints+[active_checkpoint])[-4:]
     diagnostic={"mode":"dry_run","provider":detect_application_provider(job.get("application_url")),
         "filled_fields":[],"required_fields":[],"unsupported_fields":[],"human_actions_required":[],
-        "unanswered_fields":[],"draft_answers":[],"steps":0,"submission_performed":False,"screenshot":None,"message":""}
+        "unanswered_fields":[],"draft_answers":[],"steps":0,"submission_performed":False,"screenshot":None,"message":"",
+        "browser_checkpoint_history":prior_checkpoints}
     if _paused(): _update(app_id,"paused",diagnostic); return
     posting_blocker=_posting_preparation_blocker(job.get("job_key"))
     if posting_blocker:
@@ -3079,6 +3175,8 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
     _update(app_id,"opening",diagnostic)
     local_mock=_mock_allowed(job.get("application_url",""))
     policy_state={}
+    scope={}
+    preflight={}
     try:
         validate_application_url(job["application_url"])
         if not local_mock:
@@ -3112,7 +3210,17 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                 diagnostic["human_actions_required"]=list(preflight.get("human_actions_required") or [])
                 diagnostic["unanswered_fields"]=[blocker]
                 diagnostic["screenshot"]=None
-                _update(app_id,"needs_user_input" if diagnostic["human_actions_required"] else "unsupported",diagnostic);return
+                if diagnostic["human_actions_required"] or preflight.get("inspection_outcome")=="needs_human_action":
+                    evidence=" ".join(str(x) for x in (diagnostic["human_actions_required"] or [blocker]))
+                    code="authentication_required" if re.search(r"sign[ -]?in|authenticat|password|login",evidence,re.I) and not re.search(r"captcha|human verification",evidence,re.I) else "human_verification"
+                    _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,code,blocker,resume_count=checkpoint_resume_count)
+                else:
+                    _update(app_id,"unsupported",diagnostic)
+                    if diagnostic.get("browser_checkpoint_history"):
+                        _resolve_application_attention(job.get("job_key"),preparation_state="unsupported")
+                        _record_application_attention(job,"unsupported_form",blocker,eligibility_state="needs_review",
+                            form_state=str(preflight.get("compatibility_status") or "unsupported"),report=preflight)
+                return
         from playwright.sync_api import sync_playwright
         resume_path=STORAGE/resume["stored_name"]
         if not resume_path.is_file(): raise RuntimeError("The active resume file is unavailable.")
@@ -3147,8 +3255,13 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                 interruption=_interruption(page)
                 if interruption:
                     diagnostic["message"]={"human_verification":"Human verification detected. No bypass was attempted.","authentication_required":"The employer requires sign-in. Complete authentication manually before retrying.","expired_listing":"This job listing appears expired or closed.","automation_restricted":"This employer page says automated application preparation is not permitted. The dry run stopped."}[interruption]
-                    diagnostic["screenshot"]=_screenshot(page,app_id)
-                    _close_browser_safely(page,browser); _update(app_id,"unsupported" if interruption in {"human_verification","expired_listing","automation_restricted"} else "needs_user_input",diagnostic); return
+                    _close_browser_safely(page,browser)
+                    if interruption in {"human_verification","authentication_required"}:
+                        _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"],resume_count=checkpoint_resume_count)
+                    else:
+                        diagnostic["screenshot"]=_screenshot(page,app_id)
+                        _update(app_id,"unsupported",diagnostic)
+                    return
                 if _has_form_fields(page): break
                 links=_apply_links(page)
                 if not links:
@@ -3200,8 +3313,13 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                     diagnostic["message"]=messages.get(interruption,"The employer requires a human action.")
                     diagnostic["human_actions_required"]=[diagnostic["message"]]
                     diagnostic["unanswered_fields"]=[diagnostic["message"]]
-                    diagnostic["screenshot"]=_screenshot(page,app_id)
-                    _close_browser_safely(page,browser);_update(app_id,"unsupported" if interruption in {"expired_listing","automation_restricted"} else "needs_user_input",diagnostic);return
+                    _close_browser_safely(page,browser)
+                    if interruption in {"human_verification","authentication_required"}:
+                        _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"])
+                    else:
+                        diagnostic["screenshot"]=_screenshot(page,app_id)
+                        _update(app_id,"unsupported",diagnostic)
+                    return
                 if _paused():
                     diagnostic["message"]="Paused by user; prior field entries in this browser attempt are retained."; diagnostic["screenshot"]=_screenshot(page,app_id)
                     _close_browser_safely(page,browser); _update(app_id,"paused",diagnostic); return
@@ -3231,6 +3349,17 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                     if item.get("result")=="requires_user_confirmation"))
                 # Persist progress after each step so status survives a server restart.
                 _update(app_id,"filling",diagnostic)
+                interruption=_interruption(page)
+                if interruption in {"human_verification","authentication_required"}:
+                    diagnostic["message"]=("Human verification detected. No bypass was attempted." if interruption=="human_verification"
+                        else "The employer requires sign-in. Complete authentication manually before requesting a fresh-session recheck.")
+                    _close_browser_safely(page,browser)
+                    _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"],resume_count=checkpoint_resume_count)
+                    return
+                if interruption in {"expired_listing","automation_restricted"}:
+                    diagnostic["message"]="The employer page no longer permits safe preparation. Review it manually at the official posting."
+                    diagnostic["screenshot"]=_screenshot(page,app_id)
+                    _close_browser_safely(page,browser);_update(app_id,"unsupported",diagnostic);return
                 controls=_inspect_controls(page)
                 blocked=submission_controls(controls)
                 if blocked: diagnostic["submission_controls"]=[item["label"] for item in blocked]
@@ -3273,6 +3402,17 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
             else:
                 diagnostic["message"]="Dry run complete. Review the form; final submission was not performed."; state="ready_for_review"
             _close_browser_safely(page,browser); _update(app_id,state,diagnostic)
+            if state=="ready_for_review":
+                _resolve_application_attention(job.get("job_key"))
+            elif state=="needs_user_input" and diagnostic.get("browser_checkpoint_history"):
+                # The CAPTCHA blocker cleared, but a separate applicant or
+                # employer-only action remains. Retire the stale CAPTCHA card
+                # and maintain one accurate current handoff.
+                _resolve_application_attention(job.get("job_key"),preparation_state="needs_user_input")
+                code="human_review" if diagnostic.get("human_actions_required") else "applicant_information"
+                _record_application_attention(job,code,diagnostic.get("message") or "Review the remaining required application fields.",
+                    eligibility_state="needs_review",form_state="requires_human_review",
+                    report=diagnostic.get("compatibility_report") if isinstance(diagnostic.get("compatibility_report"),dict) else {})
     except Exception as error:
         name=type(error).__name__
         phase=diagnostic.get("phase")
@@ -4084,13 +4224,41 @@ def list_applications():
 def list_application_attention():
     """Return active human handoffs without creating application attempts."""
     with connect() as db:
-        rows=db.execute("""SELECT attention_id,job_key,employer,title,posting_url,application_url,blocker_code,reason,
-            applicant_action,eligibility_state,form_state,preparation_state,status,created_at,updated_at,last_seen_at
-            FROM application_attention_items WHERE user_id=? AND status IN ('open','acknowledged')
-            ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,updated_at DESC LIMIT 200""",(USER,)).fetchall()
+        rows=db.execute("""SELECT h.attention_id,h.job_key,h.employer,h.title,h.posting_url,h.application_url,h.blocker_code,h.reason,
+            h.applicant_action,h.eligibility_state,h.form_state,h.preparation_state,h.status,h.created_at,h.updated_at,h.last_seen_at,
+            a.id AS application_id,a.resume_id AS application_resume_id,a.state AS current_application_state,a.diagnostic_json AS application_diagnostic
+            FROM application_attention_items h LEFT JOIN applications a ON a.user_id=h.user_id AND
+                (a.job_key=h.job_key OR a.id=(SELECT r.application_id FROM application_opening_reservations r
+                    WHERE r.user_id=h.user_id AND r.identity_hash=h.identity_hash LIMIT 1))
+            WHERE h.user_id=? AND h.status IN ('open','acknowledged')
+            ORDER BY CASE h.status WHEN 'open' THEN 0 ELSE 1 END,h.updated_at DESC LIMIT 200""",(USER,)).fetchall()
     result=[]
+    try: candidate_state=_candidate()
+    except HTTPException: candidate_state=(None,{}, {})
     for row in rows:
         item=dict(row)
+        try:diagnostic=json.loads(item.pop("application_diagnostic",None) or "{}")
+        except (TypeError,json.JSONDecodeError):diagnostic={}
+        checkpoint=diagnostic.get("browser_checkpoint") if isinstance(diagnostic.get("browser_checkpoint"),dict) else {}
+        application_state=item.get("current_application_state")
+        resume_allowed=False
+        if item.get("application_id") and application_state=="needs_user_input":
+            readiness=_readiness_for_application({"id":item["application_id"],"resume_id":item.get("application_resume_id"),
+                "job_key":item.get("job_key"),"application_url":item.get("application_url"),"state":application_state,
+                "diagnostic":diagnostic},candidate_state)
+            resume_allowed=bool(readiness.get("human_verification_resume_allowed"))
+        item.pop("current_application_state",None)
+        item.pop("application_resume_id",None)
+        item["human_verification_checkpoint"]={
+            "available":bool(item.get("application_id") and item.get("blocker_code")=="human_verification"
+                and application_state=="needs_user_input" and checkpoint and resume_allowed),
+            "browser_session_available":False,
+            "browser_session_persisted":False,
+            "resume_count":max(0,min(3,int(checkpoint.get("resume_count") or 0))),
+            "progress":checkpoint.get("progress") if isinstance(checkpoint.get("progress"),dict) else {},
+            "resume_upload_verified":bool(checkpoint.get("resume_upload_verified")),
+            "message":"The prior browser session is closed. Continuing opens a fresh session and rechecks the form; previously entered values are not assumed to persist." if checkpoint else "",
+        }
         for key in ("posting_url","application_url"):
             try:item[key]=urlparse(str(item.get(key) or ""))._replace(query="",fragment="").geturl()
             except ValueError:item[key]=""
@@ -4251,6 +4419,11 @@ def _readiness_for_application(app,candidate_state):
         "paused":"Paused","submitted":"Historical Submission Record","skipped_duplicate":"Duplicate Skipped"}.get(state,state.replace("_"," ").title())
     documents_needed=list(dict.fromkeys(str(value)[:240] for value in unanswered if re.search(r"resume|document|transcript|upload|file",str(value),re.I)))
     interrupted=bool(diagnostic.get("interrupted"))
+    browser_checkpoint=diagnostic.get("browser_checkpoint") if isinstance(diagnostic.get("browser_checkpoint"),dict) else {}
+    human_verification_resume_allowed=bool(state=="needs_user_input" and gate_ok and not manual_completion_reported
+        and browser_checkpoint.get("human_action_blocker")=="human_verification"
+        and int(browser_checkpoint.get("resume_count") or 0)<3
+        and not browser_checkpoint.get("browser_session",{}).get("available"))
     # Browser contexts are not persisted. A paused attempt is safely resumable
     # only if it stopped before navigation or any field interaction. Later
     # pauses must create a new, explicitly confirmed attempt.
@@ -4287,6 +4460,9 @@ def _readiness_for_application(app,candidate_state):
         "last_checkpoint":str(checkpoint).replace("_"," ")+((" · "+str(diagnostic.get("steps"))+" step(s)") if diagnostic.get("steps") is not None else ""),
         "browser_compatibility":"Unsupported" if state=="unsupported" else ("Form detected" if diagnostic.get("form_detected") else "Not yet verified"),
         "resume_allowed":resume_allowed,"resume_reason":resume_reason,"retry_allowed":retry_allowed,"retry_reason":retry_reason,
+        "human_verification_resume_allowed":human_verification_resume_allowed,
+        "browser_session_available":False,
+        "human_verification_resume_reason":"Recheck in a fresh browser context; prior cookies and entered values are not restored." if human_verification_resume_allowed else "",
         "retry_creates_new_attempt":retryable_state,"manual_submission_outcome":manual_outcome,
         "manual_completion_reported":manual_completion_reported}
 
@@ -4444,6 +4620,104 @@ def resume_one(application_id:str):
     return {"application_id":application_id,"status":"queued","resumed_existing_attempt":True,"new_attempt_created":False}
 
 
+@router.post("/api/applications/{application_id}/verification-resume")
+def resume_after_human_verification(application_id:str):
+    """Recheck a human-action attempt in a fresh browser context without a new attempt."""
+    resume,candidate,answers=_candidate()
+    resume=dict(resume)
+    with connect() as db:
+        row=db.execute("SELECT * FROM applications WHERE id=? AND user_id=?",(application_id,USER)).fetchone()
+    if not row:raise HTTPException(404,"Application not found.")
+    row=dict(row)
+    if row["state"]!="needs_user_input":raise HTTPException(409,"This application is no longer waiting for human verification.")
+    try:diagnostic=json.loads(row.get("diagnostic_json") or "{}")
+    except (TypeError,json.JSONDecodeError):raise HTTPException(409,"The saved human-action checkpoint is unavailable.")
+    checkpoint=diagnostic.get("browser_checkpoint") if isinstance(diagnostic.get("browser_checkpoint"),dict) else None
+    if not checkpoint or checkpoint.get("human_action_blocker")!="human_verification":
+        raise HTTPException(409,"Only a CAPTCHA or human-verification checkpoint can be rechecked. Authentication state is not stored; continue manually at the official employer site.")
+    if checkpoint.get("browser_session",{}).get("available") or checkpoint.get("browser_session",{}).get("valid"):
+        raise HTTPException(409,"Saved browser state is not trusted. Recheck can only use a fresh browser context.")
+    if int(checkpoint.get("resume_count") or 0)>=3:
+        raise HTTPException(429,"The bounded verification recheck limit was reached. Continue manually at the official employer site.")
+    if row.get("resume_id")!=resume.get("id"):
+        raise HTTPException(409,"The active resume changed. Review the application and authorization before continuing.")
+    local_mock=_mock_allowed(row.get("application_url"))
+    scope=None
+    if local_mock:
+        job={"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]}
+    else:
+        try:
+            validate_application_url(row["application_url"])
+            job=_get_job(DryRunRequest(job_key=row["job_key"]))
+        except (ValueError,HTTPException) as error:
+            raise HTTPException(409,"The official posting could not be revalidated. Open the employer link manually and review this application.") from error
+        job.update({"job_key":row["job_key"],"company":row["company"],"title":row["title"]})
+        if _public_url_for_confirmation(job.get("application_url"))!=_public_url_for_confirmation(row["application_url"]):
+            raise HTTPException(409,"The application URL changed. Review the current posting and authorization before continuing.")
+        posting_blocker=_posting_preparation_blocker(row["job_key"])
+        if posting_blocker:raise HTTPException(409,posting_blocker)
+        with connect() as db:
+            gate,reviewed,unresolved=_eligibility_gate(db,row["job_key"],resume["id"])
+        if gate not in {"potential_match","needs_review"} or unresolved or (gate=="needs_review" and not reviewed):
+            raise HTTPException(409,"Current mandatory eligibility evidence is unresolved or stale. Review it before resuming preparation.")
+        scope=_current_preparation_authorization(row["job_key"],resume["id"],row["application_url"])
+        if not scope:raise HTTPException(403,"Job-specific authorization is missing, revoked, or stale. Reauthorize through Application Settings before continuing.")
+        if sorted(scope.get("field_keys") or [])!=sorted(checkpoint.get("authorized_field_identifiers") or []) or sorted(scope.get("document_types") or [])!=sorted(checkpoint.get("authorized_document_types") or []):
+            raise HTTPException(409,"The approved fields or documents changed since this checkpoint. Review authorization before continuing.")
+    if not job.get("application_url") or _public_url_for_confirmation(job.get("application_url"))!=_public_url_for_confirmation(checkpoint.get("verified_form_url")):
+        raise HTTPException(409,"The verified form identity changed. Reinspect the employer form before continuing.")
+    with _attempt_lock,connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        current=db.execute("SELECT state,attempt_number,diagnostic_json FROM applications WHERE id=? AND user_id=?",(application_id,USER)).fetchone()
+        if not current or current["state"]!="needs_user_input":raise HTTPException(409,"The application state changed. Refresh before continuing.")
+        if application_id in _active_attempts:raise HTTPException(409,"This application already has an active worker.")
+        control=db.execute("SELECT paused FROM application_controls WHERE user_id=?",(USER,)).fetchone()
+        if control and control["paused"]:raise HTTPException(409,"Application processing is paused. Resume processing from Applications before continuing.")
+        active=db.execute("SELECT id FROM applications WHERE user_id=? AND state IN ('queued','opening','inspecting','filling','uploading_resume') AND id<>? LIMIT 1",(USER,application_id)).fetchone()
+        if active:raise HTTPException(409,"Another application preparation is active. Wait for it to finish.")
+        reservation=db.execute("SELECT identity_hash FROM application_opening_reservations WHERE user_id=? AND application_id=?",(USER,application_id)).fetchone()
+        if not reservation:raise HTTPException(409,"The opening reservation is missing. Duplicate safety cannot be verified.")
+        other=db.execute("SELECT application_id FROM application_opening_reservations WHERE user_id=? AND identity_hash=?",(USER,reservation["identity_hash"])).fetchone()
+        if not other or other["application_id"]!=application_id:raise HTTPException(409,"Another application owns this opening reservation.")
+        events=db.execute("SELECT outcome FROM manual_submission_events WHERE user_id=? AND application_id=? ORDER BY recorded_at DESC",(USER,application_id)).fetchall()
+        if any(item["outcome"] in {"submitted_manually","employer_confirmation_received","outcome_unknown","needs_follow_up"} for item in events):
+            raise HTTPException(409,"A submitted, uncertain, or follow-up outcome is recorded. Automatic preparation is blocked.")
+        try:current_diagnostic=json.loads(current["diagnostic_json"] or "{}")
+        except (TypeError,json.JSONDecodeError):raise HTTPException(409,"The saved checkpoint changed. Refresh before continuing.")
+        current_checkpoint=current_diagnostic.get("browser_checkpoint") if isinstance(current_diagnostic.get("browser_checkpoint"),dict) else None
+        if (not current_checkpoint or current_checkpoint.get("human_action_blocker")!=checkpoint.get("human_action_blocker") or
+                int(current_checkpoint.get("resume_count") or 0)!=int(checkpoint.get("resume_count") or 0) or
+                current_checkpoint.get("verified_form_url")!=checkpoint.get("verified_form_url")):
+            raise HTTPException(409,"The human-action checkpoint changed. Refresh before continuing.")
+        current_checkpoint["resume_count"]=int(current_checkpoint.get("resume_count") or 0)+1
+        current_checkpoint["resume_requested_at"]=now()
+        current_checkpoint["browser_session"]={"available":False,"valid":False,"persisted":False,"resume_behavior":"fresh_context_recheck"}
+        current_diagnostic["browser_checkpoint"]=current_checkpoint
+        current_diagnostic["message"]="Human verification was reported complete. BabyStepsAI is rechecking the current posting and form in a fresh browser session; previous field values are not assumed to persist."
+        current_diagnostic["human_actions_required"]=[]
+        current_diagnostic["unanswered_fields"]=[]
+        stamp=now()
+        db.execute("UPDATE applications SET state='queued',diagnostic_json=?,error=NULL,updated_at=?,state_changed_at=?,heartbeat_at=NULL WHERE id=? AND state='needs_user_input'",
+            (json.dumps(current_diagnostic,ensure_ascii=False)[:30000],stamp,stamp,application_id))
+        db.execute("UPDATE application_attempts SET state='queued',diagnostic_json=?,error=NULL,updated_at=?,state_changed_at=?,heartbeat_at=NULL WHERE application_id=? AND attempt_number=?",
+            (json.dumps(current_diagnostic,ensure_ascii=False)[:30000],stamp,stamp,application_id,current["attempt_number"]))
+    if scope:
+        candidate=_scoped_candidate(candidate,scope)
+        answers=_scoped_answers(_application_context(job,answers),scope)
+    else:
+        answers=_application_context(job,answers)
+        answers["__is_local_mock"]=True
+    try:
+        _schedule_application_queue()
+    except Exception as error:
+        failed={**current_diagnostic,"message":"The fresh-session recheck could not start. No new application attempt was created.","failure_code":"worker_start_failed"}
+        _update(application_id,"needs_user_input",failed,type(error).__name__)
+        raise HTTPException(503,"The recheck could not start. The existing attempt and checkpoint were preserved.") from error
+    return {"application_id":application_id,"status":"queued","resumed_existing_attempt":True,
+        "new_attempt_created":False,"browser_session_restored":False,"fresh_browser_context":True,
+        "resume_count":current_checkpoint["resume_count"],"submission_enabled":False}
+
+
 @router.post("/api/applications/{application_id}/retry")
 def retry_one(application_id:str):
     resume,candidate,answers=_candidate()
@@ -4523,7 +4797,7 @@ function renderAttentionInbox(apps){const box=document.querySelector('#attention
 function renderApps(apps){const box=document.querySelector('#apps');box.replaceChildren();if(!apps.length){box.append(node('div','empty','No application attempts yet. Start a dry run from a saved job or choose a local test form.'));return}for(const app of apps){const card=node('article','app'),head=node('h3','',escapeText(app.title)),company=node('div','sub',escapeText(app.company));const test=String(app.job_key||'').startsWith('local-mock:');const badge=node('span','pill',test?'Local test':'Saved job');const state=node('div','status',labels[app.state]||'Needs review');state.dataset.state=app.state;state.prepend(node('i','dot'));const bar=node('div','bar');const fill=node('i');fill.style.width=(progress[app.state]||15)+'%';bar.append(fill);const timing=node('div','sub','Last updated '+new Date(app.updated_at).toLocaleString()+(app.started_at?' · Attempt started '+new Date(app.started_at).toLocaleString():''));card.append(head,company,badge,state,bar,timing);if(app.diagnostic?.message)card.append(node('p','sub',app.diagnostic.message));if(app.diagnostic?.unanswered_fields?.length){card.append(node('p','sub','Needs your input: '+app.diagnostic.unanswered_fields.join(' · ')));const link=node('a','sub','Review candidate profile and answers');link.href='/candidate-profile';card.append(link)}if(['paused','failed','needs_user_input','unsupported'].includes(app.state)){const btn=node('button','',app.diagnostic?.interrupted?'Review and retry':'Retry dry run');btn.onclick=()=>retry(app.id);card.append(btn)}const detail=document.createElement('details'),summary=node('summary','','Diagnostics and attempt history');const body=node('div');if(app.error)body.append(node('p','', 'Technical error: '+app.error));if(app.diagnostic?.steps)body.append(node('p','', 'Form steps visited: '+app.diagnostic.steps));if(app.diagnostic?.filled_fields?.length)body.append(node('p','', 'Fields filled: '+app.diagnostic.filled_fields.filter(x=>x.result==='filled').length));if(app.diagnostic?.screenshot){const shot=node('a','sub','View private dry-run screenshot');shot.href='/api/applications/'+encodeURIComponent(app.id)+'/screenshot';shot.target='_blank';shot.rel='noopener';body.append(shot)}if(app.diagnostic?.interrupted)body.append(node('p','', 'This attempt was interrupted. It was not automatically retried because its outcome may be uncertain.'));detail.append(summary,body);detail.addEventListener('toggle',async()=>{if(!detail.open||detail.dataset.loaded)return;detail.dataset.loaded='1';try{const attempts=await req('/api/applications/'+encodeURIComponent(app.id)+'/attempts');for(const attempt of attempts){const item=node('p','sub','Attempt '+attempt.attempt_number+' · '+(labels[attempt.state]||attempt.state)+' · '+(attempt.started_at?'started '+new Date(attempt.started_at).toLocaleString():'not started'));body.append(item);if(attempt.diagnostic?.message)body.append(node('p','sub',attempt.diagnostic.message));if(attempt.error)body.append(node('p','sub','Technical error type: '+attempt.error))}}catch(e){body.append(node('p','sub',e.message))}});card.append(detail);box.append(card)}}
 async function retry(id){await runBusy('Starting the selected retry…',async()=>{await req('/api/applications/'+encodeURIComponent(id)+'/resume',{method:'POST'});say('Retry started. Previously completed attempts and diagnostics remain in history.')})}
 async function renderQuestionAttention(){const root=document.getElementById('question-attention');if(!root)return;root.replaceChildren();try{const data=await req('/api/application-questions/attention');if(!data.groups?.length){root.append(node('div','empty','No saved applications currently need additional answers.'));return}for(const group of data.groups){const card=node('article','app'),title=node('h3','',group.question);card.append(title,node('p','sub',(group.jobs.length===1?'1 saved job':'Shared across '+group.jobs.length+' saved jobs')+' · '+group.canonical_category.replaceAll('_',' ')));for(const job of group.jobs){const line=node('p','sub',job.company+' · '+job.title+' — '+job.question);card.append(line)}if(group.sensitive)card.append(node('p','sub','Sensitive or legal answer: stored encrypted, never automatically reused, and the employer may still require your action.'));const answer=document.createElement('textarea');answer.rows=3;answer.maxLength=4000;answer.required=true;answer.setAttribute('aria-label','Confirmed answer for '+group.question);answer.placeholder='Enter only an answer you have confirmed.';const scope=document.createElement('select');scope.setAttribute('aria-label','Answer reuse scope');for(const [value,label] of [['this_job','Use for this job only'],['matching_jobs','Reuse for matching jobs'],['general_preference','Save as a general preference']]){const option=document.createElement('option');option.value=value;option.textContent=label;scope.append(option)}if(group.sensitive||group.canonical_category==='relocation')scope.value='this_job';if(group.sensitive){for(const option of scope.options)if(option.value!=='this_job')option.disabled=true}if(group.canonical_category==='relocation'){for(const option of scope.options)if(option.value!=='this_job')option.disabled=true;card.append(node('p','sub','For future roles, set your structured relocation choice and destinations in Career Preferences.'))}const target=document.createElement('select');target.setAttribute('aria-label','Job for one-job reuse');for(const job of group.jobs){const option=document.createElement('option');option.value=job.job_key;option.textContent=job.company+' · '+job.title;target.append(option)}const confirmLabel=document.createElement('label'),confirm=document.createElement('input');confirm.type='checkbox';confirmLabel.append(confirm,document.createTextNode(' I confirm this answer is accurate.'));const save=node('button','primary','Save confirmed answer');const status=node('p','sub','');status.setAttribute('role','status');save.onclick=async()=>{if(!answer.value.trim()||!confirm.checked){status.textContent='Enter an answer and confirm that it is accurate.';return}save.disabled=true;status.textContent='Saving and verifying…';try{const result=await req('/api/application-questions/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:group.question,answer:answer.value,application_ids:group.jobs.map(x=>x.application_id),reuse_scope:scope.value,job_key:scope.value==='this_job'?target.value:'',confirmed:true})});if(!result.persisted_verified)throw Error('The saved answer could not be verified.');status.textContent=result.requires_manual_action?'Saved encrypted for this job only. It will not be auto-filled; enter it yourself in the employer form when asked.':'Saved. No application was resumed; choose a dry run in Application history when ready.';say(result.message);await renderQuestionAttention()}catch(error){status.textContent=error.message;save.disabled=false}};card.append(answer,scope);if(!group.sensitive&&group.canonical_category!=='relocation'){const profileLink=node('a','sub','Review your profile and permissions');profileLink.href='/candidate-profile';card.append(profileLink)}if(group.jobs.length>1)card.append(target);card.append(confirmLabel,save,status);root.append(card)}}catch(error){root.append(node('p','sub','Could not load grouped application questions: '+error.message))}}
-function renderHandoffs(items){const box=document.querySelector('#attention-inbox');if(!box)return;if(items.length)box.querySelector('.empty')?.remove();for(const item of items){const card=node('article','app');card.dataset.attentionId=item.attention_id;card.append(node('h3','',escapeText(item.title)),node('div','sub',escapeText(item.employer)),node('div','status','Needs Your Attention'));card.append(node('p','sub',escapeText(item.reason)));card.append(node('p','sub','Next action: '+escapeText(item.applicant_action)));card.append(node('p','sub','Eligibility: '+escapeText(item.eligibility_state)+' · Form: '+escapeText(item.form_state)+' · Preparation: '+escapeText(item.preparation_state==='not_prepared'?'not started':item.preparation_state.replaceAll('_',' '))));const link=node('a','sub','Open official employer application ↗');link.href=item.application_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link);if(item.posting_url&&item.posting_url!==item.application_url){const posting=node('a','sub','View official posting ↗');posting.href=item.posting_url;posting.target='_blank';posting.rel='noopener noreferrer';posting.style.marginLeft='12px';card.append(posting)}card.append(node('p','sub',item.preparation_state==='not_prepared'?'No application attempt or preparation was created for this handoff.':'Review the existing preparation in Application history; this handoff did not create another attempt.'));box.append(card)}}
+function renderHandoffs(items){const box=document.querySelector('#attention-inbox');if(!box)return;if(items.length)box.querySelector('.empty')?.remove();for(const item of items){const card=node('article','app');card.dataset.attentionId=item.attention_id;card.append(node('h3','',escapeText(item.title)),node('div','sub',escapeText(item.employer)),node('div','status','Needs Your Attention'));card.append(node('p','sub',escapeText(item.reason)));card.append(node('p','sub','Next action: '+escapeText(item.applicant_action)));card.append(node('p','sub','Eligibility: '+escapeText(item.eligibility_state)+' · Form: '+escapeText(item.form_state)+' · Preparation: '+escapeText(item.preparation_state==='not_prepared'?'not started':item.preparation_state.replaceAll('_',' '))));const link=node('a','sub','Open official employer application ↗');link.href=item.application_url;link.target='_blank';link.rel='noopener noreferrer';card.append(link);if(item.posting_url&&item.posting_url!==item.application_url){const posting=node('a','sub','View official posting ↗');posting.href=item.posting_url;posting.target='_blank';posting.rel='noopener noreferrer';posting.style.marginLeft='12px';card.append(posting)}const checkpoint=item.human_verification_checkpoint;if(checkpoint?.available&&item.application_id){card.append(node('p','sub',checkpoint.message));const resume=node('button','primary','I completed verification — recheck safely');resume.type='button';resume.onclick=()=>phaseHumanVerificationRecheck(item.application_id);card.append(resume)}card.append(node('p','sub',item.preparation_state==='not_prepared'?'No application attempt or preparation was created for this handoff.':'Review the existing preparation in Application history; this handoff did not create another attempt.'));box.append(card)}}
 async function refresh(){try{const [apps,p,handoffs]=await Promise.all([req('/api/applications'),req('/api/applications/progress'),req('/api/applications/attention')]);renderSummary(apps,p);renderAttentionInbox(apps);renderHandoffs(handoffs.items||[]);renderApps(apps);await renderQuestionAttention()}catch(e){say(e.message)}}
 document.querySelectorAll('.toolbar button').forEach(button=>button.addEventListener('click',()=>{if(busy)button.disabled=true}));refresh();setInterval(refresh,15000);const localTestHeading=[...document.querySelectorAll('.section-head')].find(x=>x.querySelector('h2')?.textContent==='Local test forms'),localTestToolbar=localTestHeading?.nextElementSibling;if(localTestToolbar){const answerTest=node('button','','Test AI-written answer');answerTest.onclick=()=>mock('written');localTestToolbar.append(answerTest)}
 Object.assign(labels,{opening:'Opening employer website',inspecting:'Finding application form',filling:'Filling candidate details'});if(!document.querySelector('nav a[href="/application-settings"]')){const settingsNav=document.createElement('a');settingsNav.href='/application-settings';settingsNav.textContent='Application settings';document.querySelector('nav')?.append(settingsNav)}
@@ -4883,6 +5157,7 @@ const phase134OriginalRenderApps=renderApps,phase134AppSignatures=new Map();
 function phase134ApplicationSignature(app){return JSON.stringify(app)}
 function phase134ReadinessItem(label,value,title){const item=node('div','readiness-item');item.setAttribute('role','listitem');item.title=title||'';item.append(node('strong','',label),node('span','',value||'Unknown'));return item}
 async function phase134ResumeApplication(id){await runBusy('Revalidating and resuming the saved attempt…',async()=>{const result=await req('/api/applications/'+encodeURIComponent(id)+'/resume',{method:'POST'});if(!result.resumed_existing_attempt||result.new_attempt_created)throw Error('The server did not confirm a safe resume. Refresh the application history.');say('Existing attempt resumed from its saved checkpoint. No new attempt was created.')})}
+async function phaseHumanVerificationRecheck(id){await runBusy('Rechecking the employer form in a fresh browser session…',async()=>{const result=await req('/api/applications/'+encodeURIComponent(id)+'/verification-resume',{method:'POST'});if(!result.resumed_existing_attempt||result.new_attempt_created||result.browser_session_restored)throw Error('The server did not confirm a safe fresh-session recheck. Refresh application history.');say('Fresh-session recheck started on the existing attempt. Prior browser values were not restored; final submission remains disabled.')})}
 retry=async function(id){await runBusy('Rechecking eligibility and authorization before retry…',async()=>{const result=await req('/api/applications/'+encodeURIComponent(id)+'/retry',{method:'POST'});if(!result.new_attempt_created)throw Error('The server did not confirm a new retry attempt. Refresh the application history.');const attempts=await req('/api/applications/'+encodeURIComponent(id)+'/attempts');if(!(attempts||[]).some(item=>item.attempt_number===result.attempt_number))throw Error('Retry started, but its attempt record could not be verified. Check application history.');say('Retry attempt '+result.attempt_number+' saved. Earlier attempt history is preserved; submission remains disabled.')})};
 function phase134DecorateApplicationCard(card,app){
   card.classList.add('application-card');card.dataset.applicationId=app.id;
@@ -4917,13 +5192,19 @@ function phase134DecorateApplicationCard(card,app){
     const resolve=node('a','primary','Resolve Questions');resolve.href='#question-attention';resolve.setAttribute('aria-label','Resolve questions shared across application attempts');buttons.append(resolve);
     const perJob=[...card.querySelectorAll('details')].find(x=>x.querySelector('summary')?.textContent==='Resolve Questions');
     if(perJob){const detailsButton=node('button','','Review This Application’s Questions');detailsButton.type='button';detailsButton.onclick=()=>{perJob.open=true;perJob.querySelector('summary')?.focus()};buttons.append(detailsButton)}
+    if(readiness.human_verification_resume_allowed)addButton('I completed verification — recheck safely',true,'',()=>phaseHumanVerificationRecheck(app.id),true);
     if(readiness.retry_allowed)addButton('Retry Dry Run',true,'',()=>retry(app.id));
     else if((questions.remaining||0)===0)addButton('Retry Dry Run',false,recoveryReason,null);
   }
   if(state==='unsupported')actionSection.append(node('p','action-reason','No retry is offered: '+(readiness.retry_reason||'The last attempt found unsupported controls. Inspect compatibility first.')));
   else if(state==='failed'||state==='paused'||state==='needs_user_input')actionSection.append(node('p','action-reason',state==='needs_user_input'?(actions.count?'Human action is required before safe retry.':questions.reason||'Save confirmed answers before retrying.'):recoveryReason));
   if(actions.count){
-    actionSection.append(node('p','action-reason','Automation stopped for a human action. Its isolated browser session is closed, so entered form values are not carried over. Complete verification or employer-specific declarations on the official form, then submit it yourself.'));
+    const checkpoint=app.diagnostic?.browser_checkpoint;
+    actionSection.append(node('p','action-reason',checkpoint?.human_action_blocker==='human_verification'
+      ?'Complete the CAPTCHA or human verification yourself on the official employer site, then return and request a fresh-session recheck. BabyStepsAI will revalidate the posting, eligibility, authorization, and duplicate reservation, then refill only currently authorized confirmed fields. The prior browser session and entered values are not preserved. Final submission remains disabled.'
+      :checkpoint?.human_action_blocker==='authentication_required'
+        ?'The employer requires authentication. BabyStepsAI does not store credentials or preserve this browser session. Continue manually at the official employer site; any later preparation must start in a fresh session and pass all checks again.'
+      :'Automation stopped for a human action. Its isolated browser session is closed, so entered form values are not carried over. Complete verification or employer-specific declarations on the official form, then submit it yourself.'));
     if(app.application_url){const employerLink=node('a','', 'Open official employer form');employerLink.href=app.application_url;employerLink.target='_blank';employerLink.rel='noopener noreferrer';actionSection.append(employerLink)}
   }
   if(buttons.childElementCount)actionSection.append(buttons);
