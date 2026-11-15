@@ -180,6 +180,7 @@ class ApplicationAgentTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); root=Path(self.temp.name)
         self.old_key_path=os.environ.get("BABYSTEPSAI_KEY_PATH"); os.environ["BABYSTEPSAI_KEY_PATH"]=str(root/"encryption.key")
+        self.old_handoff=os.environ.get("BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF");os.environ["BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF"]="false"
         self.db=root/"application.sqlite3"; self.storage=root/"resumes"; self.storage.mkdir()
         self.old_db,self.old_storage=app_agent.DB,app_agent.STORAGE
         self.old_profile_db=profile.DB
@@ -218,12 +219,16 @@ class ApplicationAgentTests(unittest.TestCase):
         self.patch_playwright.start()
         self.submit_patch=patch.object(app_agent.executor,"submit",side_effect=lambda fn,*args:fn(*args))
         self.submit_patch.start()
+        self.browser_submit_patch=patch.object(app_agent.application_executor,"submit",side_effect=lambda fn,*args,**kwargs:fn(*args,**kwargs))
+        self.browser_submit_patch.start()
 
     def tearDown(self):
-        self.submit_patch.stop(); self.patch_playwright.stop()
+        self.browser_submit_patch.stop();self.submit_patch.stop(); self.patch_playwright.stop()
         app_agent.DB=self.old_db; app_agent.STORAGE=self.old_storage; profile.DB=self.old_profile_db; answer_assistant.DB=self.old_assistant_db; jobs.DB=self.old_jobs_db
         if self.old_key_path is None: os.environ.pop("BABYSTEPSAI_KEY_PATH",None)
         else: os.environ["BABYSTEPSAI_KEY_PATH"]=self.old_key_path
+        if self.old_handoff is None:os.environ.pop("BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF",None)
+        else:os.environ["BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF"]=self.old_handoff
         self.temp.cleanup()
 
     def post(self, path, json=None):
@@ -351,6 +356,71 @@ class ApplicationAgentTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as expired:
             app_agent.resume_after_human_verification(app_id3)
         self.assertEqual(expired.exception.status_code,429)
+
+    def test_same_browser_handoff_capability_is_local_origin_bound_and_expires(self):
+        from starlette.requests import Request
+        from starlette.responses import Response
+        app_id="synthetic-human-session"
+        session={"user_id":USER,"token":"synthetic-one-time-capability","expires_at":time.monotonic()+60,
+                 "state":"waiting","command":None}
+        with app_agent._human_sessions_lock:
+            previous=app_agent._human_sessions.get(app_id)
+            app_agent._human_sessions[app_id]=session
+        def request(peer="127.0.0.1",host="127.0.0.1:8000",origin="http://127.0.0.1:8000",token=""):
+            headers=[(b"host",host.encode()),(b"origin",origin.encode())]
+            if token:headers.append((b"x-bsa-handoff-token",token.encode()))
+            return Request({"type":"http","http_version":"1.1","method":"GET","scheme":"http",
+                "server":("127.0.0.1",8000),"client":(peer,12345),"root_path":"","path":"/",
+                "raw_path":b"/","query_string":b"","headers":headers})
+        try:
+            response=Response()
+            payload=app_agent.get_human_verification_session(app_id,request(),response)
+            self.assertEqual(payload["token"],session["token"])
+            self.assertIn("no-store",response.headers["cache-control"])
+            for untrusted in (request(peer="10.0.0.2"),request(origin="https://attacker.example")):
+                with self.assertRaises(HTTPException) as denied:
+                    app_agent.get_human_verification_session(app_id,untrusted,Response())
+                self.assertEqual(denied.exception.status_code,403)
+            with self.assertRaises(HTTPException) as wrong_token:
+                app_agent.control_human_verification_session(app_id,"open",request(token="not-the-capability"))
+            self.assertEqual(wrong_token.exception.status_code,403)
+            session["command"]="continue"
+            with self.assertRaises(HTTPException) as concurrent:
+                app_agent.control_human_verification_session(app_id,"continue",request(token=session["token"]))
+            self.assertEqual(concurrent.exception.status_code,409)
+            session["command"]=None;session["expires_at"]=time.monotonic()-1
+            with self.assertRaises(HTTPException) as expired:
+                app_agent.get_human_verification_session(app_id,request(),Response())
+            self.assertEqual(expired.exception.status_code,410)
+        finally:
+            with app_agent._human_sessions_lock:
+                if previous is None:app_agent._human_sessions.pop(app_id,None)
+                else:app_agent._human_sessions[app_id]=previous
+
+    def test_same_browser_resume_rechecks_policy_and_duplicate_reservation(self):
+        job,app_id=self._human_verification_attempt()
+        with app_agent.connect() as db:
+            resume_id=db.execute("SELECT resume_id FROM applications WHERE id=?",(app_id,)).fetchone()[0]
+        prior_scope={"authorization_id":"synthetic-grant","field_keys":["full_name","email"],
+            "document_types":["resume"]}
+        session={"application_id":app_id,"application_url":job["application_url"],"job_fingerprint":job["content_fingerprint"],
+            "job_key":job["job_key"],"resume_id":resume_id,"scope":prior_scope,"job":job}
+        class Page:
+            url=job["application_url"]
+            def is_closed(self):return False
+        gates=(patch.object(app_agent,"_mock_allowed",return_value=False),
+            patch.object(app_agent,"_get_job",return_value=job),patch.object(app_agent,"validate_application_url"),
+            patch.object(app_agent,"_interruption",return_value=None),patch.object(app_agent,"_paused",return_value=False),
+            patch.object(app_agent,"_posting_preparation_blocker",return_value=""),
+            patch.object(app_agent,"_eligibility_gate",return_value=("potential_match",True,False)))
+        with gates[0],gates[1],gates[2],gates[3],gates[4],gates[5],gates[6], \
+             patch.object(app_agent,"_current_preparation_authorization",return_value=None):
+            self.assertIn("revoked or changed",app_agent._same_session_recheck_blocker(session,Page()))
+        current_scope={**prior_scope,"authorization_id":"synthetic-grant"}
+        with gates[0],gates[1],gates[2],gates[3],gates[4],gates[5],gates[6], \
+             patch.object(app_agent,"_current_preparation_authorization",return_value=current_scope):
+            with app_agent.connect() as db:db.execute("DELETE FROM application_opening_reservations WHERE application_id=?",(app_id,))
+            self.assertIn("duplicate reservation changed",app_agent._same_session_recheck_blocker(session,Page()))
 
     def _save_evidence_review_fixture(self, description, *, years=0):
         key="review-authentic-"+str(time.time_ns())
@@ -1497,11 +1567,11 @@ class ApplicationAgentTests(unittest.TestCase):
 
     def test_browser_headless_environment_flag(self):
         import os
-        self.assertTrue(app_agent.browser_headless())
+        with patch.dict(os.environ,{"BABYSTEPS_BROWSER_HEADLESS":"true"}):
+            self.assertTrue(app_agent.browser_headless())
         with patch.dict(os.environ,{"BABYSTEPS_BROWSER_HEADLESS":"false"}):
             self.assertFalse(app_agent.browser_headless())
-            app_agent.start_dry_run(app_agent.DryRunRequest(job={"job_key":"visible-browser","company":"Test","title":"Developer","application_url":"http://127.0.0.1:8000/mock-apps/simple"}))
-        self.assertFalse(self.client.launch_options[-1]["headless"])
+            self.assertFalse(app_agent.browser_launch_headless(False))
 
     def test_browser_launch_failure_has_specific_safe_diagnostic(self):
         resume,candidate,answers=app_agent._candidate()

@@ -4,9 +4,11 @@ import html
 import json
 import os
 import re
+import secrets
 import socket
 import ssl
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -22,8 +24,8 @@ from urllib.parse import urlparse
 import hashlib
 import asyncio
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from job_search_agent import USER, DB as JOB_DB, fetch_board
@@ -46,11 +48,20 @@ ARTIFACTS = ROOT / "private_application_artifacts"
 ARTIFACTS.mkdir(mode=0o700, exist_ok=True)
 router = APIRouter()
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="application-dry-run")
+application_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="application-browser")
 _attempt_lock = threading.RLock()
 _active_attempts = set()
 _queue_worker_lock = threading.RLock()
 _queue_worker_running = False
+_human_sessions_lock = threading.RLock()
+_human_sessions = {}
+HUMAN_SESSION_TTL_SECONDS = 10 * 60
+# Keep one visible employer page while leaving a second bounded browser worker
+# available for other eligible work.
+MAX_ACTIVE_HUMAN_SESSIONS = 1
+MAX_APPLICATION_BROWSER_WORKERS = 2
 _inspection_lock = threading.Lock()
+_application_preflight_lock = threading.Lock()
 _robots_cache_lock = threading.Lock()
 _robots_cache = {}
 _resume_fingerprint_lock=threading.Lock()
@@ -64,7 +75,19 @@ MOCK_PATH_PREFIX = "/mock-apps/"
 
 def browser_headless():
     """Default to the safe background mode; opt into a visible local browser."""
-    return os.getenv("BABYSTEPS_BROWSER_HEADLESS", "true").strip().casefold() not in {"0", "false", "no", "off"}
+    default="false" if sys.platform=="darwin" else "true"
+    return os.getenv("BABYSTEPS_BROWSER_HEADLESS", default).strip().casefold() not in {"0", "false", "no", "off"}
+
+def browser_launch_headless(local_mock=False):
+    """Synthetic forms stay headless; real local preparation can be handed to a person."""
+    if local_mock or os.getenv("BABYSTEPS_TEST_SAME_BROWSER_SESSION")=="1":return True
+    return False if same_browser_handoff_enabled(False) else browser_headless()
+
+def same_browser_handoff_enabled(local_mock=False):
+    """Only visible local Chromium can offer the real applicant a same-page handoff."""
+    configured=os.getenv("BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF")
+    if configured is not None:return configured.strip().casefold() in {"1","true","yes","on"}
+    return bool(local_mock or not browser_headless())
 
 def now(): return datetime.now(timezone.utc).isoformat()
 
@@ -201,6 +224,20 @@ def _save_human_action_checkpoint(app_id, job, scope, report, diagnostic, blocke
             "authentication_required" if blocker_code=="authentication_required" else
             str((report or {}).get("compatibility_status") or (report or {}).get("inspection_outcome") or "human_action")),
         report=report if isinstance(report,dict) else {})
+
+
+def _archive_same_session_checkpoint(diagnostic):
+    """Retain a sanitized audit record after same-context human verification."""
+    checkpoint=diagnostic.get("browser_checkpoint") if isinstance(diagnostic,dict) else None
+    if not isinstance(checkpoint,dict):return
+    archived=dict(checkpoint)
+    archived["resume_count"]=min(3,int(archived.get("resume_count") or 0)+1)
+    archived["browser_session"]={"available":False,"valid":False,"persisted":False,
+        "resume_behavior":"same_browser_session_completed"}
+    history=diagnostic.get("browser_checkpoint_history") if isinstance(diagnostic.get("browser_checkpoint_history"),list) else []
+    if not any(isinstance(item,dict) and item.get("checkpointed_at")==archived.get("checkpointed_at") for item in history):
+        diagnostic["browser_checkpoint_history"]=(history+[archived])[-4:]
+    diagnostic.pop("browser_checkpoint",None)
 
 
 def _resolve_application_attention(job_key, blocker_codes=("human_verification","authentication_required"), preparation_state="ready_for_review"):
@@ -383,7 +420,9 @@ TRANSITIONS = {
     "inspecting": {"filling", "paused", "failed", "unsupported", "needs_user_input", "ready_for_review"},
     "filling": {"filling", "uploading_resume", "paused", "failed", "unsupported", "needs_user_input", "ready_for_review"},
     "uploading_resume": {"filling", "paused", "failed", "unsupported", "needs_user_input"},
-    "paused": {"queued"}, "failed": {"queued"}, "needs_user_input": {"queued"}, "unsupported": {"queued"},
+    # Same-browser continuation is allowed only after the owning Playwright
+    # worker revalidates the session, policy, posting, reservation, and blocker.
+    "paused": {"queued"}, "failed": {"queued"}, "needs_user_input": {"queued", "filling"}, "unsupported": {"queued"},
     "ready_for_review": set(), "submitted": set(), "skipped_duplicate": set(),
 }
 STALE_AFTER = timedelta(minutes=2)
@@ -682,6 +721,210 @@ def _close_browser_safely(page,browser):
     if browser is not None:
         try:browser.close()
         except (Exception,asyncio.CancelledError):pass
+
+
+def _same_session_recheck_blocker(session, page):
+    """Revalidate the existing attempt from the Playwright-owning thread."""
+    app_id=session["application_id"]
+    if page.is_closed():return "The verification browser session expired. Start a fresh safe recheck."
+    try:
+        current=urlparse(page.url); original=urlparse(session["application_url"])
+        validate_application_url(page.url)
+        if (current.scheme,current.hostname,current.port)!=(original.scheme,original.hostname,original.port):
+            return "The employer page navigated to a different origin. Review the official application manually."
+    except (ValueError,TypeError):
+        return "The employer page URL changed and cannot be revalidated safely."
+    if _interruption(page):return "The employer verification or authentication step is still present. Complete it in this browser window, then try again."
+    if _paused():return "Application processing is paused. Resume it in BabyStepsAI before continuing."
+    job=session["job"]
+    if not _mock_allowed(session["application_url"]):
+        try:
+            fresh_job=_get_job(DryRunRequest(job_key=session["job_key"]))
+        except (HTTPException,ValueError,sqlite3.Error):
+            return "The saved employer posting could not be revalidated. Continue manually at the official employer URL."
+        if (str(fresh_job.get("application_url") or "")!=session["application_url"] or
+                (session.get("job_fingerprint") and fresh_job.get("content_fingerprint")!=session["job_fingerprint"])):
+            return "The saved posting changed while verification was pending. Review it before continuing."
+        blocker=_posting_preparation_blocker(session["job_key"])
+        if blocker:return blocker
+        with connect() as db:
+            classification,reviewed,unresolved=_eligibility_gate(db,session["job_key"],session["resume_id"])
+        if classification not in {"potential_match","needs_review"} or unresolved or (classification=="needs_review" and not reviewed):
+            return "Eligibility evidence changed or is unresolved. Review it before continuing."
+        scope=_current_preparation_authorization(session["job_key"],session["resume_id"],session["application_url"])
+        prior=session.get("scope") or {}
+        if not scope or scope.get("authorization_id")!=prior.get("authorization_id"):
+            return "Job-specific authorization was revoked or changed. Review permissions before continuing."
+        if sorted(scope.get("field_keys") or [])!=sorted(prior.get("field_keys") or []) or sorted(scope.get("document_types") or [])!=sorted(prior.get("document_types") or []):
+            return "Authorized fields or documents changed. Review permissions before continuing."
+    with connect() as db:
+        row=db.execute("SELECT state,resume_id FROM applications WHERE id=? AND user_id=?",(app_id,USER)).fetchone()
+        reservation=db.execute("SELECT identity_hash FROM application_opening_reservations WHERE user_id=? AND application_id=?",(USER,app_id)).fetchone()
+        events=db.execute("SELECT outcome FROM manual_submission_events WHERE user_id=? AND application_id=?",(USER,app_id)).fetchall()
+        identity=_opening_identity(job)
+        owner=db.execute("SELECT application_id FROM application_opening_reservations WHERE user_id=? AND identity_hash=?",(USER,identity["hash"])).fetchone()
+    if not row or row["state"]!="needs_user_input" or row["resume_id"]!=session["resume_id"]:
+        return "The application or resume changed while verification was pending. Refresh before continuing."
+    if not reservation or not owner or owner["application_id"]!=app_id:
+        return "The duplicate reservation changed. Preparation is blocked until reviewed."
+    if any(item["outcome"] in {"submitted_manually","employer_confirmation_received","outcome_unknown","needs_follow_up"} for item in events):
+        return "A submitted or uncertain outcome is recorded. Automatic preparation is blocked."
+    return ""
+
+
+def _pause_for_same_browser_session(app_id,page,browser,job,resume,candidate,scope,report,diagnostic,blocker_code,reason):
+    """Keep a visible local Chromium page alive for bounded applicant verification."""
+    local_mock=_mock_allowed(job.get("application_url"))
+    resume_id=str((resume.get("id") if isinstance(resume,dict) else resume["id"]) or "")
+    # A headless browser cannot be handed to the applicant. Keep the already
+    # supported durable checkpoint/fresh-context recovery as the safe fallback.
+    if not same_browser_handoff_enabled(local_mock):return "unavailable"
+    if browser_launch_headless(local_mock) and not local_mock and os.getenv("BABYSTEPS_TEST_SAME_BROWSER_SESSION")!="1":return "unavailable"
+    with _human_sessions_lock:
+        if app_id in _human_sessions or len(_human_sessions)>=MAX_ACTIVE_HUMAN_SESSIONS:return "unavailable"
+        token=secrets.token_urlsafe(32)
+        session={"application_id":app_id,"user_id":USER,"job_key":str(job.get("job_key") or ""),
+            "employer":str(job.get("company") or ""),"title":str(job.get("title") or ""),
+            "application_url":str(job.get("application_url") or ""),"job_fingerprint":str(job.get("content_fingerprint") or ""),
+            "resume_id":resume_id,"scope":dict(scope or {}),"job":dict(job),
+            "page":page,"browser":browser,"headless":browser_launch_headless(local_mock),
+            "owner_thread_id":threading.get_ident(),"token":token,"expires_at":time.monotonic()+HUMAN_SESSION_TTL_SECONDS,
+            "command":None,"command_event":threading.Event(),"reply_event":threading.Event(),"reply":None,"state":"waiting"}
+        _human_sessions[app_id]=session
+    try:
+        diagnostic["message"]=reason
+        _save_human_action_checkpoint(app_id,job,scope,report,diagnostic,blocker_code,reason)
+        if not session["headless"]:page.bring_to_front()
+        while time.monotonic()<session["expires_at"]:
+            if page.is_closed():break
+            remaining=session["expires_at"]-time.monotonic()
+            if not session["command_event"].wait(min(remaining,0.5)):continue
+            with _human_sessions_lock:
+                command=session.get("command");session["command"]=None
+                session["command_event"].clear();session["reply_event"].clear()
+            if command=="open":
+                try:
+                    if not page.is_closed() and not session["headless"]:page.bring_to_front()
+                    session["reply"]={"status":"active","message":"The original employer form is open in its existing browser window."}
+                except Exception:
+                    session["reply"]={"status":"expired","message":"The employer browser session is no longer available."}
+            elif command=="cancel":
+                session["state"]="cancelled"
+                session["reply"]={"status":"closed","message":"The verification session was closed. Continue manually or request a fresh safe recheck."}
+                session["reply_event"].set()
+                diagnostic["message"]="The applicant closed the verification browser. No browser state was saved; use a fresh safe recheck only after reviewing current eligibility and authorization."
+                _update(app_id,"needs_user_input",diagnostic)
+                _record_application_attention(job,"human_verification",diagnostic["message"],eligibility_state="needs_review",form_state="verification_session_closed",report=report if isinstance(report,dict) else {})
+                return "handled"
+            elif command=="shutdown":
+                session["state"]="expired"
+                session["reply"]={"status":"expired","message":"The local BabyStepsAI server is shutting down. The browser session will close without saving browser state."}
+                session["reply_event"].set()
+                return "handled"
+            elif command=="continue":
+                blocker=_same_session_recheck_blocker(session,page)
+                if blocker:
+                    session["reply"]={"status":"blocked","message":blocker}
+                else:
+                    session["state"]="continuing"
+                    session["reply"]={"status":"continuing","message":"Verification cleared. BabyStepsAI is continuing in the same browser session."}
+                    session["reply_event"].set()
+                    _archive_same_session_checkpoint(diagnostic)
+                    return True
+            else:
+                session["reply"]={"status":"expired","message":"The verification session request was invalid."}
+            session["reply_event"].set()
+    except Exception:
+        pass
+    finally:
+        with _human_sessions_lock:
+            if _human_sessions.get(app_id) is session:_human_sessions.pop(app_id,None)
+    diagnostic["message"]="The same-browser verification session expired or closed. No browser state was saved. Use the fresh-session recheck only after reviewing current eligibility and authorization."
+    _update(app_id,"needs_user_input",diagnostic)
+    _record_application_attention(job,"human_verification",diagnostic["message"],eligibility_state="needs_review",
+        form_state="verification_session_expired",report=report if isinstance(report,dict) else {})
+    return "handled"
+
+
+@router.on_event("shutdown")
+def shutdown_human_verification_sessions():
+    with _human_sessions_lock:sessions=list(_human_sessions.values())
+    for session in sessions:
+        with _human_sessions_lock:
+            if session.get("command") is None:
+                session["command"]="shutdown";session["reply_event"].clear();session["command_event"].set()
+    deadline=time.monotonic()+3
+    for session in sessions:session["reply_event"].wait(max(0,deadline-time.monotonic()))
+    while time.monotonic()<deadline:
+        with _human_sessions_lock:
+            if not _human_sessions:break
+        time.sleep(.02)
+
+
+def _local_handoff_request(request):
+    """Restrict browser-session control to same-origin requests from loopback."""
+    try:
+        peer=ipaddress.ip_address(str(request.client.host if request.client else ""))
+        host=str(request.headers.get("host") or "")
+        origin_value=str(request.headers.get("origin") or "")
+        if not origin_value:origin_value=str(request.headers.get("referer") or "")
+        origin=urlparse(origin_value)
+        if origin.path not in {"","/"}:
+            origin=urlparse(f"{origin.scheme}://{origin.netloc}")
+        host_name=urlparse("//"+host).hostname or ""
+        host_loopback=host_name.casefold()=="localhost" or ipaddress.ip_address(host_name).is_loopback
+        return bool(peer.is_loopback and host_loopback and origin.scheme in {"http","https"} and
+            origin.netloc.casefold()==host.casefold() and origin.path in {"","/"} and not origin.query and not origin.fragment)
+    except (ValueError,TypeError):
+        return False
+
+
+def _get_live_human_session(application_id,request):
+    if not _local_handoff_request(request):raise HTTPException(403,"Verification-session controls are available only from the local BabyStepsAI page.")
+    token=str(request.headers.get("x-bsa-handoff-token") or "")
+    with _human_sessions_lock:
+        session=_human_sessions.get(application_id)
+        if not session or session["user_id"]!=USER or time.monotonic()>=session["expires_at"]:
+            raise HTTPException(410,"The employer browser session expired. Use the safe fresh-session recheck if it is still available.")
+        if not token or not secrets.compare_digest(token,session["token"]):
+            raise HTTPException(403,"This verification-session link is invalid or expired.")
+        if session.get("command") is not None:raise HTTPException(409,"A verification-session action is already in progress.")
+        return session
+
+
+def _send_human_session_command(session,command):
+    with _human_sessions_lock:
+        if session.get("command") is not None:raise HTTPException(409,"A verification-session action is already in progress.")
+        session["reply"]=None;session["reply_event"].clear();session["command"]=command;session["command_event"].set()
+    if not session["reply_event"].wait(5):
+        raise HTTPException(504,"The employer browser session did not respond. Refresh status and do not start a duplicate attempt.")
+    return session.get("reply") or {"status":"unknown","message":"The browser session did not return a status."}
+
+
+@router.post("/api/applications/{application_id}/verification-session/{action}")
+def control_human_verification_session(application_id:str,action:str,request:Request):
+    if action not in {"open","continue","cancel"}:raise HTTPException(404,"Unknown verification-session action.")
+    session=_get_live_human_session(application_id,request)
+    if action=="continue":
+        if session.get("state")!="waiting":raise HTTPException(409,"The browser session is not waiting for applicant verification.")
+        reply=_send_human_session_command(session,"continue")
+        if reply.get("status")=="continuing":return {**reply,"same_browser_session":True,"submission_enabled":False}
+        raise HTTPException(409,reply.get("message") or "The human-verification step remains unresolved.")
+    reply=_send_human_session_command(session,action)
+    return {**reply,"same_browser_session":reply.get("status")=="active","submission_enabled":False}
+
+
+@router.get("/api/applications/{application_id}/verification-session")
+def get_human_verification_session(application_id:str,request:Request,response:Response):
+    if not _local_handoff_request(request):raise HTTPException(403,"Verification sessions are available only from the local BabyStepsAI page.")
+    with _human_sessions_lock:
+        session=_human_sessions.get(application_id)
+        if not session or session["user_id"]!=USER or time.monotonic()>=session["expires_at"]:
+            raise HTTPException(410,"The employer browser session expired. Use a safe fresh-session recheck if it is still available.")
+        result={"application_id":application_id,"token":session["token"],"expires_in_seconds":max(0,int(session["expires_at"]-time.monotonic())),"state":session["state"]}
+    response.headers["Cache-Control"]="no-store, private"
+    response.headers["Pragma"]="no-cache"
+    return result
 
 
 class _ManagedPlaywrightContext:
@@ -2691,10 +2934,10 @@ def _fill_page(page,candidate,answers,resume_path,on_upload=None):
             report.append({"field":info.get("label") or info.get("name") or "Question","result":"filled",
                            "source":source if source=="ai_draft" else ("verified_profile" if source in candidate else "confirmed_answer"),
                            "required":bool(info.get("required"))})
-        except Exception:
+        except Exception as exc:
             if info.get("type")=="file":
                 missing.append("The active resume could not be uploaded. Check the employer's accepted file format and retry.")
-                report.append({"field":"Resume upload","result":"upload_failed"})
+                report.append({"field":"Resume upload","result":"upload_failed","failure_category":"upload_error","error_type":type(exc).__name__})
             elif info.get("required"): missing.append("A required field could not be filled: "+(info.get("label") or "application question"))
     # Support accessible custom selects only when an exact normalized option
     # exists; do not guess among fuzzy employer-specific choices.
@@ -2857,10 +3100,10 @@ def inspect_public_application_form(url):
     except (TypeError, ValueError):
         return {"application_url": "", "inspection_outcome": "inaccessible",
                 "reason": "This destination is not a permitted public HTTPS page.","failure_category":"unsafe_destination"}
-    if not _inspection_lock.acquire(blocking=False):
+    if not _inspection_lock.acquire(timeout=20):
         return {"application_url": clean_url, "inspection_outcome": "inaccessible",
                 "provider":provider,"form_detected":False,"page_classification":"not_inspected",
-                "reason": "Another public form inspection is already running. Try again shortly."}
+                "reason": "Another public form inspection remained active past the bounded wait. Try again shortly."}
     browser = context = page = None
     policy_state={}
     try:
@@ -3196,16 +3439,28 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
             answers=_scoped_answers(answers,scope)
             diagnostic["phase"]="read_only_preflight"
             _update(app_id,"inspecting",diagnostic)
-            preflight=inspect_public_application_form(job["application_url"])
+            if not _application_preflight_lock.acquire(timeout=35):
+                preflight={"application_url":job["application_url"],"inspection_outcome":"inaccessible",
+                    "form_detected":False,"page_classification":"not_inspected",
+                    "reason":"A previous application form inspection exceeded the bounded wait.",
+                    "failure_category":"inspection_busy"}
+            else:
+                try:preflight=inspect_public_application_form(job["application_url"])
+                finally:_application_preflight_lock.release()
             preflight=_save_form_inspection(job,preflight,preparation_preflight=True)
             blocker=_preparation_inspection_blocker(preflight)
+            actions=[str(item).casefold() for item in (preflight.get("human_actions_required") or [])]
+            verification_only=bool(preflight.get("form_detected") and actions and
+                all(any(word in item for word in ("captcha","human verification","verification code","email verification")) for item in actions) and
+                not any(any(word in item for word in ("legal","terms","declaration","authentication","sign in","password")) for item in actions) and
+                same_browser_handoff_enabled(local_mock))
             diagnostic["compatibility_report"]={key:preflight.get(key) for key in
                 ("provider","form_detected","page_classification","inspection_outcome","compatibility_status","page_metadata","canonical_application_url","inspection_timestamp","form_fingerprint","required_fields","unsupported_fields",
                  "required_control_count","total_dom_control_count","visible_form_control_count","required_dom_control_count","unique_question_count","unique_required_question_count","unique_optional_question_count","unique_unknown_requirement_question_count",
                  "questions","unresolved_controls","ignored_controls","ignored_control_count","conditional_questions","conditional_detection_note",
                  "file_upload_controls","upload_prompts","upload_control_details","human_actions_required","multi_step_detected","submission_control_detected","submission_controls",
                  "submission_control_status","blocked_non_read_only_request_count","blocked_non_read_only_requests","robots_policy","form_fingerprint","reason")}
-            if blocker:
+            if blocker and not verification_only:
                 diagnostic["message"]=blocker
                 diagnostic["human_actions_required"]=list(preflight.get("human_actions_required") or [])
                 diagnostic["unanswered_fields"]=[blocker]
@@ -3226,7 +3481,7 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
         if not resume_path.is_file(): raise RuntimeError("The active resume file is unavailable.")
         with _ManagedPlaywrightContext(sync_playwright) as p:
             diagnostic["phase"]="browser_launch"
-            browser=p.chromium.launch(headless=browser_headless());p.attach(None,browser)
+            browser=p.chromium.launch(headless=browser_launch_headless(local_mock));p.attach(None,browser)
             context=browser.new_context(accept_downloads=False); page=context.new_page();p.attach(page,browser)
             page.set_default_timeout(20000)
             page.route("**/*",lambda route:_guard_browser_request(route,policy_state))
@@ -3253,14 +3508,22 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                 validate_application_url(page.url)
                 _update(app_id,"inspecting",diagnostic)
                 interruption=_interruption(page)
+                if interruption in {"human_verification","authentication_required"}:
+                    reason=("Human verification detected. Complete it yourself in the visible employer browser; no bypass was attempted." if interruption=="human_verification"
+                        else "The employer requires authentication. Sign in yourself in the visible employer browser; BabyStepsAI does not collect credentials.")
+                    handoff=_pause_for_same_browser_session(app_id,page,browser,job,resume,candidate,scope,preflight,diagnostic,interruption,reason)
+                    if handoff is True:
+                        diagnostic["message"]="The human step cleared in the same browser session. Continuing only with currently authorized information."
+                        interruption=None
+                    else:
+                        _close_browser_safely(page,browser)
+                        if handoff=="unavailable":_save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,reason,resume_count=checkpoint_resume_count)
+                        return
                 if interruption:
                     diagnostic["message"]={"human_verification":"Human verification detected. No bypass was attempted.","authentication_required":"The employer requires sign-in. Complete authentication manually before retrying.","expired_listing":"This job listing appears expired or closed.","automation_restricted":"This employer page says automated application preparation is not permitted. The dry run stopped."}[interruption]
                     _close_browser_safely(page,browser)
-                    if interruption in {"human_verification","authentication_required"}:
-                        _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"],resume_count=checkpoint_resume_count)
-                    else:
-                        diagnostic["screenshot"]=_screenshot(page,app_id)
-                        _update(app_id,"unsupported",diagnostic)
+                    diagnostic["screenshot"]=_screenshot(page,app_id)
+                    _update(app_id,"unsupported",diagnostic)
                     return
                 if _has_form_fields(page): break
                 links=_apply_links(page)
@@ -3313,10 +3576,17 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                     diagnostic["message"]=messages.get(interruption,"The employer requires a human action.")
                     diagnostic["human_actions_required"]=[diagnostic["message"]]
                     diagnostic["unanswered_fields"]=[diagnostic["message"]]
-                    _close_browser_safely(page,browser)
                     if interruption in {"human_verification","authentication_required"}:
-                        _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"])
+                        handoff=_pause_for_same_browser_session(app_id,page,browser,job,resume,candidate,scope,preflight,diagnostic,interruption,diagnostic["message"])
+                        if handoff is True:
+                            diagnostic["human_actions_required"]=[];diagnostic["unanswered_fields"]=[]
+                            _update(app_id,"filling",diagnostic)
+                            continue
+                        _close_browser_safely(page,browser)
+                        if handoff=="unavailable":_save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"],resume_count=checkpoint_resume_count)
+                        return
                     else:
+                        _close_browser_safely(page,browser)
                         diagnostic["screenshot"]=_screenshot(page,app_id)
                         _update(app_id,"unsupported",diagnostic)
                     return
@@ -3336,6 +3606,10 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                         diagnostic["screenshot"]=_screenshot(page,app_id);_close_browser_safely(page,browser);_update(app_id,"needs_user_input",diagnostic);return
                 def mark_upload(): _update(app_id,"uploading_resume",diagnostic)
                 filled,unanswered,drafts=_fill_page(page,candidate,answers,resume_path,on_upload=mark_upload)
+                resolved_required={normalize_text(item.get("field")) for item in filled if item.get("result")=="filled"}
+                if any(item.get("result")=="filled" and item.get("source")=="active_resume" for item in filled):resolved_required.add("resume")
+                missing=[item for item in missing if not (str(item).startswith("Required field is still empty: ") and
+                    normalize_text(str(item).split(":",1)[-1]) in resolved_required)]
                 diagnostic["filled_fields"].extend(filled); missing.extend(unanswered); diagnostic["draft_answers"].extend(drafts); diagnostic["steps"]=step+1
                 missing.extend("Required field is still empty: "+str(label) for label in _required_field_issues(page))
                 diagnostic["required_fields"]=list(dict.fromkeys(
@@ -3352,9 +3626,14 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                 interruption=_interruption(page)
                 if interruption in {"human_verification","authentication_required"}:
                     diagnostic["message"]=("Human verification detected. No bypass was attempted." if interruption=="human_verification"
-                        else "The employer requires sign-in. Complete authentication manually before requesting a fresh-session recheck.")
+                        else "The employer requires authentication. Sign in yourself in the visible employer browser; BabyStepsAI does not collect credentials.")
+                    handoff=_pause_for_same_browser_session(app_id,page,browser,job,resume,candidate,scope,preflight,diagnostic,interruption,diagnostic["message"])
+                    if handoff is True:
+                        diagnostic["human_actions_required"]=[];diagnostic["unanswered_fields"]=[]
+                        _update(app_id,"filling",diagnostic)
+                        continue
                     _close_browser_safely(page,browser)
-                    _save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"],resume_count=checkpoint_resume_count)
+                    if handoff=="unavailable":_save_human_action_checkpoint(app_id,job,scope,preflight,diagnostic,interruption,diagnostic["message"],resume_count=checkpoint_resume_count)
                     return
                 if interruption in {"expired_listing","automation_restricted"}:
                     diagnostic["message"]="The employer page no longer permits safe preparation. Review it manually at the official posting."
@@ -3437,22 +3716,26 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
         _update(app_id,"failed",diagnostic,name)
 
 
-def process_application(app_id,job,resume,candidate,answers):
+def process_application(app_id,job,resume,candidate,answers,*,claimed=False):
     with _attempt_lock:
-        if app_id in _active_attempts:
+        if app_id in _active_attempts and not claimed:
             return
-        _active_attempts.add(app_id)
+        if not claimed:_active_attempts.add(app_id)
     try:
         return _process_application_inner(app_id,job,resume,candidate,answers)
     finally:
         with _attempt_lock:
             _active_attempts.discard(app_id)
+        with connect() as db:pending=db.execute("SELECT 1 FROM applications WHERE user_id=? AND state='queued' LIMIT 1",(USER,)).fetchone()
+        if pending:_schedule_application_queue()
 
 
 def _drain_application_queue():
     global _queue_worker_running
     try:
         while not _paused():
+            with _attempt_lock:
+                if len(_active_attempts)>=MAX_APPLICATION_BROWSER_WORKERS:break
             with connect() as db:
                 row=db.execute("SELECT * FROM applications WHERE user_id=? AND state='queued' ORDER BY queue_priority DESC,created_at ASC LIMIT 1",(USER,)).fetchone()
             if not row: break
@@ -3485,7 +3768,24 @@ def _drain_application_queue():
                 if not _mock_allowed(row["application_url"]):
                     candidate=_scoped_candidate(candidate,scope)
                     answers=_scoped_answers(answers,scope)
-                process_application(row["id"],job,resume,candidate,answers)
+                app_id=row["id"]
+                with _attempt_lock:
+                    if len(_active_attempts)>=MAX_APPLICATION_BROWSER_WORKERS:break
+                    if app_id in _active_attempts:continue
+                    _active_attempts.add(app_id)
+                with connect() as db:
+                    changed=db.execute("UPDATE applications SET state='opening',state_changed_at=?,updated_at=? WHERE id=? AND state='queued'",
+                        (now(),now(),app_id)).rowcount
+                    if changed:db.execute("UPDATE application_attempts SET state='opening',state_changed_at=?,updated_at=? WHERE application_id=? AND attempt_number=(SELECT attempt_number FROM applications WHERE id=?)",
+                        (now(),now(),app_id,app_id))
+                if not changed:
+                    with _attempt_lock:_active_attempts.discard(app_id)
+                    continue
+                try:application_executor.submit(process_application,app_id,job,resume,candidate,answers,claimed=True)
+                except Exception:
+                    with _attempt_lock:_active_attempts.discard(app_id)
+                    _update(app_id,"queued",{"mode":"dry_run","submission_performed":False,"message":"The browser worker could not start. The existing attempt remains queued.","failure_code":"worker_start_failed"})
+                    break
             except HTTPException as error:
                 _update(row["id"],"needs_user_input",{"mode":"dry_run","submission_performed":False,"message":"Candidate information is needed before this dry run can start.","unanswered_fields":[str(error.detail)[:300]]})
             except Exception as error:
@@ -3494,7 +3794,8 @@ def _drain_application_queue():
         with _queue_worker_lock: _queue_worker_running=False
     with connect() as db:
         pending=db.execute("SELECT 1 FROM applications WHERE user_id=? AND state='queued' LIMIT 1",(USER,)).fetchone()
-    if pending and not _paused(): _schedule_application_queue()
+    with _attempt_lock:has_capacity=len(_active_attempts)<MAX_APPLICATION_BROWSER_WORKERS
+    if pending and has_capacity and not _paused(): _schedule_application_queue()
 
 
 def _schedule_application_queue():
@@ -3594,7 +3895,7 @@ def start_dry_run(request:DryRunRequest):
     candidate,answers=_authorized_preparation_payload(job,resume,candidate,answers)
     app_id,state,created=_create(job,resume)
     if state=="skipped_duplicate": return {"application_id":app_id,"status":state,"message":"Already submitted; duplicate prevented."}
-    if created: executor.submit(process_application,app_id,job,resume,candidate,answers)
+    if created: application_executor.submit(process_application,app_id,job,resume,candidate,answers)
     messages={"queued":"Preparing application. The selected dry run is queued.","opening":"This application is already being prepared.","inspecting":"This application is already finding its application form.","filling":"This application is already filling confirmed information.","uploading_resume":"This application is already uploading the resume.","needs_user_input":"This attempt needs your input. Review its missing questions before retrying.","ready_for_review":"This application is already ready for your review.","paused":"This attempt is paused. Resume it explicitly when ready.","failed":"A previous attempt failed. Review its diagnostics and retry explicitly.","unsupported":"A previous attempt stopped at an unsupported workflow. Review diagnostics before retrying."}
     return {"application_id":app_id,"status":state,"mode":"dry_run","created":created,"message":messages.get(state,"Existing application status: "+state.replace("_"," ")+".")}
 
@@ -4249,15 +4550,22 @@ def list_application_attention():
             resume_allowed=bool(readiness.get("human_verification_resume_allowed"))
         item.pop("current_application_state",None)
         item.pop("application_resume_id",None)
+        with _human_sessions_lock:
+            live_session=_human_sessions.get(str(item.get("application_id") or ""))
+            if live_session and time.monotonic()>=live_session["expires_at"]:live_session=None
+            live_active=bool(live_session and live_session.get("state") in {"waiting","continuing"})
         item["human_verification_checkpoint"]={
             "available":bool(item.get("application_id") and item.get("blocker_code")=="human_verification"
-                and application_state=="needs_user_input" and checkpoint and resume_allowed),
-            "browser_session_available":False,
+                and application_state=="needs_user_input" and checkpoint and resume_allowed and not live_active),
+            "browser_session_available":live_active,
             "browser_session_persisted":False,
             "resume_count":max(0,min(3,int(checkpoint.get("resume_count") or 0))),
             "progress":checkpoint.get("progress") if isinstance(checkpoint.get("progress"),dict) else {},
             "resume_upload_verified":bool(checkpoint.get("resume_upload_verified")),
-            "message":"The prior browser session is closed. Continuing opens a fresh session and rechecks the form; previously entered values are not assumed to persist." if checkpoint else "",
+            "message":("The original employer browser session is active for this device; finish the verification in that window before continuing." if live_active else
+                "The prior browser session is closed. Continuing opens a fresh session and rechecks the form; previously entered values are not assumed to persist." if checkpoint else ""),
+            "browser_session_active":live_active,
+            "browser_session_expires_in_seconds":max(0,int(live_session["expires_at"]-time.monotonic())) if live_active else 0,
         }
         for key in ("posting_url","application_url"):
             try:item[key]=urlparse(str(item.get(key) or ""))._replace(query="",fragment="").geturl()
@@ -4567,7 +4875,7 @@ def resume_processing():
                 job=_get_job(DryRunRequest(job_key=row["job_key"]))
                 job.update({"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]})
                 scoped_candidate=_scoped_candidate(candidate,scope);scoped_answers=_scoped_answers(_application_context(job,answers),scope)
-            executor.submit(process_application,row["id"],row,resume,scoped_candidate,scoped_answers)
+            application_executor.submit(process_application,row["id"],row,resume,scoped_candidate,scoped_answers)
     return {"paused":False,"resumed":len(resumable),"needs_explicit_retry":sum("interrupted" in value["reason"].lower() for value in waiting),"waiting_for_original_resume":len(waiting),"blocked":waiting}
 
 @router.get("/api/applications/progress")
@@ -4616,7 +4924,7 @@ def resume_one(application_id:str):
         job=_get_job(DryRunRequest(job_key=row["job_key"]))
         job.update({"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]})
         candidate=_scoped_candidate(candidate,scope);answers=_scoped_answers(_application_context(job,answers),scope)
-    executor.submit(process_application,application_id,dict(row),resume,candidate,answers)
+    application_executor.submit(process_application,application_id,dict(row),resume,candidate,answers)
     return {"application_id":application_id,"status":"queued","resumed_existing_attempt":True,"new_attempt_created":False}
 
 
@@ -4751,7 +5059,7 @@ def retry_one(application_id:str):
         job=_get_job(DryRunRequest(job_key=row["job_key"]))
         job.update({"job_key":row["job_key"],"company":row["company"],"title":row["title"],"application_url":row["application_url"]})
         candidate=_scoped_candidate(candidate,scope);answers=_scoped_answers(_application_context(job,answers),scope)
-    executor.submit(process_application,application_id,row,resume,candidate,answers)
+    application_executor.submit(process_application,application_id,row,resume,candidate,answers)
     return {"application_id":application_id,"status":"queued","new_attempt_created":True,"attempt_number":number}
 
 @router.get("/applications",response_class=HTMLResponse)
@@ -5511,5 +5819,27 @@ refresh=async function(){
   try{const [apps,handoffs]=await Promise.all([req('/api/applications'),req('/api/applications/attention')]);
     const active=document.activeElement;if(!(active&&active!==document.body&&active.closest('#attention-inbox'))){renderAttentionInbox(apps);renderHandoffs(handoffs.items||[])}
   }catch(error){say(readableApiError(error.message))}
+};
+</script></body></html>""")
+
+APPLICATIONS_PAGE = APPLICATIONS_PAGE.replace("</body></html>", """<script>
+async function phaseSameSessionAction(applicationId,action){
+  await runBusy(action==='open'?'Opening the existing employer browser…':action==='cancel'?'Closing the employer verification session…':'Rechecking the existing employer session…',async()=>{
+    const base='/api/applications/'+encodeURIComponent(applicationId)+'/verification-session';
+    const session=await req(base);const result=await req(base+'/'+action,{method:'POST',headers:{'X-BSA-Handoff-Token':session.token}});
+    say(result.message||'Verification-session status updated.');setTimeout(()=>refresh(),0);
+  });
+}
+const phaseSameSessionRenderHandoffs=renderHandoffs;
+renderHandoffs=function(items){
+  phaseSameSessionRenderHandoffs(items);
+  const box=document.querySelector('#attention-inbox');if(!box)return;
+  for(const item of items){const state=item.human_verification_checkpoint;if(!state?.browser_session_active||!item.application_id)continue;
+    const card=[...box.querySelectorAll('[data-attention-id]')].find(node=>node.dataset.attentionId===item.attention_id);if(!card)continue;
+    card.append(node('p','sub','The same employer browser is active on this device for '+state.browser_session_expires_in_seconds+' more seconds. Complete verification directly in that browser; BabyStepsAI never reads CAPTCHA answers, passwords, or codes.'));
+    for(const [action,label,primary] of [['open','Open verification session',false],['continue','Continue after verification',true],['cancel','Close verification session',false]]){
+      const button=node('button',primary?'primary':'',label);button.type='button';button.onclick=()=>phaseSameSessionAction(item.application_id,action);card.append(button);
+    }
+  }
 };
 </script></body></html>""")

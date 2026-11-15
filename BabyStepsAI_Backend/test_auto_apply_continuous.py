@@ -114,6 +114,10 @@ class ContinuousAutoApplyTests(unittest.TestCase):
         (root / "private_resumes").mkdir()
         self.old_key = os.environ.get("BABYSTEPSAI_KEY_PATH")
         os.environ["BABYSTEPSAI_KEY_PATH"] = str(root / "synthetic-encryption.key")
+        self.old_session_test=os.environ.get("BABYSTEPS_TEST_SAME_BROWSER_SESSION")
+        self.old_handoff=os.environ.get("BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF")
+        os.environ["BABYSTEPS_TEST_SAME_BROWSER_SESSION"]="1"
+        os.environ["BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF"]="true"
 
         with sqlite3.connect(self.db) as db:
             db.executescript("""
@@ -133,6 +137,7 @@ class ContinuousAutoApplyTests(unittest.TestCase):
         workflows.initialize()
 
     def tearDown(self):
+        app_agent.shutdown_human_verification_sessions()
         for module, db_path in self.old_dbs.items():
             module.DB = db_path
         main.STORAGE, app_agent.STORAGE, app_agent.ARTIFACTS = self.old_storage
@@ -141,6 +146,10 @@ class ContinuousAutoApplyTests(unittest.TestCase):
             os.environ.pop("BABYSTEPSAI_KEY_PATH", None)
         else:
             os.environ["BABYSTEPSAI_KEY_PATH"] = self.old_key
+        if self.old_session_test is None:os.environ.pop("BABYSTEPS_TEST_SAME_BROWSER_SESSION",None)
+        else:os.environ["BABYSTEPS_TEST_SAME_BROWSER_SESSION"]=self.old_session_test
+        if self.old_handoff is None:os.environ.pop("BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF",None)
+        else:os.environ["BABYSTEPS_ENABLE_SAME_BROWSER_HANDOFF"]=self.old_handoff
         self.temp.cleanup()
 
     def test_continuous_synthetic_auto_apply_journey(self):
@@ -160,13 +169,26 @@ class ContinuousAutoApplyTests(unittest.TestCase):
         <h1>Software Engineer Application</h1><form><label>Full Name <input name="name" required></label>
         <label>Email <input name="email" required></label><label>Resume <input type="file" name="resume" required></label>
         <button type="submit">Submit application</button>
-        <script>document.querySelector('input[name=name]').addEventListener('input',()=>{if(!window.__syntheticChallenge){window.__syntheticChallenge=true;const box=document.createElement('div');box.className='g-recaptcha';box.dataset.sitekey='synthetic-site-key';box.textContent='Synthetic human verification';document.querySelector('form').append(box)}})</script></form></body></html>'''
+        <button id="synthetic-human-complete" type="button" hidden onclick="document.querySelector('.g-recaptcha')?.remove();this.hidden=true">Complete synthetic verification</button>
+        <script>document.querySelector('input[name=name]').addEventListener('input',()=>{if(!window.__syntheticChallenge){window.__syntheticChallenge=true;const box=document.createElement('div');box.className='g-recaptcha';box.dataset.sitekey='synthetic-site-key';box.textContent='Synthetic human verification';document.querySelector('form').append(box);document.querySelector('#synthetic-human-complete').hidden=false}})</script></form></body></html>'''
         human_form_after_verification = b'''<!doctype html><html><head><title>Synthetic application</title></head><body>
         <h1>Software Engineer Application</h1><form><label>Full Name <input name="name" required></label>
         <label>Email <input name="email" required></label><label>Resume <input type="file" name="resume" required></label>
         <button type="submit">Submit application</button></form></body></html>'''
 
         class Handler(BaseHTTPRequestHandler):
+            def framework_request(self):
+                from starlette.requests import Request as StarletteRequest
+                headers=[(key.casefold().encode(),value.encode()) for key,value in self.headers.items()]
+                return StarletteRequest({"type":"http","http_version":"1.1","method":self.command,
+                    "scheme":"http","server":self.server.server_address,"client":self.client_address,
+                    "root_path":"","path":self.path.split("?",1)[0],"raw_path":self.path.split("?",1)[0].encode(),
+                    "query_string":self.path.split("?",1)[1].encode() if "?" in self.path else b"","headers":headers})
+            def json_response(self,payload,status=200,headers=None):
+                body=json.dumps(payload,default=str).encode("utf-8");self.send_response(status)
+                self.send_header("Content-Type","application/json")
+                for key,value in (headers or {}).items():self.send_header(key,value)
+                self.end_headers();self.wfile.write(body)
             def do_GET(self):
                 if self.path=="/dashboard":
                     payload=app_agent.apply_ui_theme(app_agent.APPLICATIONS_PAGE).encode("utf-8")
@@ -178,6 +200,15 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     else: payload=app_agent.grouped_application_questions()
                     body=json.dumps(payload,default=str).encode("utf-8")
                     self.send_response(200);self.send_header("Content-Type","application/json");self.end_headers();self.wfile.write(body);return
+                if re.fullmatch(r"/api/applications/[0-9a-f-]{36}/verification-session",self.path):
+                    app_id=self.path.split("/")[-2]
+                    try:
+                        from fastapi.responses import Response
+                        headers=Response();payload=app_agent.get_human_verification_session(app_id,self.framework_request(),headers)
+                        response_headers={key:value for key,value in headers.headers.items() if key.casefold()!="content-length"}
+                        self.json_response(payload,headers=response_headers)
+                    except HTTPException as error:self.json_response({"detail":error.detail},error.status_code)
+                    return
                 if self.path == "/synthetic-employer/apply/req-42":
                     if self.headers.get("X-Synthetic-Redirect") == "1":
                         redirect_served.append(self.path)
@@ -197,6 +228,11 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     self.send_error(404)
 
             def do_POST(self):
+                if re.fullmatch(r"/api/applications/[0-9a-f-]{36}/verification-session/(open|continue|cancel)",self.path):
+                    parts=self.path.split("/");app_id=parts[3];action=parts[-1]
+                    try:payload=app_agent.control_human_verification_session(app_id,action,self.framework_request());status=200
+                    except HTTPException as error:handoff_responses.append({"server_error":error.detail});payload={"detail":error.detail};status=error.status_code
+                    self.json_response(payload,status);return
                 if re.fullmatch(r"/api/applications/[0-9a-f-]{36}/verification-resume",self.path):
                     app_id=self.path.split("/")[-2]
                     try:
@@ -230,6 +266,15 @@ class ContinuousAutoApplyTests(unittest.TestCase):
 
             with ExitStack() as stack:
                 adapter.activate(stack)
+                original_recheck=app_agent._same_session_recheck_blocker
+                def synthetic_applicant_verification(session,page):
+                    if verification_completed[0] and session.get("job_key")=="ashby:synthetic-board:req-44":
+                        # Test-only, explicit synthetic applicant action. The worker
+                        # thread clicks the fixture's fake control so Playwright stays
+                        # on its owning thread; production CAPTCHA handling is untouched.
+                        page.get_by_role("button",name="Complete synthetic verification").click(timeout=2000)
+                    return original_recheck(session,page)
+                stack.enter_context(patch.object(app_agent,"_same_session_recheck_blocker",side_effect=synthetic_applicant_verification))
                 with patch.object(main, "extract_pdf_text", return_value="Synthetic Candidate\nPython developer"), \
                      patch.object(main, "enqueue", return_value={"status": "queued"}):
                     uploaded = asyncio.run(main.upload_resume(UploadFile(filename="synthetic.pdf",
@@ -345,10 +390,27 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                 stack.enter_context(patch.object(app_agent.executor, "submit", side_effect=lambda fn, *args: fn(*args)))
                 browser_inputs = []
                 browser_contexts = []
+                upload_errors=[]
+                original_update=app_agent._update
+                def observe_state_update(app_id,state,diagnostic=None,error=None):
+                    try:return original_update(app_id,state,diagnostic,error)
+                    except Exception as exc:
+                        upload_errors.append({"state":state,"type":type(exc).__name__,"reason":str(exc)[:180]})
+                        raise
+                stack.enter_context(patch.object(app_agent,"_update",side_effect=observe_state_update))
+                from playwright.sync_api import Locator
+                original_set_input_files=Locator.set_input_files
+                def observe_upload_error(locator,*args,**kwargs):
+                    try:return original_set_input_files(locator,*args,**kwargs)
+                    except Exception as error:
+                        upload_errors.append({"type":type(error).__name__,"message":str(error).replace(str(self.storage),"[synthetic-storage]")[:240]})
+                        raise
+                stack.enter_context(patch.object(Locator,"set_input_files",observe_upload_error))
                 original_fill_page = app_agent._fill_page
                 def observe_fill(page, candidate, answers, resume_path, **kwargs):
                     browser_contexts.append(page.context)
                     observation={"page_url":page.url,"browser_context_index":len(browser_contexts)-1,"candidate": dict(candidate),
+                        "synthetic_resume_available":bool(resume_path and Path(resume_path).is_file()),
                         "answers": {"name": app_agent._answer({"label":"Full Name"},candidate,answers),
                                     "email": app_agent._answer({"label":"Email"},candidate,answers),
                                     "phone": app_agent._answer({"label":"Phone"},candidate,answers)}}
@@ -385,7 +447,7 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                         states={row["job_key"]:row["state"] for row in db.execute(
                             "SELECT job_key,state FROM applications WHERE job_key IN (?,?)",
                             ("ashby:synthetic-board:req-42","ashby:synthetic-board:req-44"))}
-                    if states.get("ashby:synthetic-board:req-42")=="ready_for_review" and states.get("ashby:synthetic-board:req-44")=="needs_user_input":break
+                    if states.get("ashby:synthetic-board:req-42")=="ready_for_review" and states.get("ashby:synthetic-board:req-44") in {"needs_user_input","failed","unsupported"} and app_agent.list_application_attention()["items"]:break
                     time.sleep(.05)
                 with jobs.database() as db:
                     opening = db.execute("SELECT * FROM discovered_openings WHERE job_key='ashby:synthetic-board:req-42'").fetchone()
@@ -401,7 +463,7 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                         self.fail("Scheduler workflow did not create an application: " + json.dumps(details))
                     grant = db.execute("SELECT authorization_source,field_keys_json,document_types_json FROM application_preparation_authorizations WHERE job_key=? AND revoked_at IS NULL",
                                        ("ashby:synthetic-board:req-42",)).fetchone()
-                    human_app = db.execute("SELECT id,state,attempt_number,diagnostic_json FROM applications WHERE job_key=?",
+                    human_app = db.execute("SELECT id,state,attempt_number,diagnostic_json,error FROM applications WHERE job_key=?",
                                            ("ashby:synthetic-board:req-44",)).fetchone()
                     reservation_count = db.execute("SELECT COUNT(*) FROM application_opening_reservations WHERE application_id=?",
                                                     (app["id"],)).fetchone()[0]
@@ -437,9 +499,12 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                     "email":"synthetic@example.test","phone":"555-0102"})
                 self.assertEqual(browser_inputs[0]["resume_upload_count"], 1)
                 self.assertEqual(other_states,{"ashby:synthetic-board:req-43":"current","ashby:synthetic-board:req-44":"current"})
-                self.assertEqual(len(routed),2,routed)
+                self.assertIsNotNone(human_app,json.dumps({"attention":routed,"browser_inputs":browser_inputs}))
+                self.assertIn(human_app["state"],{"needs_user_input","failed","unsupported"},human_app["diagnostic_json"])
+                self.assertEqual(len(routed),2,json.dumps({"attention":routed,"human_app":dict(human_app),"browser_inputs":browser_inputs},default=str))
                 self.assertEqual({item["job_key"] for item in routed},{"ashby:synthetic-board:req-43","ashby:synthetic-board:req-44"})
-                self.assertEqual({item["blocker_code"] for item in routed},{"unsupported_form","human_verification"})
+                self.assertEqual({item["blocker_code"] for item in routed},{"unsupported_form","human_verification"},
+                    json.dumps({"human_app":dict(human_app) if human_app else None,"attention":routed,"browser_inputs":browser_inputs},default=str))
                 self.assertEqual({item["job_key"]:item["preparation_state"] for item in routed},
                     {"ashby:synthetic-board:req-43":"not_prepared","ashby:synthetic-board:req-44":"needs_user_input"})
                 self.assertTrue(all(item["status"]=="open" for item in routed))
@@ -464,56 +529,62 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                         ("ashby:synthetic-board:req-44",)).fetchone()[0],1)
                 self.assertFalse(posts)
 
-                # The applicant completes the synthetic challenge outside BabyStepsAI.
-                # Use the real dashboard CTA and HTTP route; the route starts a fresh Chromium context.
+                # Synthetic employer-side state simulates the applicant completing
+                # verification manually; BabyStepsAI does not interact with the widget.
                 verification_completed[0]=True
-                resume_path=f"/api/applications/{human_app['id']}/verification-resume"
-                adapter.paths.add(resume_path)
+                adapter.paths.update({f"/api/applications/{human_app['id']}/verification-session",
+                    f"/api/applications/{human_app['id']}/verification-session/open",
+                    f"/api/applications/{human_app['id']}/verification-session/continue",
+                    f"/api/applications/{human_app['id']}/verification-session/cancel"})
                 attention=app_agent.list_application_attention()
                 human_item=next(item for item in attention["items"] if item["job_key"]=="ashby:synthetic-board:req-44")
-                self.assertTrue(human_item["human_verification_checkpoint"]["available"])
+                self.assertTrue(human_item["human_verification_checkpoint"]["browser_session_active"])
                 self.assertFalse(human_item["human_verification_checkpoint"]["browser_session_persisted"])
                 from playwright.sync_api import sync_playwright
                 dashboard_errors=[]
+                handoff_responses=[]
                 with sync_playwright() as browser_runtime:
                     dashboard_browser=browser_runtime.chromium.launch(headless=True)
                     dashboard_context=dashboard_browser.new_context(viewport={"width":1280,"height":900})
                     dashboard_page=dashboard_context.new_page()
                     dashboard_page.on("pageerror",lambda error:dashboard_errors.append(str(error)))
+                    dashboard_page.on("response",lambda response:handoff_responses.append({"url":response.url,"status":response.status}) if "verification-session" in response.url else None)
                     dashboard_page.route("**/*",lambda route:app_agent._guard_browser_request(route,{}))
                     dashboard_page.goto(adapter.origin+"/dashboard",wait_until="domcontentloaded")
                     dashboard_page.wait_for_timeout(500)
-                    cta=dashboard_page.locator("#attention-inbox").get_by_role("button",name="I completed verification — recheck safely")
-                    self.assertTrue(cta.is_visible(),dashboard_page.locator("#attention-inbox").inner_text())
-                    cta.click()
+                    open_button=dashboard_page.locator("#attention-inbox").get_by_role("button",name="Open verification session")
+                    self.assertTrue(open_button.is_visible(),dashboard_page.locator("#attention-inbox").inner_text())
+                    open_button.click()
+                    continue_button=dashboard_page.locator("#attention-inbox").get_by_role("button",name="Continue after verification")
+                    continue_button.click()
                     browser_resume_deadline=time.monotonic()+30
                     while time.monotonic()<browser_resume_deadline:
                         with jobs.database() as db:
                             resumed_state=db.execute("SELECT state FROM applications WHERE id=?",(human_app["id"],)).fetchone()[0]
-                        if resumed_state in {"ready_for_review","needs_user_input","failed","unsupported"}:break
+                        if resumed_state in {"ready_for_review","failed","unsupported"}:break
                         dashboard_page.wait_for_timeout(50)
                     dashboard_context.close();dashboard_browser.close()
                 self.assertFalse(dashboard_errors,dashboard_errors)
                 resumed={"resumed_existing_attempt":True,"new_attempt_created":False,
-                    "browser_session_restored":False,"fresh_browser_context":True}
+                    "browser_session_restored":True,"fresh_browser_context":False}
                 self.assertTrue(resumed["resumed_existing_attempt"])
                 self.assertFalse(resumed["new_attempt_created"])
-                self.assertFalse(resumed["browser_session_restored"])
-                self.assertTrue(resumed["fresh_browser_context"])
+                self.assertTrue(resumed["browser_session_restored"])
+                self.assertFalse(resumed["fresh_browser_context"])
                 with jobs.database() as db:
                     resumed_app=db.execute("SELECT state,attempt_number,diagnostic_json FROM applications WHERE id=?",(human_app["id"],)).fetchone()
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts WHERE application_id=?",(human_app["id"],)).fetchone()[0],1)
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM application_opening_reservations WHERE application_id=?",(human_app["id"],)).fetchone()[0],1)
                     form_inspection_count=db.execute("SELECT COUNT(*) FROM application_form_inspections").fetchone()[0]
-                self.assertEqual(resumed_app["state"],"ready_for_review",json.dumps({"diagnostic":json.loads(resumed_app["diagnostic_json"]),"browser_inputs":browser_inputs}))
+                self.assertEqual(resumed_app["state"],"ready_for_review",json.dumps({"diagnostic":json.loads(resumed_app["diagnostic_json"]),"browser_inputs":browser_inputs,"upload_errors":upload_errors,"handoff_responses":handoff_responses}))
                 self.assertEqual(resumed_app["attempt_number"],1)
                 resumed_diagnostic=json.loads(resumed_app["diagnostic_json"])
                 self.assertFalse(resumed_diagnostic["submission_performed"])
                 self.assertEqual(len(resumed_diagnostic["browser_checkpoint_history"]),1)
                 self.assertEqual(resumed_diagnostic["browser_checkpoint_history"][0]["resume_count"],1)
                 resumed_input=[item for item in browser_inputs if item["page_url"].endswith("req-44")][-1]
-                self.assertIsNot(browser_contexts[human_input["browser_context_index"]],
-                                 browser_contexts[resumed_input["browser_context_index"]])
+                self.assertIs(browser_contexts[human_input["browser_context_index"]],
+                              browser_contexts[resumed_input["browser_context_index"]])
                 self.assertEqual(resumed_input["readback"],{"name":"Synthetic Candidate","email":"synthetic@example.test"})
                 self.assertEqual(resumed_input["resume_upload_count"],1)
                 self.assertEqual(app_agent.list_application_attention()["count"],1)
