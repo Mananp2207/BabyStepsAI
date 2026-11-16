@@ -530,7 +530,7 @@ def source_application_url(value, source):
     value=valid_application_url(value)
     if not value: return None
     host=urlparse(value).hostname.casefold()
-    approved={"greenhouse":{"boards.greenhouse.io","job-boards.greenhouse.io"},
+    approved={"greenhouse":{"boards.greenhouse.io","job-boards.greenhouse.io","job-boards.eu.greenhouse.io"},
               "lever":{"jobs.lever.co","jobs.eu.lever.co"},
               "ashby":{"jobs.ashbyhq.com"},
               "smartrecruiters":{"smartrecruiters.com","www.smartrecruiters.com","careers.smartrecruiters.com"}}
@@ -1965,6 +1965,20 @@ def _verified_registered_employer(domain: str) -> str:
     return next(iter(matches)) if len(matches)==1 else ""
 
 
+def _imported_work_arrangement(detail, description):
+    """Use explicit ATS metadata or an unmistakable workplace statement."""
+    raw=str(detail.get("work_arrangement") or "").strip()
+    if raw:
+        return _arrangement(raw)
+    # Do not let the word "remote" in a hybrid schedule turn the entire role
+    # into Remote. Only infer Hybrid when the posting explicitly gives office
+    # days as part of that schedule; otherwise keep the metadata unknown.
+    if re.search(r"\bhybrid\b[^\n.]{0,120}\b\d+\s+days?\s+(?:per\s+week\s+)?(?:in|at)\s+(?:the\s+)?office\b",
+                 str(description or ""),re.I):
+        return "Hybrid"
+    return ""
+
+
 @router.post("/api/jobs/import-url")
 def import_job_url(payload: JobUrlImportRequest, request: Request):
     """Import one public posting into the existing saved-opening/matching flow."""
@@ -2023,6 +2037,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
     application_url = str(detail.get("application_url") or "")
     description = str(detail.get("description") or "")
     employment_type = str(detail.get("employment_type") or "")
+    work_arrangement = _imported_work_arrangement(detail, description)
     department = str(detail.get("department") or "")
     location = str(detail.get("location") or "")
     country = str(detail.get("country") or "")
@@ -2085,7 +2100,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
                  availability_status=?,imported_source_url=?,import_eligibility_status=?,import_review_json=?,
                  reopened_review_required=CASE WHEN ? THEN 1 ELSE reopened_review_required END
                 WHERE user_id=? AND job_key=?""",
-                (company,title,location,application_url,employment_type,department,country,str(detail.get("work_arrangement") or ""),description,detail.get("date_posted"),stamp,
+                (company,title,location,application_url,employment_type,department,country,work_arrangement,description,detail.get("date_posted"),stamp,
                  int(detail.get("active", True)),fingerprint,posting_url,level,json.dumps(qualifications),json.dumps(detail.get("preferred_qualifications") or []),
                  json.dumps(graduation_windows),"expired" if not detail.get("active",True) else "current",str(detail.get("source_url") or payload.url),eligibility,json.dumps(review_reasons),int(reopened),USER,job_key))
         else:
@@ -2097,7 +2112,7 @@ def import_job_url(payload: JobUrlImportRequest, request: Request):
                  import_eligibility_status,import_review_json)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (USER,job_key,company,title,location,application_url,stamp,employment_type,location_status,location_reason,
-                 "Direct official job URL import",f"Official company posting ({provider})",provider,source_id,country,str(detail.get("work_arrangement") or ""),description,
+                 "Direct official job URL import",f"Official company posting ({provider})",provider,source_id,country,work_arrangement,description,
                  detail.get("date_posted"),stamp,int(detail.get("active", True)),fingerprint,posting_url,department,
                  classify_career_category(title,prefs),level,json.dumps(qualifications),json.dumps(detail.get("preferred_qualifications") or []),
                  json.dumps(graduation_windows),"expired" if not detail.get("active",True) else "current",str(detail.get("source_url") or payload.url),

@@ -339,12 +339,33 @@ class SarathiTests(unittest.TestCase):
         cases = [
             ("I can start in January 2027", "full_time_availability", "Available for full-time employment starting January 2027."),
             ("I'm willing and able to relocate to NYC.", "relocation_willingness", "Willing and able to relocate to NYC."),
+            ("I'm willing to work hybrid three days per week in NYC.", "work_arrangement_preferences",
+             "Hybrid; willing and able to work on-site in New York City three days per week."),
             ("My technical skills are Python, React", "technical_skills", "Python\nReact"),
         ]
         for message, key, expected in cases:
             proposal = sarathi._profile_proposal_from_message(message, [])
             self.assertEqual(proposal["field_key"], key)
             self.assertEqual(proposal["value"], expected)
+
+    def test_hybrid_schedule_proposal_requires_explicit_confirmation_and_reads_back_as_list(self):
+        conversation_id = self.new_conversation()
+        with patch.object(sarathi, "_generate") as generate:
+            response = sarathi.send_message(sarathi.ChatRequest(
+                conversation_id=conversation_id,
+                message="I'm willing to work hybrid three days per week in NYC.",
+                provider="ollama", use_context=False))
+        proposal = response["profile_update_proposal"]
+        self.assertEqual(proposal["field_key"], "work_arrangement_preferences")
+        generate.assert_not_called()
+        field = next(x for x in profile.get_verification()["fields"] if x["key"] == "work_arrangement_preferences")
+        self.assertEqual(field["value"], [])
+        self.assertFalse(field["confirmed"])
+        confirm = sarathi.confirm_profile_proposal(proposal["proposal_id"], sarathi.ConfirmProposal(confirmed=True))
+        self.assertTrue(confirm["verified"])
+        saved = next(x for x in profile.get_verification()["fields"] if x["key"] == "work_arrangement_preferences")
+        self.assertTrue(saved["confirmed"])
+        self.assertEqual(saved["value"], [proposal["value"]])
 
     def test_unapproved_groq_model_or_provider_is_not_silently_replaced(self):
         with patch.object(sarathi, "get_authorization", return_value={"settings": {

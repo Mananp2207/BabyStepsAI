@@ -212,6 +212,35 @@ class ConnectorTests(unittest.TestCase):
         self.assertTrue(result["retrieved_at"])
         self.assertTrue(any("boards-api.greenhouse.io" in target for target in calls))
 
+    def test_greenhouse_eu_job_board_url_uses_same_public_detail_safeguards(self):
+        url="https://job-boards.eu.greenhouse.io/stubhubinc/jobs/5027626101"
+        description="A public new graduate software engineering role building customer-facing applications. "*5
+        payload={"id":5027626101,"company_name":"StubHub","title":"Software Engineer I (New Grad) - Consumer Experience",
+            "absolute_url":url,"location":{"name":"New York, New York, United States"},"content":description,
+            "first_published":"2026-11-05T12:56:06-05:00","metadata":[]}
+        calls=[]
+        def getter(target,**kwargs):
+            calls.append(target)
+            if target.endswith("/robots.txt"):
+                return SimpleNamespace(status_code=404,headers={},content=b"",text="",url=target,raise_for_status=lambda:None)
+            if "boards-api.greenhouse.io" in target:
+                body=json.dumps(payload).encode()
+                return SimpleNamespace(status_code=200,headers={},content=body,text="",url=target,
+                    json=lambda:payload,raise_for_status=lambda:None)
+            page="<html><h1>Software Engineer I (New Grad)</h1></html>"
+            return SimpleNamespace(status_code=200,headers={},content=page.encode(),text=page,url=target,raise_for_status=lambda:None)
+        with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
+            result,error=connectors.fetch_public_job_url(url,getter=getter)
+        self.assertIsNone(error)
+        self.assertEqual(result["provider"],"greenhouse")
+        self.assertEqual(result["source_token"],"stubhubinc")
+        self.assertEqual(result["id"],"5027626101")
+        self.assertEqual(result["employer"],"StubHub")
+        self.assertEqual(result["application_url"],url)
+        self.assertTrue(result["robots_checked"])
+        self.assertTrue(any("boards-api.greenhouse.io" in target for target in calls))
+        self.assertEqual(discovery.source_application_url(url,connectors.EmployerSource("StubHub","greenhouse","stubhubinc")),url)
+
     def test_greenhouse_direct_import_rejects_invalid_board_and_job_identifiers(self):
         with patch.object(connectors,"validate_public_https_url",side_effect=lambda value,**_kwargs:value):
             detail,error=connectors._greenhouse_job_detail("bad/token","123")

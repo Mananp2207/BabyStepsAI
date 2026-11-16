@@ -646,12 +646,17 @@ def extract_experience_requirements(description):
         preceding=[heading.group(0).casefold().replace("’","'") for heading in headings.finditer(text,0,match.start())]
         section=preceding[-1] if preceding else ""
         section=section.replace("’","'")
-        if section in preferred_headings:
+        before=text[max(0,match.start()-100):match.start()].casefold()
+        upper_bound=bool(re.search(r"\b(?:up to|at most|no more than|maximum of|max(?:imum)?)\s+(?:~\s*)?(?:(?:about|approximately|around)\s*)?$",before,re.I))
+        if upper_bound:
+            # "Up to one year" is a ceiling/alternate experience path, not a
+            # minimum prerequisite. Keep it visible without blocking a new grad.
+            category="unclear"
+        elif section in preferred_headings:
             category="preferred"
         elif section in required_headings or "skillset you" in section or "what you" in section:
             category="required"
         else:
-            before=text[max(0,match.start()-100):match.start()].casefold()
             after=text[match.end():min(len(text),match.end()+100)].casefold()
             if re.search(r"\b(?:must|required|requires?|minimum|at least)\b[^.;]{0,80}$",before):
                 category="required"
@@ -662,6 +667,7 @@ def extract_experience_requirements(description):
             else:
                 category="unclear"
         item = {"requirement": match.group(0), "years": match.group("years"), "status": category}
+        if upper_bound:item["bound"]="maximum"
         if item not in output[category]:
             output[category].append(item)
     return output

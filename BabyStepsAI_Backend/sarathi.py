@@ -43,7 +43,7 @@ _RATE_EVENTS: dict[str, list[float]] = {}
 _PROPOSABLE_FIELDS = {
     "linkedin", "github", "portfolio", "website", "full_time_availability",
     "earliest_available_date", "relocation_willingness", "availability",
-    "technical_skills",
+    "technical_skills", "work_arrangement_preferences",
 }
 
 
@@ -502,6 +502,13 @@ def _profile_proposal_from_message(message: str, prior_messages: list[dict]):
         month = availability.group(1)
         value = "Available for full-time employment starting " + month + "."
         return {"field_key": "full_time_availability", "label": "Full-time availability", "value": value}
+    if (re.search(r"\bhybrid\b", text, re.I)
+            and re.search(r"\b(?:3|three)\s+days?\s+(?:per|a)\s+week\b", text, re.I)
+            and re.search(r"\bwilling\b", text, re.I)
+            and re.search(r"\b(?:nyc|new york(?: city)?)\b", text, re.I)):
+        return {"field_key": "work_arrangement_preferences",
+                "label": "Work arrangement preference",
+                "value": "Hybrid; willing and able to work on-site in New York City three days per week."}
     relocation = re.search(r"\bi(?: am|'m) willing(?: and able)? to relocate to ([A-Za-z][A-Za-z ,.-]{1,80}?)(?: for |\.|$)", text, re.I)
     if relocation:
         place = relocation.group(1).strip(" ,.")
@@ -901,7 +908,7 @@ def confirm_profile_proposal(proposal_id: str, payload: ConfirmProposal):
             if item.get("kind") == "objects":
                 confirmed_fields.extend(f"{item['key']}:{i}" for i, confirmed in enumerate(item.get("entry_confirmed", [])) if confirmed)
         stored_value = ([part.strip() for part in value.splitlines() if part.strip()]
-                        if field_key == "technical_skills" else value)
+                        if field_key in {"technical_skills", "work_arrangement_preferences"} else value)
         values[field_key] = stored_value
         confirmed_fields.append(field_key)
         saved = candidate_profile.update_verification(VerificationUpdate(values=values, confirmed_fields=confirmed_fields))

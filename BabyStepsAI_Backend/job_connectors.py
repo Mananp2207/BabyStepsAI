@@ -480,7 +480,7 @@ def discover_source_candidates(company_name: str, website_url: str, *, getter=No
         host = (parsed.hostname or "").casefold()
         parts = [part for part in parsed.path.split("/") if part]
         kind = token = None
-        if host in {"boards.greenhouse.io", "job-boards.greenhouse.io"} and parts:
+        if host in {"boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io"} and parts:
             kind, token = "greenhouse", parts[0]
         elif host in {"jobs.lever.co", "jobs.eu.lever.co"} and parts:
             kind, token = "lever", parts[0]
@@ -530,7 +530,7 @@ def _job_provider_for_url(url):
     parsed = urlparse(url)
     host = (parsed.hostname or "").casefold()
     parts = [part for part in parsed.path.split("/") if part]
-    if host in {"boards.greenhouse.io", "job-boards.greenhouse.io"} and len(parts) >= 3 and parts[1] == "jobs":
+    if host in {"boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io"} and len(parts) >= 3 and parts[1] == "jobs":
         return "greenhouse", parts[0], parts[2]
     if host in {"jobs.lever.co", "jobs.eu.lever.co"} and len(parts) >= 2:
         return "lever", parts[0], parts[1]
@@ -689,7 +689,7 @@ def _greenhouse_job_detail(token, job_id, getter=None):
         return None, "Unsupported Greenhouse public API response: posting URL is unsafe."
     published = urlparse(absolute_url)
     expected_parts = urlparse(expected)
-    if ((published.hostname or "").casefold() not in {"boards.greenhouse.io", "job-boards.greenhouse.io"}
+    if ((published.hostname or "").casefold() not in {"boards.greenhouse.io", "job-boards.greenhouse.io", "job-boards.eu.greenhouse.io"}
             or published.path.rstrip("/") != expected_parts.path.rstrip("/")):
         return None, "Unsupported Greenhouse public API response: posting URL did not match the requested board and job."
     description = _plain(payload.get("content") or "")
@@ -909,7 +909,7 @@ def fetch_public_career_page(source: EmployerSource, getter=None):
 
 def _recognized_ats_target(url, company_name=""):
     parsed=urlparse(url); host=(parsed.hostname or "").casefold(); parts=[p for p in parsed.path.split("/") if p]
-    if host in {"boards.greenhouse.io","job-boards.greenhouse.io"} and parts:
+    if host in {"boards.greenhouse.io","job-boards.greenhouse.io","job-boards.eu.greenhouse.io"} and parts:
         return "greenhouse",parts[0]
     if host in {"jobs.lever.co","jobs.eu.lever.co"} and parts:
         return "lever",parts[0]

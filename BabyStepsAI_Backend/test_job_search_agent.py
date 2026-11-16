@@ -106,6 +106,11 @@ class DiscoveryTests(unittest.TestCase):
                        "enrichImport","/api/jobs/import-url"):
             self.assertIn(marker,page)
 
+    def test_import_url_route_remains_bound_to_the_import_handler(self):
+        route=next(item for item in jobs.router.routes
+                   if getattr(item,"path","")=="/api/jobs/import-url")
+        self.assertIs(route.endpoint,jobs.import_job_url)
+
     def test_shortlist_ui_surfaces_matching_readiness_and_saved_preference_conflicts(self):
         page=jobs.find_jobs_page()
         if hasattr(page,"body"):page=page.body.decode("utf-8")
@@ -539,6 +544,27 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(found["company_name"],"Acme Systems")
         self.assertEqual(found["content"],changed["description"])
 
+    def test_direct_import_extracts_explicit_hybrid_office_schedule_without_inventing_employment_type(self):
+        with jobs.database() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
+            db.execute("INSERT OR REPLACE INTO application_authorizations VALUES(?,?)",
+                       (jobs.USER,json.dumps({"allow_automatic_discovery":True})))
+        url="https://job-boards.eu.greenhouse.io/stubhubinc/jobs/5027626101"
+        description=("Software Engineer I (New Grad). Location: Hybrid (3 days in office / 2 days remote) — New York, NY. "
+                     "Recent graduates with up to one year of experience are encouraged. "*5)
+        detail={"provider":"greenhouse","source_token":"stubhubinc","id":"5027626101","employer":"StubHub",
+            "title":"Software Engineer I (New Grad) - Consumer Experience","description":description,
+            "location":"New York, New York, United States","country":"US","employment_type":"",
+            "url":url,"application_url":url,"active":True,"retrieved_url":url}
+        with patch.object(jobs,"fetch_public_job_url",return_value=(detail,None)):
+            result=jobs.import_job_url(jobs.JobUrlImportRequest(url=url),self.local_request())
+        self.assertEqual(result["job_key"],"greenhouse:stubhubinc:5027626101")
+        with jobs.database() as db:
+            saved=db.execute("SELECT work_arrangement,employment_type FROM discovered_openings WHERE job_key=?",
+                             (result["job_key"],)).fetchone()
+        self.assertEqual(saved["work_arrangement"],"Hybrid")
+        self.assertEqual(saved["employment_type"],"")
+
     def test_direct_url_import_requires_discovery_authorization(self):
         with jobs.database() as db:
             db.execute("CREATE TABLE IF NOT EXISTS application_authorizations(user_id TEXT PRIMARY KEY,settings_json TEXT NOT NULL)")
@@ -767,6 +793,15 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual([item["years"] for item in extracted["preferred"]],["2"])
         enterprise=extract_experience_requirements("THE SKILLSET YOU'LL BRING 2–8 years of professional software engineering experience on high impact teams.")
         self.assertEqual([item["years"] for item in enterprise["required"]],["2–8"])
+
+    def test_experience_extractor_does_not_turn_up_to_one_year_into_a_minimum(self):
+        from job_relevance import classify_role_level
+        description=("WHAT WE'RE LOOKING FOR: Recent graduate or software engineer with up to ~1 year of experience "
+                     "including internships, co-ops, or substantial academic projects. Strong CS fundamentals.")
+        extracted=extract_experience_requirements(description)
+        self.assertEqual(extracted["required"],[])
+        self.assertEqual(extracted["unclear"],[{"requirement":"1 year of experience","years":"1","status":"unclear","bound":"maximum"}])
+        self.assertEqual(classify_role_level("Software Engineer I (New Grad)",description)[0],"New Graduate")
 
     def test_experience_extractor_recognizes_required_skills_and_what_we_are_looking_for_sections(self):
         from job_relevance import classify_experience_level
