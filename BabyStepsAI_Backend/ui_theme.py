@@ -17,7 +17,7 @@ NAV_ITEMS = (
 )
 
 
-def apply_ui_theme(document: str) -> str:
+def apply_ui_theme(document: str, *, sarathi_launcher: bool = True) -> str:
     """Add one consistent, responsive app shell without changing page behavior."""
     if not isinstance(document, str):
         return document
@@ -63,7 +63,7 @@ html[data-bsa-theme="dark"] .bsa-sidebar{background:#131e2e;border-color:var(--b
 #bsa-sarathi-panel[hidden]{display:none!important}#bsa-sarathi-panel header{height:48px!important;width:100%!important;margin:0!important;padding:7px 12px!important;display:flex;align-items:center;justify-content:space-between;background:var(--bsa-surface)!important;border-bottom:1px solid var(--bsa-line)}#bsa-sarathi-panel header button{min-height:32px!important;padding:4px 9px!important}#bsa-sarathi-frame{display:block;width:100%;height:calc(100% - 48px);border:0;background:var(--bsa-surface)}
 @media(max-width:760px){#bsa-sarathi-launcher{right:12px;bottom:12px}#bsa-sarathi-panel{inset:58px 0 0;width:100vw;height:calc(100dvh - 58px);border-radius:0;border-left:0;border-right:0;border-bottom:0}html[data-bsa-theme="dark"] #bsa-sarathi-launcher{color:#111b2b!important}}
 </style>"""
-    if "</head>" in document and 'id="bsa-sarathi-launcher-style"' not in document:
+    if sarathi_launcher and "</head>" in document and 'id="bsa-sarathi-launcher-style"' not in document:
         document = document.replace("</head>", launcher_style + "</head>", 1)
 
     path_match = re.search(r"<body\b[^>]*>", document, re.I)
@@ -90,8 +90,11 @@ html[data-bsa-theme="dark"] .bsa-sidebar{background:#131e2e;border-color:var(--b
                 '<header><strong>Sarathi · Your guide</strong><button type="button" id="bsa-sarathi-close" aria-label="Close Sarathi chat">Close</button></header>'
                 '<iframe id="bsa-sarathi-frame" title="Sarathi conversational assistant" src="about:blank" loading="lazy"></iframe></section>'
                 '<button id="bsa-sarathi-launcher" type="button" aria-controls="bsa-sarathi-panel" aria-expanded="false">Ask Sarathi</button>')
-    document = document.replace("</body>", launcher + "</body>", 1)
+    if sarathi_launcher:
+        document = document.replace("</body>", launcher + "</body>", 1)
     controller = r"""<script id="bsa-theme-controller">(()=>{const key='babysteps-theme',root=document.documentElement;let mode='light';try{mode=localStorage.getItem(key)||'light'}catch{}root.dataset.bsaTheme=mode;const toggles=[...document.querySelectorAll('.bsa-theme-toggle')],sidebar=document.getElementById('bsa-sidebar'),menu=document.querySelector('.bsa-menu-toggle'),shade=document.querySelector('.bsa-mobile-shade'),syncActive=()=>{const path=location.pathname;for(const a of document.querySelectorAll('.bsa-sidebar nav a')){const link=new URL(a.href,location.href),active=link.pathname===path&&(link.pathname!=='/'||(link.hash?link.hash===location.hash:!location.hash));if(active)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')}};syncActive();addEventListener('hashchange',syncActive);const paint=()=>{const dark=root.dataset.bsaTheme==='dark';for(const b of toggles){b.textContent=dark?'Light mode':'Dark mode';b.setAttribute('aria-pressed',String(dark))}};const syncMobile=()=>{const mobile=matchMedia('(max-width:760px)').matches,open=sidebar?.getAttribute('data-open')==='true';if(sidebar){sidebar.inert=mobile&&!open;sidebar.setAttribute('aria-hidden',String(mobile&&!open))}if(menu)menu.hidden=!mobile;if(!mobile&&shade)shade.hidden=true};const close=()=>{const restore=sidebar?.contains(document.activeElement),mobile=matchMedia('(max-width:760px)').matches;sidebar?.setAttribute('data-open','false');menu?.setAttribute('aria-expanded','false');if(shade)shade.hidden=true;syncMobile();if(restore&&mobile)menu?.focus()};for(const b of toggles)b.addEventListener('click',()=>{root.dataset.bsaTheme=root.dataset.bsaTheme==='dark'?'light':'dark';try{localStorage.setItem(key,root.dataset.bsaTheme)}catch{}paint()});menu?.addEventListener('click',()=>{const open=sidebar?.getAttribute('data-open')!=='true';sidebar?.setAttribute('data-open',String(open));menu.setAttribute('aria-expanded',String(open));if(shade)shade.hidden=!open;syncMobile();if(open)sidebar?.querySelector('a')?.focus()});shade?.addEventListener('click',close);document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});sidebar?.querySelectorAll('a').forEach(a=>a.addEventListener('click',close));addEventListener('resize',syncMobile);syncMobile();paint()})();</script>"""
     document = document.replace("</body>", controller + "</body>", 1)
     launcher_controller = r"""<script id="bsa-sarathi-launcher-controller">(()=>{const button=document.getElementById('bsa-sarathi-launcher'),panel=document.getElementById('bsa-sarathi-panel'),frame=document.getElementById('bsa-sarathi-frame'),close=document.getElementById('bsa-sarathi-close');if(!button||!panel||!frame)return;let loaded=false;const sendTheme=()=>{try{frame.contentWindow?.postMessage({type:'bsa-theme',theme:document.documentElement.dataset.bsaTheme==='dark'?'dark':'light'},location.origin)}catch{}};const observer=new MutationObserver(sendTheme);observer.observe(document.documentElement,{attributes:true,attributeFilter:['data-bsa-theme']});frame.addEventListener('load',sendTheme);const hide=()=>{panel.hidden=true;button.setAttribute('aria-expanded','false');button.focus()};button.addEventListener('click',()=>{panel.hidden=!panel.hidden;const open=!panel.hidden;button.setAttribute('aria-expanded',String(open));if(open){if(!loaded){frame.src='/sarathi?compact=1';loaded=true}close?.focus();sendTheme()}});close?.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!panel.hidden)hide()})})();</script>"""
-    return document.replace("</body>", launcher_controller + "</body>", 1)
+    if sarathi_launcher:
+        document = document.replace("</body>", launcher_controller + "</body>", 1)
+    return document

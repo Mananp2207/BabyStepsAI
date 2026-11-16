@@ -51,6 +51,13 @@ class UIThemeTests(unittest.TestCase):
         once=apply_ui_theme('<html><head></head><body></body></html>')
         self.assertEqual(apply_ui_theme(once),once)
 
+    def test_review_page_keeps_theme_controller_without_overlapping_sarathi_launcher(self):
+        review=application_agent.application_review_page().body.decode()
+        self.assertIn('id="bsa-theme-controller"',review)
+        self.assertNotIn('id="bsa-sarathi-launcher"',review)
+        applications=application_agent.applications_page().body.decode()
+        self.assertIn('id="bsa-sarathi-launcher"',applications)
+
     def test_profile_component_theme_selectors_do_not_skip_shared_controller(self):
         page=apply_ui_theme(candidate_verification.PROFILE_PAGE)
         self.assertIn('html[data-bsa-theme="dark"] .chip',page)

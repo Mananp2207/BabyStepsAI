@@ -4636,10 +4636,16 @@ def application_review_data(job_key: str):
     for key in profile_keys:
         label=profile_service.FIELDS.get(key,("",key.replace("_"," ").title()))[1]
         value=values.get(key)
-        has_value=bool(value not in (None,"",[],{}))
         is_confirmed=bool(confirmed.get(key))
+        if key in {"education_entries","experience_entries","internship_entries","project_entries"}:
+            confirmed_entries=[entry for index,entry in enumerate(value or []) if confirmed.get(f"{key}:{index}")]
+            is_confirmed=bool(confirmed_entries)
+            value=confirmed_entries
+        has_value=bool(value not in (None,"",[],{}))
         row={"key":key,"label":label,"confirmed":is_confirmed,"has_value":has_value}
-        if is_confirmed and key in {"linkedin","country","full_time_availability","work_arrangement_preferences"}:
+        if is_confirmed and key in {"full_name","email","phone","linkedin","country","full_time_availability",
+                                    "work_arrangement_preferences","education_entries","experience_entries",
+                                    "internship_entries","project_entries","technical_skills"}:
             row["value"]=value
         profile_summary.append(row)
 
@@ -4682,16 +4688,31 @@ def application_review_data(job_key: str):
     required_fields=report.get("required_fields") if isinstance(report.get("required_fields"),list) else []
     form_fields=report.get("fields") if isinstance(report.get("fields"),list) else []
     required_controls=[]
+    form_questions=[]
     for field in form_fields:
-        if not isinstance(field,dict) or not field.get("required"):continue
+        if not isinstance(field,dict):continue
         label=str(field.get("question") or field.get("label") or "Required employer field")[:500]
         text=label.casefold()
         candidate_key=("country" if "country" in text else "linkedin" if "linkedin" in text else
                        "email" if "email" in text else "phone" if "phone" in text else
                        "full_name" if "name" in text else "")
-        required_controls.append({"label":label,"candidate_field":candidate_key,
-            "permission_current":bool(candidate_key and candidate_key in field_keys),
-            "human_only":bool(re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|authori[sz]ation",text))})
+        human_only=bool(re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|authori[sz]ation|citizenship|demographic|ai interview assistant",text))
+        field_type=str(field.get("type") or field.get("tag") or "").casefold()
+        item={"label":label,"candidate_field":candidate_key,"required":bool(field.get("required")),
+            "field_type":field_type,"permission_current":bool(candidate_key and candidate_key in field_keys),
+            "human_only":human_only}
+        if field.get("required"):required_controls.append(item)
+        if not candidate_key and not human_only:
+            form_questions.append({**item,"ordinary_text_question":bool(field_type in {"textarea","text","search"} or
+                re.search(r"describe|tell us|why|experience|project|skills|technical|programming|challenge|motivation",text))})
+    if not form_questions and required_fields:
+        for label in required_fields:
+            text=str(label or "")[:500]
+            if not re.search(r"[a-z]{3,}",text,re.I):continue
+            human_only=bool(re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|citizenship|demographic",text,re.I))
+            if not human_only and re.search(r"describe|tell us|why|experience|project|skills|technical|programming|challenge|motivation",text,re.I):
+                form_questions.append({"label":text,"required":True,"field_type":"unknown","candidate_field":"",
+                    "permission_current":False,"human_only":False,"ordinary_text_question":True})
     required_uploads=report.get("upload_control_details") if isinstance(report.get("upload_control_details"),list) else []
     for upload in required_uploads:
         if not isinstance(upload,dict) or not upload.get("required"):continue
@@ -4761,6 +4782,19 @@ def application_review_data(job_key: str):
     else:readiness={"status":"Needs Applicant Information","next_action":"Refresh this review and verify every preparation gate before authorizing preparation."}
     if not confirmed_submitted and not (applicant_blockers or employer_blockers or human_blockers or policy_blocker) and match_info["current"] and preparation_plan_ready:
         readiness={"status":"Ready for Preparation","next_action":"Review current job-specific preparation authorization before preparing any fields."}
+    review_checks=[
+        ("Posting availability",bool(opening.get("active",1)) and str(opening.get("availability_status") or "").casefold() in {"open","active","available"}),
+        ("Current match",bool(match_info["current"])),
+        ("Eligibility evidence",not bool(eligibility_blocker)),
+        ("Auto Apply policy",not bool(policy_blocker)),
+        ("Form compatibility",bool(report_current and not form_blocker)),
+        ("Duplicate and outcome review",bool(not application and not reservation and not outcomes)),
+        ("Human-only controls",not bool(human_blockers)),
+    ]
+    progress={"completed":sum(1 for _,ok in review_checks if ok),"total":len(review_checks),
+        "percent":round(100*sum(1 for _,ok in review_checks if ok)/len(review_checks)),
+        "checks":[{"label":label,"complete":bool(ok)} for label,ok in review_checks]}
+    readiness["progress"]=progress
     return {"job":{"job_key":job_key,"employer":str(opening.get("company") or ""),"title":str(opening.get("title") or ""),
             "posting_url":_sanitized_inspection_url(opening.get("job_url") or opening.get("url") or ""),
             "application_url":_sanitized_inspection_url(opening.get("url") or ""),"location":str(opening.get("location") or ""),
@@ -4775,7 +4809,7 @@ def application_review_data(job_key: str):
             "current_allowed_fields":field_keys,"proposed_allowed_fields":sorted(set(field_keys)|{"linkedin","country"})},
         "form":{"state":form_state,"inspected_at":str(inspection["inspected_at"] or "") if inspection else "",
             "provider":str(report.get("provider",{}).get("provider") if isinstance(report.get("provider"),dict) else report.get("provider") or "unknown"),
-            "required_fields":required_fields,"required_controls":required_controls,"required_uploads":required_uploads,
+            "required_fields":required_fields,"required_controls":required_controls,"questions":form_questions,"required_uploads":required_uploads,
             "human_actions":human_blockers,"submission_control_status":submission_status,
             "submission_control_detected":bool(report.get("submission_control_detected")),"submission_disabled":True},
         "answers":answer_summary,"preparation_plan":{"ready":preparation_plan_ready,
@@ -5280,7 +5314,7 @@ def applications_page(): return HTMLResponse(apply_ui_theme(APPLICATIONS_PAGE))
 
 
 @router.get("/applications/review",response_class=HTMLResponse)
-def application_review_page(): return HTMLResponse(apply_ui_theme(APPLICATION_REVIEW_PAGE))
+def application_review_page(): return HTMLResponse(apply_ui_theme(APPLICATION_REVIEW_PAGE,sarathi_launcher=False))
 
 
 APPLICATION_REVIEW_PAGE=r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Review Application — BabyStepsAI</title>
@@ -5308,6 +5342,104 @@ async function saveAnswer(key,question,area,check,button){if(saving)return;const
 async function load(){if(!jobKey){status.textContent='No saved opening was selected.';return}try{const d=await req('/api/application-review?'+new URLSearchParams({job_key:jobKey}));review=d;profileData=await req('/api/candidate-profile/verification');authData=await req('/api/application-authorization');root.replaceChildren();renderReadiness();const job=section('Opening');job.append(node('h2','',review.job.employer+' — '+review.job.title),node('p','',`${review.job.location||'Location not listed'} · ${review.job.work_arrangement||'Work arrangement unknown'} · ${review.job.employment_type||'Employment type unknown'}`),node('p','rv-muted',`Posting ${review.job.availability_status} · verified ${review.job.last_verified_at||'unknown'}`));for(const [label,url] of [['Official posting',review.job.posting_url],['Official application form',review.job.application_url]])if(url){const link=node('a','rv-link',label+' ↗');link.href=url;link.target='_blank';link.rel='noopener noreferrer';job.append(link,node('span','',' · '))}root.append(job);renderProposals();renderProfile();renderAuthorization();renderQuestions();renderEmployer();renderSarathi();status.textContent=review.application.attempt_count?'Existing application history is preserved.':'No application attempt exists for this opening.'}catch(e){status.textContent=errorText(e.message);status.className='rv-error'}}
 load();
 </script></body></html>'''
+
+REVIEW_INTERACTION_SCRIPT = r'''/* Progressive review, grounded answers, and the existing Sarathi assistant. */
+function reviewError(value){
+  if(value&&typeof value==='object'){
+    if(value.message)return reviewError(value.message);
+    if(value.detail)return reviewError(value.detail);
+    if(value.errors)return Array.isArray(value.errors)?value.errors.map(reviewError).join(' '):reviewError(value.errors);
+    if(value.field&&value.message)return value.field.replaceAll('_',' ')+': '+value.message;
+    return 'The request could not be completed. Check the highlighted information and try again.';
+  }
+  const text=String(value||'');
+  if(/\b(?:HTTP|SQLite|IntegrityError|Traceback|500|422|403|409)\b/i.test(text))return 'The change could not be saved. Review the information and try again; your previous saved information is unchanged.';
+  return text.slice(0,500)||'The request could not be completed.';
+}
+errorText=reviewError;
+function section(title){const s=document.createElement('section');s.className='rv-card';s.setAttribute('aria-label',title);const h=document.createElement('h2');h.textContent=title;s.append(h);return s}
+valueText=function(v){if(Array.isArray(v)){if(v.every(x=>typeof x!=='object'||x===null))return v.join('; ');const titles=v.map(x=>typeof x==='object'?[x.name,x.job_title,x.degree,x.role].filter(Boolean).join(' · ')||'Confirmed entry':String(x)).slice(0,4);return `${v.length} confirmed entr${v.length===1?'y':'ies'}: ${titles.join('; ')}${v.length>4?'; and '+(v.length-4)+' more':''}`}if(v&&typeof v==='object')return Object.entries(v).slice(0,4).map(([k,x])=>k.replaceAll('_',' ')+': '+String(x)).join('; ');return safe(v)};
+function renderReadiness(){
+  readiness.textContent=review.readiness.status;
+  const s=section('Application Overview');s.classList.add('rv-readiness-card');
+  const hero=document.createElement('div');hero.className='rv-hero-grid';const main=document.createElement('div');
+  main.append(node('h2','',review.job.employer+' — '+review.job.title));
+  main.append(node('p','rv-muted',[review.job.location||'Location not listed',review.job.work_arrangement||'Work arrangement unknown',review.job.employment_type||'Employment type unknown'].join(' · ')));
+  main.append(node('p','rv-next rv-note',review.readiness.next_action));
+  const actions=node('div','rv-actions');for(const [label,url] of [['Official posting',review.job.posting_url],['Employer application form',review.job.application_url]])if(url){const a=node('a','rv-button',label+' ↗');a.href=url;a.target='_blank';a.rel='noopener noreferrer';actions.append(a)}
+  main.append(actions);const side=document.createElement('div');side.append(node('strong','','Review progress'));
+  const bar=node('div','rv-progress');bar.setAttribute('role','progressbar');bar.setAttribute('aria-label','Application readiness checks');bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax','100');bar.setAttribute('aria-valuenow',review.readiness.progress?.percent||0);const fill=document.createElement('span');fill.style.width=(review.readiness.progress?.percent||0)+'%';bar.append(fill);side.append(bar,node('p','rv-muted',`${review.readiness.progress?.completed||0} of ${review.readiness.progress?.total||0} readiness checks complete`));
+  const listBox=node('ul','rv-list');for(const check of review.readiness.progress?.checks||[]){const li=node('li','',`${check.complete?'✓':'○'} ${check.label}`);listBox.append(li)}side.append(listBox);hero.append(main,side);s.append(hero);
+  s.append(node('p','rv-muted',`Preparation: ${review.application.state==='not_started'?'not started':review.application.state.replaceAll('_',' ')} · ${review.application.attempt_count} attempt(s) · matching ${review.match.current?'current':'needs refresh/review'}. ATS-style scores are informational only.`));
+  s.append(node('p','rv-warning','This review does not create an application attempt. Final employer submission remains disabled.'));root.append(s)
+}
+function renderProfile(){
+  const s=section('Profile Information');s.append(node('p','rv-muted','Confirmed resume and profile evidence is shown here. Saving a profile fact and authorizing its use with an employer are separate decisions.'));
+  const grid=node('div','rv-grid');for(const f of review.profile||[]){const item=node('div','rv-item');item.append(node('strong','',f.label),node('span','',f.confirmed?(f.value!==undefined?valueText(f.value):'Confirmed'):f.has_value?'Saved but not confirmed':'Not confirmed'));grid.append(item)}s.append(grid);
+  if(!review.profile.find(x=>x.key==='country')?.confirmed){const box=node('div','rv-item');box.append(node('h3','','Country is needed for this application'));box.append(node('p','rv-muted','Confirming a country saves a profile fact only. It does not authorize sharing it with an employer.'));const label=node('label','rv-field','Country');const input=node('input');input.id='country-value';input.autocomplete='country-name';input.maxLength=120;label.append(input);const checkLabel=node('label','rv-check'),check=node('input');check.type='checkbox';check.id='country-confirm';checkLabel.append(check,document.createTextNode(' I confirm this country value is accurate.'));const save=node('button','rv-primary','Save and verify country');save.onclick=()=>saveCountry(input.value,check.checked,save);box.append(label,checkLabel,save);s.append(box)}root.append(s)
+}
+function reviewAnswerCard(parent,{key,title,question,required=true,existing=null,formQuestion=false}){
+  const card=node('article','rv-item rv-answer');card.append(node('strong','',title));card.append(node('span','rv-helper',required?'Required employer question':'Optional employer question'));
+  const matching=(answerRows||[]).find(row=>row.confirmed&&!row.sensitive&&row.question===question);
+  if(matching){card.append(node('p','rv-good','A confirmed answer already exists in the answer bank. Reuse scope: '+(matching.reuse_scope||'none')+'.'));const details=document.createElement('details');details.append(node('summary','','Show saved answer'));details.append(node('p','',matching.answer||'Saved answer text is unavailable.'));card.append(details);parent.append(card);return}
+  const experienceQuestion=/full.?time professional software engineering experience|excluding internships/i.test(question);
+  const fact=existing?.confirmed_record?`A confirmed answer record exists${existing.job_specific?' for this opening':' but is not confirmed as specific to this opening'}.`:experienceQuestion?'Use confirmed employment entries only. Projects and internships do not count as full-time professional employment.':'Sarathi will use only relevant confirmed profile evidence and the saved posting.';
+  card.append(node('p','rv-muted',fact));const area=document.createElement('textarea');area.rows=2;area.maxLength=1200;area.setAttribute('aria-label',title+' answer');area.placeholder='Generate a grounded draft or enter details you can confirm.';
+  const field=node('label','rv-field','Your answer');field.append(area);card.append(field);
+  const tools=node('div','rv-answer-tools');const draft=node('button','rv-primary','Generate with Sarathi');draft.type='button';const provider=authData?.settings?.matching_provider||'ollama';const hasDraftPermission=!!authData?.settings?.allow_ai_drafting&&(provider==='ollama'||(provider==='groq'&&authData.settings.allow_groq_cloud_ai&&(!authData.settings.standing_policy_enabled||authData.settings.standing_policy_allow_groq))||(provider==='gemini'&&authData.settings.standing_policy_allow_cloud_ai));draft.disabled=!hasDraftPermission;draft.title=hasDraftPermission?'Generate a draft from relevant confirmed evidence.':'Enable the selected provider and its separate consent in Application Settings before sending candidate context.';const save=node('button','rv-primary','Confirm and save');save.type='button';save.disabled=true;save.title='Generate or enter an answer, then confirm its accuracy.';tools.append(draft,save);card.append(tools);
+  const confirmLabel=node('label','rv-check'),confirm=node('input');confirm.type='checkbox';confirm.id='review-confirm-'+key.replace(/[^a-z0-9_-]/gi,'-');confirmLabel.htmlFor=confirm.id;confirm.setAttribute('aria-label','I confirm this answer is accurate');confirmLabel.append(confirm,document.createTextNode(' I reviewed this answer and confirm it is accurate.'));card.append(confirmLabel);
+  const reuseAllowed=!!(authData?.settings?.allow_auto_use_confirmed_answers&&authData?.settings?.standing_policy_reuse_confirmed_answers);
+  if(reuseAllowed){const reuseLabel=node('label','rv-check'),reuse=node('input');reuse.type='checkbox';reuseLabel.append(reuse,document.createTextNode(' Allow reuse for similar jobs under my current policy (optional).'));card.append(reuseLabel);card._reuse=reuse}
+  const feedback=node('p','rv-draft-status',hasDraftPermission?'No answer has been saved. Sarathi drafts remain unconfirmed until you review and save them.':'AI drafting is unavailable until the selected provider and any required cloud permission are enabled in Settings. You can still enter a truthful answer yourself.');feedback.setAttribute('role','status');card.append(feedback);
+  confirm.addEventListener('change',()=>{save.disabled=!confirm.checked||!area.value.trim();save.title=save.disabled?'Review and confirm a non-empty answer before saving.':''});area.addEventListener('input',()=>{save.disabled=!confirm.checked||!area.value.trim()});
+  draft.onclick=async()=>{if(saving)return;saving=true;draft.disabled=true;feedback.textContent='Sarathi is checking confirmed evidence…';try{const result=await req('/api/application-answers/draft',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,job_key:jobKey})});area.value=result.answer||'';confirm.checked=false;save.disabled=true;const evidence=result.evidence||[];feedback.replaceChildren();feedback.append(node('span','',result.needs_user_input?'More confirmed information is needed.':'Draft ready — review and edit before confirming.'));if(result.disclaimer)feedback.append(node('p','rv-muted',result.disclaimer));if(result.missing_question)feedback.append(node('p','rv-warning',result.missing_question));if(evidence.length){const details=document.createElement('details');details.append(node('summary','','Supporting evidence'));for(const item of evidence){const block=node('div','rv-evidence');block.append(node('strong','',item.source||'Confirmed source'),node('p','',item.excerpt||''));details.append(block)}feedback.append(details)}if(result.reused){feedback.append(node('p','rv-good','This draft reused a previously confirmed answer within its saved scope. Review it for this employer.'))}save.title='Confirm the answer is accurate before saving.'}catch(e){feedback.textContent=reviewError(e.message)}finally{saving=false;draft.disabled=false}};
+  save.onclick=async()=>{if(saving)return;if(!confirm.checked||!area.value.trim()){feedback.textContent='Review the answer and explicitly confirm its accuracy before saving.';return}const answer=area.value.trim();if(answer.length<5){feedback.textContent='Add a little more detail, or leave this question for applicant review.';return}if(question.length>300){feedback.textContent='This employer question exceeds the answer bank question limit. Review and answer it directly on the official employer form.';return}saving=true;save.disabled=true;feedback.textContent='Saving and verifying your answer…';try{const reuse=!!card._reuse?.checked;const slug=(title+'-'+jobKey).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,100);const saved=await req('/api/application-answers/review-'+slug,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,answer,confirmed:true,sensitive:false,answer_type:'generated',auto_reuse:reuse,reuse_scope:reuse?'matching_jobs':'none',scope_job_key:''})});if(!saved.persisted_verified)throw Error('BabyStepsAI could not verify the saved answer.');const rows=await req('/api/application-answers'),read=rows.find(row=>row.key===saved.key||row.question===question);if(!read?.confirmed||read.answer!==answer||read.sensitive||((read.reuse_scope==='matching_jobs')!==reuse))throw Error('The saved answer did not pass readback checks. Review the Answer Bank before continuing.');await load();status.textContent='Answer saved and verified in your existing answer bank. It has not been sent to an employer.'}catch(e){feedback.textContent=reviewError(e.message);save.disabled=false}finally{saving=false}};
+  parent.append(card)
+}
+function renderQuestions(){
+  const s=section('AI-Assisted Answers');s.append(node('p','rv-muted','Sarathi can draft ordinary answers from confirmed profile evidence. Each draft shows its support. You decide whether to edit and confirm it; no answer is sent to the employer from this page.'));
+  const q=review.answers||{};const human=node('details','');human.append(node('summary','','Sensitive and applicant-only decisions'));for(const [label,data,note] of [['Work authorization',q.work_authorization,'Applicant must answer for the relevant country; no AI selection.'],['Sponsorship',q.sponsorship,'Applicant must answer for the relevant country; no AI selection.']]){const item=node('div','rv-item');item.append(node('strong','',label),node('p','',data?.confirmed_record?'A confirmed record exists; job-specific applicability is '+(data.job_specific?'recorded':'not recorded')+'.':'No confirmed answer record found.'),node('p','rv-muted',note));human.append(item)}human.append(node('p','rv-warning','AI interview-assistant consent, legal accuracy declarations, demographic disclosures, CAPTCHA, and authentication remain applicant-controlled.'));s.append(human);
+  reviewAnswerCard(s,{key:'professional-experience',title:'Full-time professional software engineering experience',question:'Describe your full-time professional software engineering experience, excluding internships. If you have none, say so clearly.',existing:q.professional_experience});
+  reviewAnswerCard(s,{key:'technical-fundamentals',title:'Data structures, algorithms, and software design',question:'Describe specific confirmed coursework or project evidence for data structures, algorithms, and software-design fundamentals. Do not infer details from technology names.',existing:q.technical_qualification});
+  reviewAnswerCard(s,{key:'motivation',title:'Professional motivation',question:'Why are you interested in this role, based only on confirmed candidate information and the saved posting?',required:false});
+  const questions=(review.form?.questions||[]).filter(item=>item.ordinary_text_question&&!item.human_only);for(let i=0;i<questions.length;i++){const item=questions[i];if(/full.?time professional software engineering experience|data structures.*algorithms/i.test(item.label))continue;reviewAnswerCard(s,{key:'employer-'+i,title:item.label,question:item.label,required:item.required!==false,formQuestion:true})}
+  s.append(node('p','rv-warning','Never use Sarathi for legal attestations, work authorization, sponsorship, identity verification, or employer consent. Projects and internships are not counted as full-time professional employment.'));root.append(s)
+}
+function renderEmployer(){
+  const s=section('Human Verification and Employer Details');s.append(node('p','',`Employment type: ${review.job.employment_type||'Unknown — employer metadata does not explicitly state it.'}`));
+  if(review.job.reopened_review_required)s.append(node('p','rv-warning','This requisition was reopened and still requires human review.'));
+  const controls=review.form.required_controls||[];if(controls.length){const details=document.createElement('details');details.append(node('summary','','Required employer fields and permissions'));const ul=node('ul','rv-list');for(const f of controls){const mark=f.candidate_field?(f.permission_current?'authorized field':'permission required'):f.human_only?'applicant action':'needs review';ul.append(node('li','',`${f.label} · ${mark}`))}details.append(ul);s.append(details)}
+  for(const upload of review.form.required_uploads||[])s.append(node('p','rv-muted',`Required document: ${upload.question||upload.purpose||'file upload'} · ${upload.supported?'control detected':'support unresolved'} · ${upload.permission_current?'document allowed':'document permission missing'}`));
+  s.append(node('p','rv-muted',`Form inspection: ${review.form.state} · ${review.form.inspected_at||'timestamp unavailable'} · final-submit boundary: ${review.form.submission_control_status}.`));
+  if(review.form.human_actions?.length)s.append(node('div','rv-note','Human action required: '+review.form.human_actions.join('; ')+'. Completing verification does not itself establish eligibility or authorization.'));
+  s.append(node('p','rv-warning','BabyStepsAI will stop for CAPTCHA, authentication, legal acknowledgments, and unsupported controls. Final submission is never automated.'));root.append(s)
+}
+function renderAuthorization(){
+  const s=section('Permissions');const a=review.authorization;s.append(node('p','',`Current authorization version ${a.version} · standing policy ${a.settings.standing_policy_enabled?'enabled':'disabled'} · daily limit ${a.settings.standing_policy_daily_limit||'not set'}.`));
+  s.append(node('p','rv-note','Allowed fields: '+(a.current_allowed_fields.join(', ')||'none')+'. Any proposed additions require your explicit policy approval. Profile confirmation alone does not authorize sharing.'));
+  const d=document.createElement('details');d.append(node('summary','','Review the complete current and proposed policy'));const grid=node('div','rv-policy-preview');for(const [title,value] of [['Current policy',authProjection(a.settings)],['Proposed policy',{...authProjection(a.settings),'Allowed candidate fields':a.proposed_allowed_fields}]]){const box=document.createElement('div');box.append(node('h3','',title));const pre=document.createElement('pre');pre.textContent=JSON.stringify(value,null,2);box.append(pre);grid.append(box)}d.append(grid);
+  const additions=(a.proposed_allowed_fields||[]).filter(key=>!(a.current_allowed_fields||[]).includes(key));if(additions.length){const label=node('label','rv-check'),check=node('input');check.type='checkbox';check.id='policy-approve';label.append(check,document.createTextNode(' I reviewed this complete policy and explicitly approve adding only '+additions.join(' and ')+' to the allowed fields.'));const save=node('button','rv-primary','Approve and save policy update');save.type='button';save.onclick=()=>savePolicy(save,check.checked);const result=node('p','rv-draft-status','No permission changes have been saved.');result.id='policy-status';d.append(label,save,result)}else d.append(node('p','rv-good','The currently approved fields already cover the proposed field set. No policy update is needed.'));s.append(d);s.append(node('p','rv-muted','Any approval is versioned and read back before the review updates. Other policy settings must remain unchanged.'));root.append(s)
+}
+function renderSarathi(){
+  const s=section('Ask Sarathi');s.append(node('p','rv-muted','Ask about this opening, your answers, or blockers. The context toggle is off by default. Sarathi will not save profile changes without your confirmation.'));
+  const details=document.createElement('details');details.append(node('summary','','Open Sarathi for this application'));const frame=document.createElement('iframe');frame.id='sarathi-review-frame';frame.title='Sarathi conversational assistant';frame.loading='lazy';frame.src='/sarathi?compact=1';frame.referrerPolicy='same-origin';const sendTheme=()=>{try{frame.contentWindow.postMessage({type:'bsa-theme',theme:document.documentElement.dataset.bsaTheme==='dark'?'dark':'light'},location.origin)}catch{}};frame.addEventListener('load',sendTheme);new MutationObserver(sendTheme).observe(document.documentElement,{attributes:true,attributeFilter:['data-bsa-theme']});details.append(frame);s.append(details);
+  const link=node('a','rv-link','Open Sarathi in full page ↗');link.href='/sarathi';s.append(link);root.append(s)
+}
+async function load(){if(!jobKey){status.textContent='No saved opening was selected.';return}try{
+  const [data,profile,authorization,answers]=await Promise.all([req('/api/application-review?'+new URLSearchParams({job_key:jobKey})),req('/api/candidate-profile/verification'),req('/api/application-authorization'),req('/api/application-answers')]);review=data;profileData=profile;authData=authorization;answerRows=Array.isArray(answers)?answers:[];root.replaceChildren();renderReadiness();renderProfile();renderProposals();renderQuestions();renderAuthorization();renderEmployer();renderSarathi();status.textContent=review.application.attempt_count?'Existing application history is preserved. No new attempt was started.':'No application attempt exists for this opening.'
+}catch(e){status.textContent=reviewError(e.message);status.className='rv-error'}}
+window.addEventListener('message',event=>{if(event.origin===location.origin&&event.data?.type==='bsa-theme-request'){const frame=document.querySelector('#sarathi-review-frame');frame?.contentWindow.postMessage({type:'bsa-theme',theme:document.documentElement.dataset.bsaTheme==='dark'?'dark':'light'},location.origin)}});
+let answerRows=[];
+'''
+APPLICATION_REVIEW_PAGE = APPLICATION_REVIEW_PAGE.replace("load();\n</script></body></html>", REVIEW_INTERACTION_SCRIPT+"load();\n</script></body></html>",1)
+
+APPLICATION_REVIEW_PAGE = APPLICATION_REVIEW_PAGE.replace("</style></head>", r'''</style><style id="application-review-polish">
+body>main.rv-wrap{width:min(calc(100% - 40px),1180px)!important;max-width:1180px!important;padding:0 20px!important;margin:26px auto 56px!important}
+.rv-wrap{max-width:1180px}.rv-head{align-items:center;margin:10px 0 16px}.rv-head h1{font-size:clamp(26px,3vw,34px);letter-spacing:-.025em}.rv-muted{color:#52627a}.rv-card{border-radius:15px;padding:18px;margin:12px 0;box-shadow:0 2px 8px #102a4308}.rv-card h2{font-size:18px;letter-spacing:-.01em}.rv-grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr));gap:9px}.rv-item{background:#f8fafc;border-color:#d5deea}.rv-status{font-size:13px}.rv-primary,body button.rv-primary{background:#2859a5!important;border:1px solid #214c90!important;color:#fff!important;font-weight:700!important;box-shadow:0 1px 2px #10233a22}.rv-primary:hover:not(:disabled),body button.rv-primary:hover:not(:disabled){background:#204b8e!important}.rv-button:disabled,button:disabled{opacity:.56!important}.rv-card details{border-top:1px solid var(--rv-line);padding-top:10px;margin-top:12px}.rv-card summary{cursor:pointer;font-weight:700;padding:6px 2px}.rv-answer textarea{display:block;min-height:56px!important;height:56px;width:100%;resize:vertical;font:inherit;font-size:15px;line-height:1.5;padding:10px 12px;border:1px solid #aab8ca;border-radius:9px;background:var(--rv-surface);color:var(--rv-ink)}.rv-answer textarea:focus-visible,.rv-field input:focus-visible,.rv-check input:focus-visible,button:focus-visible,a:focus-visible{outline:3px solid #2563eb!important;outline-offset:2px!important}.rv-answer textarea::placeholder{color:#596a80;opacity:1}.rv-answer-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:9px 0}.rv-draft-status{min-height:22px;color:var(--rv-muted);font-size:13px}.rv-evidence{border-left:3px solid var(--rv-brand);padding:8px 10px;margin:8px 0;background:var(--rv-wash);overflow-wrap:anywhere}.rv-progress{height:8px;border-radius:9px;background:var(--rv-line);overflow:hidden}.rv-progress span{display:block;height:100%;background:#2f855a;transition:width .2s}.rv-hero-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(210px,.8fr);gap:14px;align-items:start}.rv-readiness-card{border-color:#9aaec8}.rv-next{font-size:16px;font-weight:650}.rv-section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.rv-helper{font-size:13px;color:var(--rv-muted)}#sarathi-review-frame{display:block;width:100%;height:560px;border:1px solid var(--rv-line);border-radius:10px;background:var(--rv-surface)}
+html[data-bsa-theme="dark"] .rv-muted,html[data-bsa-theme="dark"] .rv-helper{color:#bac7d9!important}html[data-bsa-theme="dark"] .rv-item{background:#1d2a40!important;color:#e7edf6!important;border-color:#43536b!important}html[data-bsa-theme="dark"] .rv-item strong,html[data-bsa-theme="dark"] .rv-item p{color:#e7edf6!important}html[data-bsa-theme="dark"] .rv-answer textarea,html[data-bsa-theme="dark"] .rv-field input,html[data-bsa-theme="dark"] .rv-field textarea{background:#101a2a!important;color:#f0f4fa!important;border-color:#71819a!important}html[data-bsa-theme="dark"] .rv-answer textarea::placeholder{color:#c3cede!important}html[data-bsa-theme="dark"] .rv-primary,html[data-bsa-theme="dark"] body button.rv-primary{background:#2859a5!important;border-color:#87a9d8!important;color:#fff!important}html[data-bsa-theme="dark"] .rv-status{color:#f0f4fa!important;background:#202e44}html[data-bsa-theme="dark"] .rv-warning{color:#ffd68d!important}html[data-bsa-theme="dark"] .rv-good{color:#9be6ba!important}
+@media(max-width:760px){body>main.rv-wrap{width:100%!important;padding:0 14px!important;margin:16px auto 40px!important}.rv-card{padding:14px}.rv-hero-grid{grid-template-columns:1fr}.rv-head{display:flex;align-items:flex-start}.rv-nav{gap:10px}.rv-actions>*{width:auto}#sarathi-review-frame{height:540px}}
+@media(max-width:420px){.rv-nav{display:grid;grid-template-columns:1fr 1fr}.rv-head{display:block}.rv-actions{display:grid;grid-template-columns:1fr}.rv-actions>*{width:100%}}
+</style></head>''',1)
 
 @router.get("/mock-apps/{scenario}",response_class=HTMLResponse)
 def mock_application(scenario:str):

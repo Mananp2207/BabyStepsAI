@@ -317,7 +317,10 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertIn("/api/application-authorization",review)
         self.assertIn("expected_version",review)
         self.assertIn("@media(max-width:640px)",review)
-        self.assertIn("Ask Sarathi about this opening",review)
+        self.assertIn("Ask Sarathi",review)
+        self.assertIn("sarathi-review-frame",review)
+        self.assertIn("Generate with Sarathi",review)
+        self.assertIn("Supporting evidence",review)
         self.assertIn("submission is disabled",review.casefold())
         self.assertIn("/api/application-review",main.app.openapi()["paths"])
 
@@ -945,23 +948,24 @@ class ApplicationAgentTests(unittest.TestCase):
         """Render the real review page against a synthetic read/write API in Chromium."""
         from urllib.parse import urlparse
         page_html=app_agent.application_review_page().body
-        policy={"allow_automatic_discovery":True,"allow_ai_matching":True,"matching_provider":"groq",
-            "groq_model":"openai/gpt-oss-20b","allow_groq_cloud_ai":True,"allow_automated_form_preparation":True,
-            "allow_auto_use_confirmed_answers":True,"allow_demographic_reuse":False,"allow_ai_drafting":False,
+        policy={"allow_automatic_discovery":True,"allow_ai_matching":True,"matching_provider":"ollama",
+            "groq_model":"openai/gpt-oss-20b","allow_groq_cloud_ai":False,"allow_automated_form_preparation":True,
+            "allow_auto_use_confirmed_answers":True,"allow_demographic_reuse":False,"allow_ai_drafting":True,
             "require_review_uncertain_answers":True,"max_applications_per_24_hours":3,"standing_policy_enabled":True,
             "standing_policy_categories":["Software Engineering"],"standing_policy_employment_types":["Full-time"],
             "standing_policy_countries":["United States"],"standing_policy_locations":["New York"],
             "standing_policy_work_arrangements":["Hybrid"],"standing_policy_experience_levels":["New Graduate"],
             "standing_policy_excluded_employers":[],"standing_policy_daily_limit":3,
             "standing_policy_field_keys":["full_name","email","phone"],"standing_policy_document_types":["resume"],
-            "standing_policy_reuse_confirmed_answers":True,"standing_policy_allow_ai_answers":False,
+            "standing_policy_reuse_confirmed_answers":True,"standing_policy_allow_ai_answers":True,
             "standing_policy_allow_cloud_ai":False,"standing_policy_allow_groq":False,"live_submission_enabled":False}
         auth={"version":9,"updated_at":"2026-11-01T00:00:00Z","settings":policy}
         review={"job":{"job_key":"greenhouse:synthetic:5027","employer":"Synthetic StubHub","title":"Software Engineer I (New Grad)",
                 "posting_url":"https://job-boards.greenhouse.io/synthetic/jobs/5027","application_url":"https://job-boards.greenhouse.io/synthetic/jobs/5027",
                 "location":"New York, NY","employment_type":"","work_arrangement":"Hybrid","availability_status":"open",
                 "last_verified_at":"2026-11-15T00:00:00Z","reopened_review_required":False},
-            "readiness":{"status":"Needs Applicant Information","next_action":"Review the missing synthetic evidence."},
+            "readiness":{"status":"Needs Applicant Information","next_action":"Review the missing synthetic evidence.","progress":{"completed":2,"total":7,"percent":29,
+                "checks":[{"label":"Posting availability","complete":True},{"label":"Current match","complete":False}] }},
             "attention":{"reason":"Synthetic review","eligibility_state":"needs_review","preparation_state":"not_prepared","status":"open"},
             "match":{"status":"completed","classification":"needs_review","freshness":"stale","current":False,"score_informational_only":True},
             "profile":[{"key":"full_name","label":"Full name","confirmed":True,"has_value":True},
@@ -975,6 +979,8 @@ class ApplicationAgentTests(unittest.TestCase):
                 "proposed_allowed_fields":["country","email","full_name","linkedin","phone"]},
             "form":{"state":"needs_human_action","inspected_at":"2026-11-15T00:00:00Z","provider":"greenhouse",
                 "required_fields":["LinkedIn URL","Country","Resume"],
+                "questions":[{"label":"Describe a confirmed API project","required":True,"field_type":"textarea",
+                    "ordinary_text_question":True,"human_only":False}],
                 "required_controls":[{"label":"LinkedIn URL","candidate_field":"linkedin","permission_current":False,"human_only":False},
                     {"label":"Country","candidate_field":"country","permission_current":False,"human_only":False}],
                 "required_uploads":[{"question":"Resume","purpose":"resume","supported":True,"permission_current":True}],
@@ -989,7 +995,7 @@ class ApplicationAgentTests(unittest.TestCase):
         profile_state={"fields":[{"key":"full_name","value":"Synthetic Candidate","confirmed":True},
             {"key":"email","value":"candidate@example.test","confirmed":True},
             {"key":"country","value":"","confirmed":False}]}
-        calls=[]
+        calls=[];answer_rows=[]
         class Handler(BaseHTTPRequestHandler):
             def _json(self,value,status=200):
                 body=json.dumps(value).encode();self.send_response(status);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
@@ -999,13 +1005,27 @@ class ApplicationAgentTests(unittest.TestCase):
                 elif path=="/api/application-review":self._json(review)
                 elif path=="/api/candidate-profile/verification":self._json(profile_state)
                 elif path=="/api/application-authorization":self._json(auth)
+                elif path=="/api/application-answers":self._json(answer_rows)
+                elif path=="/sarathi":self.send_response(200);self.send_header("Content-Type","text/html; charset=utf-8");self.end_headers();self.wfile.write(b"<html><body>Synthetic Sarathi frame</body></html>")
                 else:self.send_error(404)
             def do_POST(self):
-                calls.append(("POST",self.path));self._json({"verified":True,"message":"Synthetic proposal confirmed."})
+                body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0)) or 0) or b"{}")
+                calls.append(("POST",self.path,body))
+                if self.path=="/api/application-answers/draft":
+                    self._json({"answer":"I built a synthetic API project using confirmed Python experience.","needs_user_input":False,
+                        "question":body.get("question"),"disclaimer":"Synthetic grounded draft.",
+                        "evidence":[{"source":"Confirmed project evidence","excerpt":"Synthetic API project · Python","confirmed":True}],"evidence_used":["confirmed candidate profile"]})
+                else:self._json({"verified":True,"message":"Synthetic proposal confirmed."})
             def do_PUT(self):
                 body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0)) or 0) or b"{}")
-                calls.append(("PUT",self.path,body));auth["version"]+=1;auth["settings"]={**policy,"standing_policy_field_keys":body.get("standing_policy_field_keys",[])}
-                self._json({"version":auth["version"],"settings":auth["settings"]})
+                calls.append(("PUT",self.path,body))
+                if self.path=="/api/application-authorization":
+                    auth["version"]+=1;auth["settings"]={**policy,"standing_policy_field_keys":body.get("standing_policy_field_keys",[])}
+                    self._json({"version":auth["version"],"settings":auth["settings"]})
+                else:
+                    item={"key":self.path.rsplit("/",1)[-1],"question":body.get("question"),"answer":body.get("answer"),
+                        "confirmed":True,"sensitive":False,"reuse_scope":body.get("reuse_scope"),"auto_reuse":body.get("auto_reuse")}
+                    answer_rows.append(item);self._json({"key":item["key"],"persisted_verified":True})
             def log_message(self,*_args):pass
         server=ThreadingHTTPServer(("127.0.0.1",0),Handler);port=server.server_address[1]
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
@@ -1022,21 +1042,46 @@ class ApplicationAgentTests(unittest.TestCase):
                 self.assertIn("January 2027",page.locator("body").inner_text())
                 self.assertIn("CAPTCHA or human verification",page.locator("body").inner_text())
                 self.assertIn("Employment type: Unknown",page.locator("body").inner_text())
-                self.assertIn("No application attempt is started",page.locator("body").inner_text())
-                self.assertEqual(page.locator("input[type=checkbox]").count(),4)
+                self.assertIn("This review does not create an application attempt",page.locator("body").inner_text())
+                self.assertTrue(page.get_by_role("button",name="Generate with Sarathi").count()>=1)
+                self.assertEqual(page.locator("#bsa-sarathi-launcher").count(),0)
+                page.get_by_role("button",name="Generate with Sarathi").first.focus()
+                page.keyboard.press("Tab")
+                self.assertTrue(page.evaluate("document.activeElement.matches(':focus-visible')"))
+                motivation=page.locator(".rv-answer").filter(has_text="Professional motivation")
+                motivation.get_by_role("button",name="Generate with Sarathi").click()
+                page.get_by_text("Draft ready — review and edit before confirming.",exact=False).wait_for(timeout=5000)
+                self.assertIn("Supporting evidence",page.locator("body").inner_text())
+                area=motivation.get_by_label("Professional motivation answer")
+                area.fill("I am interested in this opportunity and value confirmed engineering work.")
+                confirm=motivation.locator('input[type="checkbox"]').first
+                confirm.check()
+                motivation.get_by_role("button",name="Confirm and save").click()
+                page.get_by_text("Answer saved and verified in your existing answer bank",exact=False).wait_for(timeout=5000)
+                self.assertEqual(len(answer_rows),1)
+                self.assertTrue(answer_rows[0]["confirmed"])
+                self.assertEqual(answer_rows[0]["reuse_scope"],"none")
+                page.locator("summary").get_by_text("Open Sarathi for this application").click()
+                page.frame_locator("#sarathi-review-frame").get_by_text("Synthetic Sarathi frame").wait_for(timeout=5000)
+                self.assertEqual(page.get_by_role("button",name="Submit application",exact=False).count(),0)
+                self.assertFalse(any("submit" in call[1].casefold() for call in calls))
                 page.locator("summary").get_by_text("Review the complete current and proposed policy").click()
                 page.locator("#policy-approve").check()
                 page.get_by_role("button",name="Approve and save policy update").click()
                 page.wait_for_function("document.querySelector('#page-status').textContent.includes('Policy saved and read back')")
-                self.assertEqual(len([call for call in calls if call[0]=="PUT"]),1)
-                self.assertEqual(calls[-1][2]["expected_version"],9)
-                self.assertCountEqual(calls[-1][2]["standing_policy_field_keys"],["full_name","email","phone","linkedin","country"])
-                for width in (1024,390):
+                policy_calls=[call for call in calls if call[0]=="PUT" and call[1]=="/api/application-authorization"]
+                self.assertEqual(len(policy_calls),1)
+                self.assertEqual(policy_calls[-1][2]["expected_version"],9)
+                self.assertCountEqual(policy_calls[-1][2]["standing_policy_field_keys"],["full_name","email","phone","linkedin","country"])
+                for width in (1024,768,390):
                     page.set_viewport_size({"width":width,"height":900})
                     page.evaluate("document.documentElement.dataset.bsaTheme='light'")
                     self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"),width)
                     page.evaluate("document.documentElement.dataset.bsaTheme='dark'")
                     self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"),width)
+                    colors=page.locator(".rv-primary").first.evaluate("el=>({background:getComputedStyle(el).backgroundColor,color:getComputedStyle(el).color})")
+                    self.assertEqual(colors["background"],"rgb(40, 89, 165)")
+                    self.assertEqual(colors["color"],"rgb(255, 255, 255)")
                 self.assertEqual(errors,[])
                 self.assertFalse(any("/submit" in call[1] for call in calls))
                 browser.close()
