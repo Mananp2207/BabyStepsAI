@@ -71,6 +71,56 @@ class CandidateImportTests(unittest.TestCase):
         self.assertEqual(saved["active"],0)
         self.assertEqual(stages,4)
 
+    def test_duplicate_import_completes_only_missing_website_with_same_site_evidence(self):
+        original=discovery.EmployerImportItem(name="Netic",source_type="ashby",source_token="netic",
+            careers_url="https://jobs.ashbyhq.com/netic/",evidence_url="https://jobs.ashbyhq.com/netic/posting")
+        with patch.object(discovery,"validate_public_https_url",side_effect=lambda value,**_kw:value):
+            discovery.register_employer_sources(discovery.EmployerImportRequest(sources=[original]))
+        with discovery.database() as db:
+            db.execute("UPDATE employers SET active=1,connector_status='healthy',evidence_url=? WHERE employer_id='ashby:netic'",
+                       ("https://jobs.ashbyhq.com/netic/posting",))
+        completed=original.model_copy(update={"website_url":"https://www.netic.ai/",
+            "evidence_url":"https://netic.ai/company"})
+        with patch.object(discovery,"validate_public_https_url",side_effect=lambda value,**_kw:value):
+            result=discovery.register_employer_sources(discovery.EmployerImportRequest(sources=[completed]))
+        self.assertEqual(result["imported"],0)
+        self.assertEqual(result["website_metadata_completed"],1)
+        with discovery.database() as db:
+            row=db.execute("SELECT name,website_url,evidence_url,careers_url,active,connector_status FROM employers WHERE employer_id='ashby:netic'").fetchone()
+        self.assertEqual(row["website_url"],"https://www.netic.ai/")
+        self.assertEqual(row["evidence_url"],"https://jobs.ashbyhq.com/netic/posting")
+        self.assertEqual(row["careers_url"],"https://jobs.ashbyhq.com/netic/")
+        self.assertEqual((row["active"],row["connector_status"]),(1,"healthy"))
+
+    def test_duplicate_import_does_not_fill_website_for_name_or_evidence_mismatch(self):
+        original=discovery.EmployerImportItem(name="Netic",source_type="ashby",source_token="netic",
+            careers_url="https://jobs.ashbyhq.com/netic/")
+        discovery.register_employer_sources(discovery.EmployerImportRequest(sources=[original]))
+        invalid=[original.model_copy(update={"name":"Different Employer","website_url":"https://netic.ai/",
+                    "evidence_url":"https://netic.ai/company"}),
+                 original.model_copy(update={"website_url":"https://netic.ai/",
+                    "evidence_url":"https://unrelated.example/company"})]
+        for item in invalid:
+            with patch.object(discovery,"validate_public_https_url",side_effect=lambda value,**_kw:value):
+                result=discovery.register_employer_sources(discovery.EmployerImportRequest(sources=[item]))
+            self.assertEqual(result["website_metadata_completed"],0)
+        with discovery.database() as db:
+            row=db.execute("SELECT website_url,active,connector_status FROM employers WHERE employer_id='ashby:netic'").fetchone()
+        self.assertEqual(row["website_url"],"")
+        self.assertEqual((row["active"],row["connector_status"]),(0,"needs_verification"))
+
+    def test_duplicate_import_never_overwrites_existing_website(self):
+        first=discovery.EmployerImportItem(name="Example",source_type="ashby",source_token="example",
+            careers_url="https://jobs.ashbyhq.com/example/",website_url="https://example.org/",
+            evidence_url="https://example.org/careers")
+        with patch.object(discovery,"validate_public_https_url",side_effect=lambda value,**_kw:value):
+            discovery.register_employer_sources(discovery.EmployerImportRequest(sources=[first]))
+            result=discovery.register_employer_sources(discovery.EmployerImportRequest(sources=[first.model_copy(
+                update={"website_url":"https://example.com/","evidence_url":"https://example.com/company"})]))
+        self.assertEqual(result["website_metadata_completed"],0)
+        with discovery.database() as db:
+            self.assertEqual(db.execute("SELECT website_url FROM employers WHERE employer_id='ashby:example'").fetchone()[0],"https://example.org/")
+
     def test_wikidata_importer_accepts_official_cc0_records_and_deduplicates(self):
         class Response:
             status_code=200; headers={}; content=b'{"results":{"bindings":[]}}'
