@@ -127,6 +127,7 @@ def get_authorization():
 
 
 class AuthorizationUpdate(BaseModel):
+    expected_version: int | None = Field(default=None, ge=1)
     allow_automatic_discovery: bool = False
     allow_ai_matching: bool = False
     matching_provider: Literal["ollama", "gemini", "groq"] = "ollama"
@@ -178,7 +179,8 @@ def authorization_status():
 
 @router.put("/api/application-authorization")
 def update_authorization(payload: AuthorizationUpdate):
-    settings = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict()
+    expected_version = payload.expected_version
+    settings = payload.model_dump(exclude={"expected_version"}) if hasattr(payload, "model_dump") else payload.dict(exclude={"expected_version"})
     if not groq_model_allowed(settings["groq_model"]):
         _authorization_field_error("groq_model", "Choose a Groq model explicitly listed for free-tier use.")
     if settings["allow_groq_cloud_ai"] and settings["matching_provider"] != "groq":
@@ -255,8 +257,12 @@ def update_authorization(payload: AuthorizationUpdate):
     settings["live_submission_enabled"] = False
     stamp = now()
     with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
         current = db.execute("SELECT version FROM application_authorizations WHERE user_id=?", (USER,)).fetchone()
-        version = (int(current["version"]) if current else 0) + 1
+        current_version = int(current["version"]) if current else 0
+        if expected_version is not None and current_version != expected_version:
+            raise HTTPException(409, "Authorization changed since this review was loaded. Reload the complete policy before approving it.")
+        version = current_version + 1
         encoded = json.dumps(settings, sort_keys=True)
         db.execute("""INSERT INTO application_authorizations(user_id,version,settings_json,updated_at) VALUES(?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET version=excluded.version,settings_json=excluded.settings_json,updated_at=excluded.updated_at""",

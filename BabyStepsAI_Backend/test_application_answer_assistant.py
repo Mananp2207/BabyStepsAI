@@ -67,6 +67,26 @@ class ApplicationAnswerAssistantTests(unittest.TestCase):
         with assistant.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM application_authorization_history WHERE user_id=?",(USER,)).fetchone()[0],3)
 
+    def test_policy_review_uses_expected_version_and_preserves_existing_scope(self):
+        from fastapi import HTTPException
+        initial=assistant.get_authorization()
+        settings=initial["settings"]
+        body={key:value for key,value in settings.items() if key in assistant.AuthorizationUpdate.model_fields}
+        body["standing_policy_field_keys"]=["full_name","email","phone","linkedin","country"]
+        body["expected_version"]=initial["version"]
+        updated=assistant.update_authorization(assistant.AuthorizationUpdate(**body))
+        self.assertEqual(updated["version"],initial["version"]+1)
+        self.assertEqual(updated["settings"]["standing_policy_field_keys"],body["standing_policy_field_keys"])
+        for key,value in settings.items():
+            if key not in {"standing_policy_field_keys","live_submission_enabled","gemini_configured","groq_configured"} and key in updated["settings"]:
+                self.assertEqual(updated["settings"][key],value,key)
+        stale=dict(body);stale["expected_version"]=initial["version"]
+        with self.assertRaises(HTTPException) as caught:
+            assistant.update_authorization(assistant.AuthorizationUpdate(**stale))
+        self.assertEqual(caught.exception.status_code,409)
+        self.assertEqual(assistant.get_authorization()["version"],updated["version"])
+        self.assertFalse(assistant.get_authorization()["settings"]["live_submission_enabled"])
+
     def test_matching_provider_is_versioned_and_gemini_key_is_not_persisted(self):
         with patch.dict(os.environ,{"GEMINI_API_KEY":"optional-test-key"}):
             saved=assistant.update_authorization(assistant.AuthorizationUpdate(

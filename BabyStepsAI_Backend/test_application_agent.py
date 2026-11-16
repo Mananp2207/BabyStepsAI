@@ -19,6 +19,7 @@ import application_agent as app_agent
 import candidate_verification as profile
 import application_answer_assistant as answer_assistant
 import resume_job_matcher as matcher
+import sarathi
 import job_search_agent as jobs
 from job_search_agent import USER
 
@@ -262,6 +263,63 @@ class ApplicationAgentTests(unittest.TestCase):
         with app_agent.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM applications").fetchone()[0],0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts").fetchone()[0],0)
+
+    def test_unified_saved_job_review_aggregates_proposals_policy_questions_and_employer_blockers_read_only(self):
+        key="greenhouse:synthetic-review:123"
+        url="https://job-boards.greenhouse.io/synthetic-review/jobs/123"
+        with app_agent.connect() as db:
+            db.execute("INSERT INTO discovered_openings(user_id,job_key,company,title,location,url,discovered_at,employment_type,location_status,location_reason,search_prompt,discovery_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (USER,key,"Synthetic StubHub","Software Engineer I (New Grad)","New York, New York",url,"2026-01-01","","unknown","","synthetic","Greenhouse"))
+            db.execute("CREATE TABLE sarathi_profile_proposals(proposal_id TEXT PRIMARY KEY,conversation_id TEXT,user_id TEXT,field_key TEXT,value_encrypted TEXT,status TEXT,created_at TEXT,expires_at TEXT,confirmed_at TEXT)")
+            now=app_agent.now();value="Available for full-time employment starting January 2027."
+            db.execute("INSERT INTO sarathi_profile_proposals(proposal_id,conversation_id,user_id,field_key,value_encrypted,status,created_at,expires_at) VALUES(?,?,?,?,?,'pending',?,?)",
+                ("proposal-1","conversation-1",USER,"full_time_availability",sarathi.encrypt_text(value),now,"2099-01-01T00:00:00+00:00"))
+            db.execute("INSERT INTO sarathi_profile_proposals(proposal_id,conversation_id,user_id,field_key,value_encrypted,status,created_at,expires_at) VALUES(?,?,?,?,?,'pending',?,?)",
+                ("proposal-1-duplicate","conversation-2",USER,"full_time_availability",sarathi.encrypt_text(value),now,"2099-01-01T00:00:00+00:00"))
+            report={"provider":{"provider":"greenhouse"},"compatibility_status":"needs_human_action","inspection_outcome":"needs_human_action",
+                "form_detected":True,"page_classification":"application_form","robots_policy":"verified_allow",
+                "requested_application_url":url,"inspected_at":now,"form_fingerprint":"synthetic-form-v1",
+                "fields":[{"label":"LinkedIn URL","question":"LinkedIn URL","required":True},
+                    {"label":"Country","question":"Country","required":True},
+                    {"label":"Work authorization","question":"Will you require sponsorship?","required":True}],
+                "required_fields":["LinkedIn URL","Country","Will you require sponsorship?"],
+                "upload_control_details":[{"question":"Resume/CV","purpose":"resume","required":True,"supported":True}],
+                "human_actions_required":["CAPTCHA or human verification"],"submission_control_status":"detected_visible",
+                "submission_control_detected":True,"unresolved_controls":[],"unsupported_fields":[]}
+            db.execute("INSERT INTO application_form_inspections(id,user_id,job_key,provider,outcome,report_json,inspected_at) VALUES(?,?,?,?,?,?,?)",
+                ("inspection-1",USER,key,"greenhouse","needs_human_action",json.dumps(report),now))
+        app_agent._record_application_attention({"job_key":key,"company":"Synthetic StubHub","title":"Software Engineer I (New Grad)","job_url":url,"application_url":url},
+            "applicant_information","Synthetic review required",form_state="needs_human_action")
+        result=app_agent.application_review_data(key)
+        self.assertEqual(result["job"]["employer"],"Synthetic StubHub")
+        self.assertEqual(result["readiness"]["status"],"Needs Applicant Information")
+        self.assertEqual(result["profile_proposals"][0]["value"],value)
+        self.assertEqual(result["profile_proposals"][0]["duplicate_count"],2)
+        self.assertEqual(len(result["profile_proposals"][0]["proposal_ids"]),2)
+        self.assertEqual(result["authorization"]["current_allowed_fields"],[])
+        self.assertEqual(result["authorization"]["proposed_allowed_fields"],["country","linkedin"])
+        self.assertFalse(next(x for x in result["profile"] if x["key"]=="country")["confirmed"])
+        self.assertIn("CAPTCHA or human verification",result["form"]["human_actions"])
+        self.assertEqual(result["form"]["submission_control_status"],"detected_visible")
+        self.assertFalse(result["live_submission_enabled"])
+        self.assertEqual(result["application"]["attempt_count"],0)
+        with app_agent.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts").fetchone()[0],0)
+
+    def test_unified_review_page_links_from_attention_and_supports_mobile_theme(self):
+        page=app_agent.applications_page().body.decode("utf-8")
+        review=app_agent.application_review_page().body.decode("utf-8")
+        self.assertIn("Review Application",page)
+        self.assertIn("/applications/review?",page)
+        self.assertIn("Confirm and save",review)
+        self.assertIn("Approve and save policy update",review)
+        self.assertIn("/api/application-authorization",review)
+        self.assertIn("expected_version",review)
+        self.assertIn("@media(max-width:640px)",review)
+        self.assertIn("Ask Sarathi about this opening",review)
+        self.assertIn("submission is disabled",review.casefold())
+        self.assertIn("/api/application-review",main.app.openapi()["paths"])
 
     def _human_verification_attempt(self, *, outcome=None, resume_count=0):
         job={"job_key":"greenhouse:synthetic:resume-123","company":"Synthetic Employer",
@@ -881,6 +939,109 @@ class ApplicationAgentTests(unittest.TestCase):
             self.assertEqual(submitted,[])
         finally:
             server.shutdown();server.server_close();thread.join(timeout=2);app_agent.ARTIFACTS=old_artifacts
+
+    @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")=="1","Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to launch installed Chromium.")
+    def test_unified_application_review_chromium_renders_responsive_synthetic_review(self):
+        """Render the real review page against a synthetic read/write API in Chromium."""
+        from urllib.parse import urlparse
+        page_html=app_agent.application_review_page().body
+        policy={"allow_automatic_discovery":True,"allow_ai_matching":True,"matching_provider":"groq",
+            "groq_model":"openai/gpt-oss-20b","allow_groq_cloud_ai":True,"allow_automated_form_preparation":True,
+            "allow_auto_use_confirmed_answers":True,"allow_demographic_reuse":False,"allow_ai_drafting":False,
+            "require_review_uncertain_answers":True,"max_applications_per_24_hours":3,"standing_policy_enabled":True,
+            "standing_policy_categories":["Software Engineering"],"standing_policy_employment_types":["Full-time"],
+            "standing_policy_countries":["United States"],"standing_policy_locations":["New York"],
+            "standing_policy_work_arrangements":["Hybrid"],"standing_policy_experience_levels":["New Graduate"],
+            "standing_policy_excluded_employers":[],"standing_policy_daily_limit":3,
+            "standing_policy_field_keys":["full_name","email","phone"],"standing_policy_document_types":["resume"],
+            "standing_policy_reuse_confirmed_answers":True,"standing_policy_allow_ai_answers":False,
+            "standing_policy_allow_cloud_ai":False,"standing_policy_allow_groq":False,"live_submission_enabled":False}
+        auth={"version":9,"updated_at":"2026-11-01T00:00:00Z","settings":policy}
+        review={"job":{"job_key":"greenhouse:synthetic:5027","employer":"Synthetic StubHub","title":"Software Engineer I (New Grad)",
+                "posting_url":"https://job-boards.greenhouse.io/synthetic/jobs/5027","application_url":"https://job-boards.greenhouse.io/synthetic/jobs/5027",
+                "location":"New York, NY","employment_type":"","work_arrangement":"Hybrid","availability_status":"open",
+                "last_verified_at":"2026-11-15T00:00:00Z","reopened_review_required":False},
+            "readiness":{"status":"Needs Applicant Information","next_action":"Review the missing synthetic evidence."},
+            "attention":{"reason":"Synthetic review","eligibility_state":"needs_review","preparation_state":"not_prepared","status":"open"},
+            "match":{"status":"completed","classification":"needs_review","freshness":"stale","current":False,"score_informational_only":True},
+            "profile":[{"key":"full_name","label":"Full name","confirmed":True,"has_value":True},
+                {"key":"email","label":"Email","confirmed":True,"has_value":True},
+                {"key":"country","label":"Country","confirmed":False,"has_value":False}],
+            "profile_proposals":[{"proposal_id":"synthetic-proposal-start","field_key":"full_time_availability","label":"Earliest full-time availability",
+                "value":"January 2027","created_at":"2026-11-01T00:00:00Z","expires_at":"2026-12-01T00:00:00Z"},
+                {"proposal_id":"synthetic-proposal-hybrid","field_key":"work_arrangement_preferences","label":"Work arrangement preferences",
+                "value":"New York hybrid, three office days weekly","created_at":"2026-11-01T00:00:00Z","expires_at":"2026-12-01T00:00:00Z"}],
+            "authorization":{"version":9,"settings":policy,"current_allowed_fields":["full_name","email","phone"],
+                "proposed_allowed_fields":["country","email","full_name","linkedin","phone"]},
+            "form":{"state":"needs_human_action","inspected_at":"2026-11-15T00:00:00Z","provider":"greenhouse",
+                "required_fields":["LinkedIn URL","Country","Resume"],
+                "required_controls":[{"label":"LinkedIn URL","candidate_field":"linkedin","permission_current":False,"human_only":False},
+                    {"label":"Country","candidate_field":"country","permission_current":False,"human_only":False}],
+                "required_uploads":[{"question":"Resume","purpose":"resume","supported":True,"permission_current":True}],
+                "human_actions":["CAPTCHA or human verification","Legal accuracy declaration"],
+                "submission_control_status":"detected_visible","submission_control_detected":True,"submission_disabled":True},
+            "answers":{"work_authorization":{"confirmed_record":False,"job_specific":False},"sponsorship":{"confirmed_record":False,"job_specific":False},
+                "professional_experience":{"confirmed_record":False,"job_specific":False},"technical_qualification":{"confirmed_record":False,"job_specific":False}},
+            "preparation_plan":{"ready":False,"authorization_current":False,"next_action":"No synthetic grant exists."},
+            "application":{"state":"not_started","attempt_count":0,"has_reservation":False,"confirmed_submitted":False,"outcomes":[]},
+            "blockers":{"applicant":["Synthetic applicant review required."],"employer":["Employment type unknown."],
+                "policy":[],"human":["CAPTCHA or human verification"]},"live_submission_enabled":False}
+        profile_state={"fields":[{"key":"full_name","value":"Synthetic Candidate","confirmed":True},
+            {"key":"email","value":"candidate@example.test","confirmed":True},
+            {"key":"country","value":"","confirmed":False}]}
+        calls=[]
+        class Handler(BaseHTTPRequestHandler):
+            def _json(self,value,status=200):
+                body=json.dumps(value).encode();self.send_response(status);self.send_header("Content-Type","application/json");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            def do_GET(self):
+                path=urlparse(self.path).path
+                if path=="/applications/review":self.send_response(200);self.send_header("Content-Type","text/html; charset=utf-8");self.end_headers();self.wfile.write(page_html)
+                elif path=="/api/application-review":self._json(review)
+                elif path=="/api/candidate-profile/verification":self._json(profile_state)
+                elif path=="/api/application-authorization":self._json(auth)
+                else:self.send_error(404)
+            def do_POST(self):
+                calls.append(("POST",self.path));self._json({"verified":True,"message":"Synthetic proposal confirmed."})
+            def do_PUT(self):
+                body=json.loads(self.rfile.read(int(self.headers.get("Content-Length",0)) or 0) or b"{}")
+                calls.append(("PUT",self.path,body));auth["version"]+=1;auth["settings"]={**policy,"standing_policy_field_keys":body.get("standing_policy_field_keys",[])}
+                self._json({"version":auth["version"],"settings":auth["settings"]})
+            def log_message(self,*_args):pass
+        server=ThreadingHTTPServer(("127.0.0.1",0),Handler);port=server.server_address[1]
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        self.patch_playwright.stop()
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                browser=p.chromium.launch(headless=True)
+                page=browser.new_page(viewport={"width":1280,"height":900})
+                errors=[];page.on("pageerror",lambda error:errors.append(str(error)))
+                page.goto(f"http://127.0.0.1:{port}/applications/review?job_key=greenhouse%3Asynthetic%3A5027",wait_until="networkidle")
+                page.get_by_text("Synthetic StubHub — Software Engineer I (New Grad)").wait_for()
+                self.assertIn("Needs Applicant Information",page.locator("#readiness").inner_text())
+                self.assertIn("January 2027",page.locator("body").inner_text())
+                self.assertIn("CAPTCHA or human verification",page.locator("body").inner_text())
+                self.assertIn("Employment type: Unknown",page.locator("body").inner_text())
+                self.assertIn("No application attempt is started",page.locator("body").inner_text())
+                self.assertEqual(page.locator("input[type=checkbox]").count(),4)
+                page.locator("summary").get_by_text("Review the complete current and proposed policy").click()
+                page.locator("#policy-approve").check()
+                page.get_by_role("button",name="Approve and save policy update").click()
+                page.wait_for_function("document.querySelector('#page-status').textContent.includes('Policy saved and read back')")
+                self.assertEqual(len([call for call in calls if call[0]=="PUT"]),1)
+                self.assertEqual(calls[-1][2]["expected_version"],9)
+                self.assertCountEqual(calls[-1][2]["standing_policy_field_keys"],["full_name","email","phone","linkedin","country"])
+                for width in (1024,390):
+                    page.set_viewport_size({"width":width,"height":900})
+                    page.evaluate("document.documentElement.dataset.bsaTheme='light'")
+                    self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"),width)
+                    page.evaluate("document.documentElement.dataset.bsaTheme='dark'")
+                    self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"),width)
+                self.assertEqual(errors,[])
+                self.assertFalse(any("/submit" in call[1] for call in calls))
+                browser.close()
+        finally:
+            server.shutdown();server.server_close();thread.join(timeout=2)
 
     @unittest.skipUnless(os.getenv("BABYSTEPS_RUN_REAL_CHROMIUM")=="1","Set BABYSTEPS_RUN_REAL_CHROMIUM=1 to launch installed Chromium.")
     def test_real_chromium_manual_outcome_ui_uses_synthetic_api_and_never_submits(self):
