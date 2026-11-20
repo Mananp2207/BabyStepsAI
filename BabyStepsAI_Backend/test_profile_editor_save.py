@@ -20,7 +20,8 @@ class LegacyProfileEditorPersistenceTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_profile_editor_save_is_persisted_and_readable(self):
-        expected = {key: [] for key in main.PROFILE_FIELDS}
+        expected = {key: [] for key in main.PROFILE_LIST_FIELDS}
+        expected.update({key: "" for key in main.PROFILE_SCALAR_FIELDS})
         expected["technical_skills"] = ["Python"]
         result = main.save_profile("r1", expected)
         self.assertEqual(result["status"], "user_reviewed")

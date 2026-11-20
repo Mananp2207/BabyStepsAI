@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from tenant_context import TenantThreadPoolExecutor as ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +28,9 @@ import job_relevance
 import resume_job_matcher
 import job_description_enricher
 from ui_theme import apply_ui_theme
+import tenant_context
+from tenant_context import database_path
+from database_adapter import connect_database, postgres_enabled
 
 router = APIRouter()
 DB = Path(__file__).resolve().parent / "babysteps.db"
@@ -44,7 +47,7 @@ def now():
 
 
 def connect():
-    db=sqlite3.connect(DB,timeout=30)
+    db=connect_database(database_path(DB),timeout=30)
     db.row_factory=sqlite3.Row
     return db
 
@@ -112,7 +115,8 @@ def initialize():
         # process imported this module; discovery leases govern recovery.
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 def run_auto_apply_scheduler_cycle():
     """Execute one idempotent scheduler pass; exposed for isolated integration tests."""
@@ -164,6 +168,8 @@ def _standing_policy_current():
 @router.on_event("startup")
 def start_auto_apply_scheduler():
     global _auto_apply_thread
+    if tenant_context.AUTH_MODE == "oidc":
+        return
     if _auto_apply_thread and _auto_apply_thread.is_alive():return
     _auto_apply_stop.clear()
     _auto_apply_thread=threading.Thread(target=_auto_apply_scheduler,name="baby-steps-auto-apply",daemon=True)
@@ -206,6 +212,10 @@ class EligibilityAction(BaseModel):
 
 
 def _local_only(request: Request):
+    if tenant_context.AUTH_MODE == "oidc":
+        if not getattr(request.state, "user_id", None):
+            raise HTTPException(401, "Authentication is required.")
+        return
     host=getattr(getattr(request,"client",None),"host",None)
     try:
         import ipaddress

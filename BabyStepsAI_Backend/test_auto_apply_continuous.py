@@ -278,7 +278,7 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                 with patch.object(main, "extract_pdf_text", return_value="Synthetic Candidate\nPython developer"), \
                      patch.object(main, "enqueue", return_value={"status": "queued"}):
                     uploaded = asyncio.run(main.upload_resume(UploadFile(filename="synthetic.pdf",
-                                                                          file=BytesIO(b"synthetic-pdf-bytes"))))
+                                                                          file=BytesIO(b"%PDF-1.4\n% synthetic fixture\n%%EOF"))))
                 resume_id = uploaded["id"]
                 with jobs.database() as db:
                     row = db.execute("SELECT active,stored_name FROM resumes WHERE id=?", (resume_id,)).fetchone()
@@ -287,7 +287,8 @@ class ContinuousAutoApplyTests(unittest.TestCase):
                 (Path(verification.__file__).resolve().parent / "private_resumes" / row["stored_name"]).write_bytes(
                     (self.storage / row["stored_name"]).read_bytes())
 
-                profile_payload = {key: [] for key in main.PROFILE_FIELDS}
+                profile_payload = {key: [] for key in main.PROFILE_LIST_FIELDS}
+                profile_payload.update({key: "" for key in main.PROFILE_SCALAR_FIELDS})
                 profile_payload.update({"education": [{"degree": "B.S.", "major": "Computer Science"}],
                                         "technical_skills": ["Python"]})
                 saved_profile = main.save_profile(resume_id, profile_payload)

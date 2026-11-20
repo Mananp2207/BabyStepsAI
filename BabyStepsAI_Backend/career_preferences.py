@@ -15,11 +15,13 @@ from career_catalog import (
 )
 from ui_theme import apply_ui_theme
 from matching_versions import fingerprint
+from tenant_context import USER_ID, database_path
+from database_adapter import connect_database, postgres_enabled
 
 router = APIRouter()
 
 DB = Path(__file__).resolve().parent / "babysteps.db"
-USER = "local-test-user"
+USER = USER_ID
 
 FEATURED = [
     "Software Development",
@@ -137,29 +139,34 @@ class ClosingConnection(sqlite3.Connection):
 
 
 def connect():
-    db = sqlite3.connect(DB, timeout=30, factory=ClosingConnection)
+    db = connect_database(database_path(DB), timeout=30, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     return db
 
 
 initialize_catalog()
 
-with connect() as db:
-    db.execute("""
+def initialize():
+    with connect() as db:
+        db.execute("""
         CREATE TABLE IF NOT EXISTS career_preferences (
             user_id TEXT PRIMARY KEY,
             preferences_json TEXT NOT NULL
         )
-    """)
-    columns={row[1] for row in db.execute("PRAGMA table_info(career_preferences)")}
-    if "preference_version" not in columns:
-        db.execute("ALTER TABLE career_preferences ADD COLUMN preference_version INTEGER NOT NULL DEFAULT 1")
-    if "preferences_fingerprint" not in columns:
-        db.execute("ALTER TABLE career_preferences ADD COLUMN preferences_fingerprint TEXT NOT NULL DEFAULT ''")
-    for row in db.execute("SELECT user_id,preferences_json,preferences_fingerprint FROM career_preferences").fetchall():
-        digest=fingerprint(json.loads(row["preferences_json"]))
-        if not row["preferences_fingerprint"]:
-            db.execute("UPDATE career_preferences SET preferences_fingerprint=? WHERE user_id=?",(digest,row["user_id"]))
+        """)
+        columns={row[1] for row in db.execute("PRAGMA table_info(career_preferences)")}
+        if "preference_version" not in columns:
+            db.execute("ALTER TABLE career_preferences ADD COLUMN preference_version INTEGER NOT NULL DEFAULT 1")
+        if "preferences_fingerprint" not in columns:
+            db.execute("ALTER TABLE career_preferences ADD COLUMN preferences_fingerprint TEXT NOT NULL DEFAULT ''")
+        for row in db.execute("SELECT user_id,preferences_json,preferences_fingerprint FROM career_preferences").fetchall():
+            digest=fingerprint(json.loads(row["preferences_json"]))
+            if not row["preferences_fingerprint"]:
+                db.execute("UPDATE career_preferences SET preferences_fingerprint=? WHERE user_id=?",(digest,row["user_id"]))
+
+
+if not postgres_enabled():
+    initialize()
 
 
 @router.get("/api/careers")

@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.robotparser
 import urllib.request
 from datetime import timedelta
-from concurrent.futures import ThreadPoolExecutor
+from tenant_context import TenantThreadPoolExecutor as ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -30,6 +30,9 @@ from pydantic import BaseModel, Field
 
 from job_search_agent import USER, DB as JOB_DB, fetch_board
 from job_connectors import canonicalize_job_url
+from tenant_context import database_path, private_storage_path
+from database_adapter import connect_database, postgres_enabled
+from private_storage import resolve_private_file
 from candidate_verification import (verified_profile_facts, save_application_answer, AnswerUpdate,
                                     verified_values_from_json, _answer_plaintext,
                                     canonical_answer_identity, stable_answer_key, _validate_profile_url,
@@ -260,7 +263,9 @@ class ClosingConnection(sqlite3.Connection):
         finally: self.close()
 
 def connect():
-    db = sqlite3.connect(DB, timeout=30, factory=ClosingConnection); db.row_factory = sqlite3.Row; return db
+    db = connect_database(database_path(DB), timeout=30, factory=ClosingConnection)
+    if isinstance(db,sqlite3.Connection):db.row_factory = sqlite3.Row
+    return db
 
 def initialize():
     with connect() as db:
@@ -461,7 +466,8 @@ def recover_stale_applications():
         return _recover_stale_in_db(db)
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 def _quota_limit(db, user_id=USER):
@@ -1208,8 +1214,9 @@ def _preparation_snapshot(job_key,resume_id,application_url):
     resume_file_hash=""
     if resume:
         name=str(resume["stored_name"] or "")
-        path=(STORAGE/Path(name).name).resolve()
-        if name and Path(name).name==name and path.parent==STORAGE.resolve() and path.is_file():
+        try:path=resolve_private_file(STORAGE,name,user_id=str(USER))
+        except (FileNotFoundError,ValueError,RuntimeError):path=None
+        if path is not None:
             try:
                 stat=path.stat(); cache_key=(str(resume_id),str(path),stat.st_size,stat.st_mtime_ns)
                 with _resume_fingerprint_lock: resume_file_hash=_resume_fingerprint_cache.get(cache_key,"")
@@ -1832,9 +1839,11 @@ def list_saved_application_jobs(q:str="",eligibility:str="all"):
         item["question_groups"]=_group_questions(app_diagnostic.get("unanswered_fields",[]))
         item["missing_questions"]=[entry["question"] for group in item["question_groups"] for entry in group["questions"]]
         item["url_syntax_allowed"]=_url_syntax_allowed(item.get("url"))
-        resume_name=Path(str(item.get("active_resume_stored_name") or ""))
-        resume_path=(STORAGE/resume_name.name).resolve()
-        resume_available=bool(item["has_active_resume"] and resume_name.name==str(item.get("active_resume_stored_name") or "") and resume_path.parent==STORAGE.resolve() and resume_path.is_file())
+        resume_name=str(item.get("active_resume_stored_name") or "")
+        try:
+            resolve_private_file(STORAGE,resume_name,user_id=str(USER))
+            resume_available=bool(item["has_active_resume"] and resume_name)
+        except (FileNotFoundError,ValueError,RuntimeError):resume_available=False
         with connect() as db:
             gate_class,reviewed,unresolved=_eligibility_gate(db,item.get("job_key"),item.get("active_resume_id")) if item.get("active_resume_id") else ("not_analyzed",False,True)
             opening_description=db.execute("SELECT description,work_arrangement FROM discovered_openings WHERE user_id=? AND job_key=?",
@@ -2025,9 +2034,9 @@ def _candidate():
                 "category":item["question_category"],"context":item["question_context"],
                 "reuse_scope":item["reuse_scope"],"scope_job_key":item["scope_job_key"],
                 "profile_version":item["profile_version"]}
-    stored=Path(str(resume["stored_name"] or ""))
-    resume_path=(STORAGE/stored.name).resolve()
-    if stored.name!=str(resume["stored_name"] or "") or resume_path.parent!=STORAGE.resolve() or not resume_path.is_file():
+    stored=str(resume["stored_name"] or "")
+    try:resume_path=resolve_private_file(STORAGE,stored,user_id=str(USER))
+    except (FileNotFoundError,ValueError,RuntimeError):
         raise HTTPException(409,"The active resume file is unavailable or invalid. Upload and activate a valid PDF first.")
     values={}; confirmed={}
     if v:
@@ -2044,13 +2053,14 @@ def _candidate():
         with connect() as db:
             docs=db.execute("SELECT document_type,stored_name,original_name,mime_type FROM application_documents WHERE user_id=? AND resume_id=? ORDER BY created_at DESC",
                             (USER,resume["id"])).fetchall()
-        private_docs=(Path(__file__).resolve().parent/"private_documents").resolve()
+        private_docs=Path(__file__).resolve().parent/"private_documents"
         facts["__application_documents"]=[]
         for doc in docs:
             name=str(doc["stored_name"] or "")
             if not re.fullmatch(r"[0-9a-f-]{36}\.(?:pdf|docx|png|jpg|jpeg)",name,re.I):continue
-            path=(private_docs/name).resolve()
-            if path.parent==private_docs and path.is_file():
+            try:path=resolve_private_file(private_docs,name,user_id=str(USER))
+            except (FileNotFoundError,ValueError,RuntimeError):continue
+            if path.is_file():
                 facts["__application_documents"].append({"document_type":doc["document_type"],
                     "original_name":doc["original_name"],"mime_type":doc["mime_type"],"path":str(path)})
     except sqlite3.OperationalError:
@@ -3388,7 +3398,11 @@ def _screenshot(page,app_id):
         with connect() as db: row=db.execute("SELECT attempt_number FROM applications WHERE id=? AND user_id=?",(app_id,USER)).fetchone()
         number=max(1,int(row["attempt_number"] or 1)) if row else 1
         name=f"{app_id}-attempt-{number}.png"
-        page.screenshot(path=str(ARTIFACTS/name),full_page=True,timeout=5000); return name
+        artifacts=private_storage_path(ARTIFACTS)
+        screenshot=artifacts/name
+        page.screenshot(path=str(screenshot),full_page=True,timeout=5000)
+        if os.name!="nt":os.chmod(screenshot,0o600)
+        return name
     except Exception: return None
 
 def _process_application_inner(app_id,job,resume,candidate,answers):
@@ -3478,8 +3492,7 @@ def _process_application_inner(app_id,job,resume,candidate,answers):
                             form_state=str(preflight.get("compatibility_status") or "unsupported"),report=preflight)
                 return
         from playwright.sync_api import sync_playwright
-        resume_path=STORAGE/resume["stored_name"]
-        if not resume_path.is_file(): raise RuntimeError("The active resume file is unavailable.")
+        resume_path=resolve_private_file(STORAGE,str(resume["stored_name"] or ""),user_id=str(USER))
         with _ManagedPlaywrightContext(sync_playwright) as p:
             diagnostic["phase"]="browser_launch"
             browser=p.chromium.launch(headless=browser_launch_headless(local_mock));p.attach(None,browser)
@@ -4689,6 +4702,37 @@ def application_review_data(job_key: str):
     form_fields=report.get("fields") if isinstance(report.get("fields"),list) else []
     required_controls=[]
     form_questions=[]
+    def employer_field_ids(field):
+        values=[field.get(name) for name in ("question_id","field_id","id","name")]
+        return list(dict.fromkeys(str(value).strip()[:200] for value in values
+                                  if isinstance(value,(str,int)) and str(value).strip()))
+    def review_question_identity(label):
+        text=re.sub(r"\s+"," ",str(label or "").casefold()).strip()
+        if re.search(r"ai.{0,30}interview assistant|interview assistant.{0,30}consent|consent.{0,30}ai",text):
+            return "ai_interview_assistant_consent"
+        if re.search(r"data structures?.{0,80}algorithms?|software design fundamentals",text):
+            return "data_structures_algorithms_design"
+        if re.search(r"full[ -]?time",text) and re.search(r"professional|software|work experience|employment history",text):
+            if re.search(r"\b(?:how many|number of|years?|months?|duration|long)\b",text):
+                return "full_time_professional_experience_duration"
+            return "full_time_professional_experience_description"
+        normalized=re.sub(r"[^a-z0-9]+"," ",text).strip()
+        normalized=re.sub(r"\b(?:please|describe|tell us|tell me|provide|briefly|your|you|the|a|an|this|that|experience|question)\b"," ",normalized)
+        return re.sub(r"\s+"," ",normalized).strip()
+    def deduplicate_review_fields(fields):
+        result=[]
+        for field in fields:
+            ids=field.get("employer_field_ids") or []
+            identity=review_question_identity(field.get("label"))
+            duplicate=next((existing for existing in result
+                if (ids and set(ids).intersection(existing.get("employer_field_ids") or [])) or
+                   (identity and identity==review_question_identity(existing.get("label")))),None)
+            if duplicate is None:
+                result.append(field)
+                continue
+            duplicate["employer_field_ids"]=list(dict.fromkeys([*(duplicate.get("employer_field_ids") or []),*ids]))
+            duplicate["required"]=bool(duplicate.get("required") or field.get("required"))
+        return result
     for field in form_fields:
         if not isinstance(field,dict):continue
         label=str(field.get("question") or field.get("label") or "Required employer field")[:500]
@@ -4696,23 +4740,29 @@ def application_review_data(job_key: str):
         candidate_key=("country" if "country" in text else "linkedin" if "linkedin" in text else
                        "email" if "email" in text else "phone" if "phone" in text else
                        "full_name" if "name" in text else "")
-        human_only=bool(re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|authori[sz]ation|citizenship|demographic|ai interview assistant",text))
+        human_only=bool(SENSITIVE_PROMPT.search(text) or re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|authori[sz]ation|citizenship|demographic|ai interview assistant",text))
         field_type=str(field.get("type") or field.get("tag") or "").casefold()
         item={"label":label,"candidate_field":candidate_key,"required":bool(field.get("required")),
-            "field_type":field_type,"permission_current":bool(candidate_key and candidate_key in field_keys),
+            "field_type":field_type,"employer_field_ids":employer_field_ids(field),
+            "permission_current":bool(candidate_key and candidate_key in field_keys),
             "human_only":human_only}
         if field.get("required"):required_controls.append(item)
         if not candidate_key and not human_only:
             form_questions.append({**item,"ordinary_text_question":bool(field_type in {"textarea","text","search"} or
                 re.search(r"describe|tell us|why|experience|project|skills|technical|programming|challenge|motivation",text))})
-    if not form_questions and required_fields:
+    if required_fields:
         for label in required_fields:
             text=str(label or "")[:500]
             if not re.search(r"[a-z]{3,}",text,re.I):continue
-            human_only=bool(re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|citizenship|demographic",text,re.I))
-            if not human_only and re.search(r"describe|tell us|why|experience|project|skills|technical|programming|challenge|motivation",text,re.I):
-                form_questions.append({"label":text,"required":True,"field_type":"unknown","candidate_field":"",
+            human_only=bool(SENSITIVE_PROMPT.search(text) or re.search(r"captcha|verification|legal|affirm|attest|consent|sponsor|authorization|citizenship|demographic",text,re.I))
+            if human_only:
+                required_controls.append({"label":text,"required":True,"field_type":"unknown",
+                    "employer_field_ids":[],"candidate_field":"","permission_current":False,"human_only":True})
+            elif not form_questions and re.search(r"describe|tell us|why|experience|project|skills|technical|programming|challenge|motivation",text,re.I):
+                form_questions.append({"label":text,"required":True,"field_type":"unknown","employer_field_ids":[],"candidate_field":"",
                     "permission_current":False,"human_only":False,"ordinary_text_question":True})
+    required_controls=deduplicate_review_fields(required_controls)
+    form_questions=deduplicate_review_fields(form_questions)
     required_uploads=report.get("upload_control_details") if isinstance(report.get("upload_control_details"),list) else []
     for upload in required_uploads:
         if not isinstance(upload,dict) or not upload.get("required"):continue
@@ -5079,9 +5129,10 @@ def application_screenshot(application_id:str):
     except (TypeError,json.JSONDecodeError): name=None
     if not isinstance(name,str) or Path(name).name!=name or not name.endswith(".png"):
         raise HTTPException(404,"No screenshot is available for this attempt.")
-    target=(ARTIFACTS/name).resolve()
-    if target.parent!=ARTIFACTS.resolve() or not target.is_file(): raise HTTPException(404,"Screenshot is no longer available.")
-    return FileResponse(target,media_type="image/png",filename="application-dry-run.png")
+    artifacts=private_storage_path(ARTIFACTS)
+    target=(artifacts/name).resolve()
+    if target.parent!=artifacts.resolve() or not target.is_file(): raise HTTPException(404,"Screenshot is no longer available.")
+    return FileResponse(target,media_type="image/png",filename="application-dry-run.png",headers={"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"})
 
 @router.post("/api/applications/pause")
 def pause_applications():
@@ -5325,7 +5376,7 @@ APPLICATION_REVIEW_PAGE=r'''<!doctype html><html lang="en"><head><meta charset="
 const AUTH_KEYS=['allow_automatic_discovery','allow_ai_matching','matching_provider','groq_model','allow_groq_cloud_ai','allow_automated_form_preparation','allow_auto_use_confirmed_answers','allow_demographic_reuse','allow_ai_drafting','require_review_uncertain_answers','max_applications_per_24_hours','standing_policy_enabled','standing_policy_categories','standing_policy_employment_types','standing_policy_countries','standing_policy_locations','standing_policy_work_arrangements','standing_policy_experience_levels','standing_policy_excluded_employers','standing_policy_daily_limit','standing_policy_field_keys','standing_policy_document_types','standing_policy_reuse_confirmed_answers','standing_policy_allow_ai_answers','standing_policy_allow_cloud_ai','standing_policy_allow_groq'];
 const LABELS={allow_automatic_discovery:'Automatic discovery',allow_ai_matching:'AI matching',matching_provider:'Selected AI provider',groq_model:'Groq model',allow_groq_cloud_ai:'Groq cloud consent',allow_automated_form_preparation:'Automated preparation',allow_auto_use_confirmed_answers:'Reuse confirmed answers',allow_demographic_reuse:'Demographic reuse',allow_ai_drafting:'AI drafting',require_review_uncertain_answers:'Review uncertain answers',max_applications_per_24_hours:'Maximum per rolling 24 hours',standing_policy_enabled:'Standing policy enabled',standing_policy_categories:'Job categories',standing_policy_employment_types:'Employment types',standing_policy_countries:'Allowed countries',standing_policy_locations:'Allowed locations',standing_policy_work_arrangements:'Work arrangements',standing_policy_experience_levels:'Experience levels',standing_policy_excluded_employers:'Excluded employers',standing_policy_daily_limit:'Daily preparation limit',standing_policy_field_keys:'Allowed candidate fields',standing_policy_document_types:'Allowed documents',standing_policy_reuse_confirmed_answers:'Policy answer reuse',standing_policy_allow_ai_answers:'Policy AI answers',standing_policy_allow_cloud_ai:'Policy cloud AI',standing_policy_allow_groq:'Policy Groq'};
 const jobKey=new URLSearchParams(location.search).get('job_key')||'',root=document.querySelector('#review-content'),status=document.querySelector('#page-status'),readiness=document.querySelector('#readiness');let review=null,profileData=null,authData=null,saving=false;
-function node(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=String(text??'');return n}function safe(value){return String(value??'')}function json(value){return JSON.stringify(value??null)}function errorText(value){if(typeof value==='string')return value;if(value&&typeof value==='object'){for(const k of ['message','detail','msg'])if(value[k])return errorText(value[k]);if(Array.isArray(value.errors))return value.errors.map(errorText).join(' ');try{return JSON.stringify(value)}catch{}}return 'The request could not be completed.'}async function req(url,options={}){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(errorText(d.detail??d.message));return d}function section(title){const s=node('section','rv-card');s.append(node('h2','',title));return s}function list(items){const ul=node('ul','rv-list');for(const value of items||[])ul.append(node('li','',value));return ul}function valueText(v){if(Array.isArray(v))return v.join('; ');if(v&&typeof v==='object')return JSON.stringify(v);return safe(v)}function authProjection(settings){const out={};for(const k of AUTH_KEYS)out[LABELS[k]]=settings?.[k]??null;out['Live submission enabled']=false;return out}
+function node(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=String(text??'');return n}function safe(value){return String(value??'')}function json(value){return JSON.stringify(value??null)}function errorText(value){if(typeof value==='string')return value;if(value&&typeof value==='object'){for(const k of ['message','detail','msg'])if(value[k])return errorText(value[k]);if(Array.isArray(value.errors))return value.errors.map(errorText).join(' ');try{return JSON.stringify(value)}catch{}}return 'The request could not be completed.'}async function req(url,options={}){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok){const e=Error(errorText(d.detail??d.message));e.status=r.status;e.path=new URL(url,location.href).pathname;throw e}return d}function section(title){const s=node('section','rv-card');s.append(node('h2','',title));return s}function list(items){const ul=node('ul','rv-list');for(const value of items||[])ul.append(node('li','',value));return ul}function valueText(v){if(Array.isArray(v))return v.join('; ');if(v&&typeof v==='object')return JSON.stringify(v);return safe(v)}function authProjection(settings){const out={};for(const k of AUTH_KEYS)out[LABELS[k]]=settings?.[k]??null;out['Live submission enabled']=false;return out}
 function renderProfile(){const s=section('Confirmed profile information');s.append(node('p','rv-muted','Saved profile facts are separate from permission to use those facts in employer applications. Sensitive work-authorization and sponsorship values are not shown here.'));const grid=node('div','rv-grid');for(const f of review.profile){const item=node('div','rv-item');item.append(node('strong','',f.label),node('span','',f.confirmed?(f.value!==undefined?valueText(f.value):'Confirmed'):f.has_value?'Saved but not confirmed':'Not confirmed'));grid.append(item)}s.append(grid);if(!review.profile.find(x=>x.key==='country')?.confirmed){const box=node('div','rv-item');box.append(node('h3','','Confirm country'));box.append(node('p','rv-muted','Country is required by the current form. Saving it confirms the profile value; it does not authorize the employer to receive it.'));const label=node('label','rv-field','Country');const input=node('input');input.id='country-value';input.autocomplete='country-name';input.maxLength=120;input.required=true;label.append(input);const checkLabel=node('label','rv-check');const check=node('input');check.type='checkbox';check.id='country-confirm';checkLabel.append(check,document.createTextNode(' I confirm this country value is accurate.'));const save=node('button','primary','Save and verify country');save.onclick=()=>saveCountry(input.value,check.checked,save);box.append(label,checkLabel,save);s.append(box)}root.append(s)}
 function renderProposals(){const s=section('Pending Sarathi profile proposals');if(!review.profile_proposals.length){s.append(node('p','rv-empty','No active pending proposals for this opening.'));root.append(s);return}s.append(node('p','rv-muted','Confirming saves through Candidate Profile and reads the saved value back. Dismissing affects only that proposal. Identical pending proposals are grouped so you review the value once.'));for(const p of review.profile_proposals){const card=node('article','rv-item');card.append(node('strong','',p.label),node('p','',p.value));if(p.duplicate_count>1)card.append(node('p','rv-muted',p.duplicate_count+' identical pending proposals will be resolved together.'));card.append(node('p','rv-muted','Proposed '+new Date(p.created_at).toLocaleString()+' · expires '+new Date(p.expires_at).toLocaleString()));const actions=node('div','rv-actions');const yes=node('button','primary','Confirm and save');yes.onclick=()=>confirmProposal(p,yes);const no=node('button','','Dismiss proposal');no.onclick=()=>dismissProposal(p,no);actions.append(yes,no);card.append(actions);s.append(card)}root.append(s)}
 function renderAuthorization(){const s=section('Auto Apply field permissions');const a=review.authorization;s.append(node('p','',`Current authorization version ${a.version} · standing policy ${a.settings.standing_policy_enabled?'enabled':'disabled'} · daily limit ${a.settings.standing_policy_daily_limit||'not set'}.`));s.append(node('p','rv-note','Current allowed fields: '+(a.current_allowed_fields.join(', ')||'none')+'. Proposed additions: linkedin and country. Profile confirmation does not itself grant permission to send a field to an employer.'));const details=node('details','');details.append(node('summary','','Review the complete current and proposed policy'));const grid=node('div','rv-policy-preview');const before=node('div');before.append(node('h3','','Current policy'));const beforePre=node('pre');beforePre.textContent=JSON.stringify(authProjection(a.settings),null,2);before.append(beforePre);const after=node('div');after.append(node('h3','','Proposed policy'));const proposed={...a.settings,standing_policy_field_keys:a.proposed_allowed_fields};const afterPre=node('pre');afterPre.textContent=JSON.stringify(authProjection(proposed),null,2);after.append(afterPre);grid.append(before,after);details.append(grid);const consentLabel=node('label','rv-check');const consent=node('input');consent.type='checkbox';consent.id='policy-approve';consentLabel.append(consent,document.createTextNode(' I reviewed this complete policy and approve adding only linkedin and country to the allowed fields.'));const save=node('button','primary','Approve and save policy update');save.onclick=()=>savePolicy(save,consent.checked);const result=node('p','rv-muted','');result.id='policy-status';details.append(consentLabel,save,result);s.append(details);root.append(s)}
@@ -5353,6 +5404,8 @@ function reviewError(value){
     return 'The request could not be completed. Check the highlighted information and try again.';
   }
   const text=String(value||'');
+  if(/answer key must contain letters, digits, hyphens, or underscores/i.test(text))return 'This answer could not be saved because its identifier is invalid. Reload Review Application and try again; your answer has not been saved.';
+  if(/answer key/i.test(text))return 'This answer could not be saved. Reload Review Application, check your answer, and try again.';
   if(/\b(?:HTTP|SQLite|IntegrityError|Traceback|500|422|403|409)\b/i.test(text))return 'The change could not be saved. Review the information and try again; your previous saved information is unchanged.';
   return text.slice(0,500)||'The request could not be completed.';
 }
@@ -5378,8 +5431,10 @@ function renderProfile(){
   const grid=node('div','rv-grid');for(const f of review.profile||[]){const item=node('div','rv-item');item.append(node('strong','',f.label),node('span','',f.confirmed?(f.value!==undefined?valueText(f.value):'Confirmed'):f.has_value?'Saved but not confirmed':'Not confirmed'));grid.append(item)}s.append(grid);
   if(!review.profile.find(x=>x.key==='country')?.confirmed){const box=node('div','rv-item');box.append(node('h3','','Country is needed for this application'));box.append(node('p','rv-muted','Confirming a country saves a profile fact only. It does not authorize sharing it with an employer.'));const label=node('label','rv-field','Country');const input=node('input');input.id='country-value';input.autocomplete='country-name';input.maxLength=120;label.append(input);const checkLabel=node('label','rv-check'),check=node('input');check.type='checkbox';check.id='country-confirm';checkLabel.append(check,document.createTextNode(' I confirm this country value is accurate.'));const save=node('button','rv-primary','Save and verify country');save.onclick=()=>saveCountry(input.value,check.checked,save);box.append(label,checkLabel,save);s.append(box)}root.append(s)
 }
-function reviewAnswerCard(parent,{key,title,question,required=true,existing=null,formQuestion=false}){
-  const card=node('article','rv-item rv-answer');card.append(node('strong','',title));card.append(node('span','rv-helper',required?'Required employer question':'Optional employer question'));
+function reviewQuestionFamily(label){const text=String(label||'').toLowerCase();if(/ai.{0,30}interview assistant|interview assistant.{0,30}consent|consent.{0,30}ai/.test(text))return'ai_interview_assistant_consent';if(/data structures?.{0,80}algorithms?|software design fundamentals/.test(text))return'data_structures_algorithms_design';if(/full[ -]?time/.test(text)&&/professional|software|work experience|employment history/.test(text))return/\b(how many|number of|years?|months?|duration|long)\b/.test(text)?'full_time_professional_experience_duration':'full_time_professional_experience_description';return text.normalize('NFKD').replace(/[^a-z0-9]+/g,' ').replace(/\b(please|describe|tell us|tell me|provide|briefly|your|you|the|a|an|this|that|experience|question)\b/g,' ').replace(/\s+/g,' ').trim()}
+function stableReviewAnswerId(fieldKey,question,fieldIds){const source=JSON.stringify([jobKey,fieldKey,fieldIds||[],question]);let a=2166136261,b=2246822519;for(let i=0;i<source.length;i++){const c=source.charCodeAt(i);a=Math.imul(a^c,16777619);b=Math.imul(b^c,3266489917);b^=a>>>13}return'review-'+(a>>>0).toString(16).padStart(8,'0')+(b>>>0).toString(16).padStart(8,'0')}
+function reviewAnswerCard(parent,{key,title,question,required=true,existing=null,formQuestion=false,fieldIds=[]}){
+  const card=node('article','rv-item rv-answer');card.dataset.employerFieldIds=JSON.stringify(fieldIds);card.append(node('strong','',title));card.append(node('span','rv-helper',required?'Required employer question':'Optional employer question'));
   const matching=(answerRows||[]).find(row=>row.confirmed&&!row.sensitive&&row.question===question);
   if(matching){card.append(node('p','rv-good','A confirmed answer already exists in the answer bank. Reuse scope: '+(matching.reuse_scope||'none')+'.'));const details=document.createElement('details');details.append(node('summary','','Show saved answer'));details.append(node('p','',matching.answer||'Saved answer text is unavailable.'));card.append(details);parent.append(card);return}
   const experienceQuestion=/full.?time professional software engineering experience|excluding internships/i.test(question);
@@ -5393,7 +5448,7 @@ function reviewAnswerCard(parent,{key,title,question,required=true,existing=null
   const feedback=node('p','rv-draft-status',hasDraftPermission?'No answer has been saved. Sarathi drafts remain unconfirmed until you review and save them.':'AI drafting is unavailable until the selected provider and any required cloud permission are enabled in Settings. You can still enter a truthful answer yourself.');feedback.setAttribute('role','status');card.append(feedback);
   confirm.addEventListener('change',()=>{save.disabled=!confirm.checked||!area.value.trim();save.title=save.disabled?'Review and confirm a non-empty answer before saving.':''});area.addEventListener('input',()=>{save.disabled=!confirm.checked||!area.value.trim()});
   draft.onclick=async()=>{if(saving)return;saving=true;draft.disabled=true;feedback.textContent='Sarathi is checking confirmed evidence…';try{const result=await req('/api/application-answers/draft',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,job_key:jobKey})});area.value=result.answer||'';confirm.checked=false;save.disabled=true;const evidence=result.evidence||[];feedback.replaceChildren();feedback.append(node('span','',result.needs_user_input?'More confirmed information is needed.':'Draft ready — review and edit before confirming.'));if(result.disclaimer)feedback.append(node('p','rv-muted',result.disclaimer));if(result.missing_question)feedback.append(node('p','rv-warning',result.missing_question));if(evidence.length){const details=document.createElement('details');details.append(node('summary','','Supporting evidence'));for(const item of evidence){const block=node('div','rv-evidence');block.append(node('strong','',item.source||'Confirmed source'),node('p','',item.excerpt||''));details.append(block)}feedback.append(details)}if(result.reused){feedback.append(node('p','rv-good','This draft reused a previously confirmed answer within its saved scope. Review it for this employer.'))}save.title='Confirm the answer is accurate before saving.'}catch(e){feedback.textContent=reviewError(e.message)}finally{saving=false;draft.disabled=false}};
-  save.onclick=async()=>{if(saving)return;if(!confirm.checked||!area.value.trim()){feedback.textContent='Review the answer and explicitly confirm its accuracy before saving.';return}const answer=area.value.trim();if(answer.length<5){feedback.textContent='Add a little more detail, or leave this question for applicant review.';return}if(question.length>300){feedback.textContent='This employer question exceeds the answer bank question limit. Review and answer it directly on the official employer form.';return}saving=true;save.disabled=true;feedback.textContent='Saving and verifying your answer…';try{const reuse=!!card._reuse?.checked;const slug=(title+'-'+jobKey).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,100);const saved=await req('/api/application-answers/review-'+slug,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,answer,confirmed:true,sensitive:false,answer_type:'generated',auto_reuse:reuse,reuse_scope:reuse?'matching_jobs':'none',scope_job_key:''})});if(!saved.persisted_verified)throw Error('BabyStepsAI could not verify the saved answer.');const rows=await req('/api/application-answers'),read=rows.find(row=>row.key===saved.key||row.question===question);if(!read?.confirmed||read.answer!==answer||read.sensitive||((read.reuse_scope==='matching_jobs')!==reuse))throw Error('The saved answer did not pass readback checks. Review the Answer Bank before continuing.');await load();status.textContent='Answer saved and verified in your existing answer bank. It has not been sent to an employer.'}catch(e){feedback.textContent=reviewError(e.message);save.disabled=false}finally{saving=false}};
+  save.onclick=async()=>{if(saving)return;if(!confirm.checked||!area.value.trim()){feedback.textContent='Review the answer and explicitly confirm its accuracy before saving.';return}const answer=area.value.trim();if(answer.length<5){feedback.textContent='Add a little more detail, or leave this question for applicant review.';return}if(question.length>300){feedback.textContent='This employer question exceeds the answer bank question limit. Review and answer it directly on the official employer form.';return}saving=true;save.disabled=true;feedback.textContent='Saving and verifying your answer…';const answerId=stableReviewAnswerId(key,question,fieldIds);try{const reuse=!!card._reuse?.checked;const saved=await req('/api/application-answers/'+answerId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,answer,confirmed:true,sensitive:false,answer_type:'generated',auto_reuse:reuse,reuse_scope:reuse?'matching_jobs':'none',scope_job_key:'',job_key:review.job.job_key,employer_field_ids:fieldIds})});if(!saved.persisted_verified)throw Error('BabyStepsAI could not verify the saved answer.');const rows=await req('/api/application-answers'),read=rows.find(row=>row.key===saved.key||row.question===question);if(!read?.confirmed||read.answer!==answer||read.sensitive||((read.reuse_scope==='matching_jobs')!==reuse))throw Error('The saved answer did not pass readback checks. Review the Answer Bank before continuing.');await load();status.textContent='Answer saved and verified in your existing answer bank. It has not been sent to an employer.'}catch(e){console.error('Review answer save failed',{status:e.status||null,path:e.path||('/api/application-answers/'+answerId),error_type:e.name||'Error'});feedback.textContent=reviewError(e.message);save.disabled=false}finally{saving=false}};
   parent.append(card)
 }
 function renderQuestions(){
@@ -5402,7 +5457,7 @@ function renderQuestions(){
   reviewAnswerCard(s,{key:'professional-experience',title:'Full-time professional software engineering experience',question:'Describe your full-time professional software engineering experience, excluding internships. If you have none, say so clearly.',existing:q.professional_experience});
   reviewAnswerCard(s,{key:'technical-fundamentals',title:'Data structures, algorithms, and software design',question:'Describe specific confirmed coursework or project evidence for data structures, algorithms, and software-design fundamentals. Do not infer details from technology names.',existing:q.technical_qualification});
   reviewAnswerCard(s,{key:'motivation',title:'Professional motivation',question:'Why are you interested in this role, based only on confirmed candidate information and the saved posting?',required:false});
-  const questions=(review.form?.questions||[]).filter(item=>item.ordinary_text_question&&!item.human_only);for(let i=0;i<questions.length;i++){const item=questions[i];if(/full.?time professional software engineering experience|data structures.*algorithms/i.test(item.label))continue;reviewAnswerCard(s,{key:'employer-'+i,title:item.label,question:item.label,required:item.required!==false,formQuestion:true})}
+  const questions=(review.form?.questions||[]).filter(item=>item.ordinary_text_question&&!item.human_only);const seenMeaning=new Set(['full_time_professional_experience_description','data_structures_algorithms_design']);const seenFieldIds=new Set();let employerIndex=0;for(const item of questions){const meaning=reviewQuestionFamily(item.label);const ids=item.employer_field_ids||[];if(meaning==='ai_interview_assistant_consent'||seenMeaning.has(meaning)||ids.some(id=>seenFieldIds.has(id)))continue;seenMeaning.add(meaning);ids.forEach(id=>seenFieldIds.add(id));reviewAnswerCard(s,{key:'employer-'+(employerIndex++),title:item.label,question:item.label,required:item.required!==false,formQuestion:true,fieldIds:ids})}
   s.append(node('p','rv-warning','Never use Sarathi for legal attestations, work authorization, sponsorship, identity verification, or employer consent. Projects and internships are not counted as full-time professional employment.'));root.append(s)
 }
 function renderEmployer(){

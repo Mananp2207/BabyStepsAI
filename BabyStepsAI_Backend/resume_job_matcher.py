@@ -11,7 +11,9 @@ import socket
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+import tenant_context
+from database_adapter import connect_database, postgres_enabled
+from tenant_context import TenantThreadPoolExecutor as ThreadPoolExecutor, new_context_thread
 from datetime import datetime, timezone, timedelta, date
 from typing import Literal
 
@@ -391,7 +393,8 @@ def initialize():
                             3, len(set(keys)), stamp, stamp))
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 def active_candidate():
@@ -2032,7 +2035,7 @@ def _session_worker(session_id, resume_id, profile_status, profile, owner_token=
     if not owner_token:
         return
     stop=threading.Event()
-    heartbeat=threading.Thread(target=_heartbeat_match_session,args=(session_id,owner_token,stop),daemon=True)
+    heartbeat=new_context_thread(threading.Thread,target=_heartbeat_match_session,args=(session_id,owner_token,stop),daemon=True)
     heartbeat.start()
     try:
         while True:
@@ -3116,6 +3119,9 @@ def cancel_paused_checkpoint(session_id:str,confirmed=False):
 
 @router.post("/api/jobs/matches/{session_id}/recover")
 def recover_matching_session(session_id:str,payload:MatchRecovery,request:Request):
+    if tenant_context.AUTH_MODE == "oidc":
+        if not getattr(request.state,"user_id",None):raise HTTPException(401,"Authentication is required.")
+        return {"recovery":recover_match_session(session_id,payload.confirm_abandoned),"submission_enabled":False}
     host=getattr(getattr(request,"client",None),"host",None)
     import ipaddress
     try:allowed=bool(host and ipaddress.ip_address(host).is_loopback)

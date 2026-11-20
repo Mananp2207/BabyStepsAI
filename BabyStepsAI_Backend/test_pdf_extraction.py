@@ -73,6 +73,40 @@ def build_minimal_pdf(page_texts):
 
 
 class PdfExtractionTests(unittest.TestCase):
+    def test_deterministic_profile_parser_extracts_literal_resume_facts_without_provider(self):
+        import main
+        from unittest.mock import patch
+        source = """Avery Morgan
+avery.morgan@example.test | +1 (555) 010-2040
+https://www.linkedin.com/in/avery-morgan https://github.com/averym
+Education
+B.S. Computer Science, Example University, Graduation 2027, GPA: 3.8
+Coursework: Algorithms, Databases, Operating Systems
+Experience
+Software Engineering Intern, Example Labs, 2024-2025
+Built a test tool using Python and PostgreSQL
+Projects
+Campus Planner: React and TypeScript
+Technical Skills
+Docker
+"""
+        with patch("urllib.request.urlopen", side_effect=AssertionError("provider must not be called")):
+            profile = main.extract_profile(source)
+        self.assertEqual(profile["full_name"], "Avery Morgan")
+        self.assertEqual(profile["email"], "avery.morgan@example.test")
+        self.assertEqual(profile["phone"], "+1 (555) 010-2040")
+        self.assertEqual(profile["linkedin"], "https://www.linkedin.com/in/avery-morgan")
+        self.assertEqual(profile["github"], "https://github.com/averym")
+        self.assertEqual(profile["education"][0]["gpa"], "3.8")
+        self.assertEqual(profile["education"][0]["graduation_year"], "2027")
+        self.assertEqual(profile["education"][0]["institution"], "Example University")
+        self.assertEqual(profile["education"][0]["degree"], "B.S. Computer Science")
+        self.assertEqual(profile["education"][0]["major"], "Computer Science")
+        self.assertEqual(profile["education"][0]["coursework"], ["Algorithms", "Databases", "Operating Systems"])
+        self.assertTrue(profile["internships"])
+        self.assertIn("Python", profile["technical_skills"])
+        self.assertIn("React", profile["technical_skills"])
+
     def _reader_module(self, reader_or_error):
         def build_reader(_source, strict=False):
             if isinstance(reader_or_error, Exception):

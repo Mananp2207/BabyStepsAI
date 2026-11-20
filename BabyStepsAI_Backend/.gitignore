@@ -2,5 +2,9 @@
 __pycache__/
 *.pyc
 private_resumes/
+private_documents/
+private_application_artifacts/
+private_users/
+private_auth/
 *.db
 .env

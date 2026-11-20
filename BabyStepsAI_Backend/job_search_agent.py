@@ -17,7 +17,7 @@ import uuid
 import email.utils
 from datetime import timedelta
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
+from tenant_context import TenantThreadPoolExecutor as ThreadPoolExecutor
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -37,7 +37,10 @@ from job_connectors import (EmployerSource, canonicalize_job_url, discover_sourc
 
 router = APIRouter()
 DB = Path(__file__).resolve().parent / "babysteps.db"
-USER = "local-test-user"
+from tenant_context import USER_ID, database_path, new_context_thread
+from database_adapter import connect_database, postgres_enabled
+
+USER = USER_ID
 FEED_CACHE_TTL = 15 * 60
 EMPLOYER_DISCOVERY_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="employer-discovery")
 BOARDS = {"Cloudflare": "cloudflare", "Datadog": "datadog", "Figma": "figma"}
@@ -112,7 +115,7 @@ class EmployerDiscoveryRunRequest(BaseModel):
 
 
 def connect():
-    db = sqlite3.connect(DB, timeout=30)
+    db = connect_database(database_path(DB), timeout=30)
     db.row_factory = sqlite3.Row
     return db
 
@@ -294,7 +297,8 @@ def initialize():
                            (row["employer_id"],key,status,"{}",stamp))
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 def preferences():
@@ -925,7 +929,7 @@ def _discover(prompt, prefs, run_id, workflow_id=None, source_keys=None):
     started_at = datetime.now(timezone.utc).isoformat()
     token,prior_diagnostics=_acquire_discovery_run(prompt,run_id,workflow_id,len(sources))
     stop=threading.Event()
-    heartbeat=threading.Thread(target=_heartbeat_discovery,args=(run_id,token,stop),daemon=True)
+    heartbeat=new_context_thread(threading.Thread,target=_heartbeat_discovery,args=(run_id,token,stop),daemon=True)
     heartbeat.start()
     try:
         return _discover_owned(prompt,prefs,run_id,terms,sources,configured_employers,prior_diagnostics,started_at,token)

@@ -22,6 +22,27 @@ from ollama_runtime import OLLAMA_LOCK
 from provider_config import configured_groq_model, groq_api_key, groq_model_allowed
 from ui_theme import apply_ui_theme
 from candidate_verification import verified_values_from_json
+from tenant_context import database_path
+from database_adapter import connect_database, postgres_enabled
+
+ONBOARDING_ACCESSIBILITY_STYLE=r"""<style id="onboarding-button-accessibility">
+button.button{min-height:44px;font:700 14px/1.3 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;transition:box-shadow .12s,transform .12s}
+.actions button.button.ghost{background:var(--surface)!important;color:var(--ink)!important;border:1px solid var(--line)!important}
+.actions button.button.primary,form button.button.primary{background:#2859a5!important;border-color:#2859a5!important;color:#fff!important}
+.actions button.button:hover:not(:disabled),form button.button:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 4px 12px #10233a22}
+.actions button.button.primary:hover:not(:disabled),form button.button.primary:hover:not(:disabled){background:#204b8e!important;border-color:#204b8e!important}
+.button:focus-visible{outline:3px solid #1d64cc!important;outline-offset:3px!important}
+.actions button.button:disabled,form button.button:disabled{opacity:1!important;cursor:not-allowed!important;transform:none!important;box-shadow:none!important;background:#e3e8ef!important;border-color:#abb7c7!important;color:#48566a!important}
+.action-help{min-height:22px;margin:10px 0 0;color:var(--muted);font-size:12px}
+.notice.pending{color:var(--ink)}.notice.error{color:#9d2424!important}.notice.success{color:#176b48!important}
+.doc-row.active-resume{border-color:#176b48;color:#174b35;font-weight:700}.resume-guidance{margin-top:12px}.upload-feedback{min-height:22px;margin:8px 0;color:var(--muted);font-size:12px}
+html[data-bsa-theme="dark"] body .actions button.button.ghost{background:#182337!important;color:#e7edf6!important;border-color:#65758d!important}
+html[data-bsa-theme="dark"] body .actions button.button.primary,html[data-bsa-theme="dark"] body form button.button.primary{background:#a9c6ff!important;border-color:#a9c6ff!important;color:#14243a!important}
+html[data-bsa-theme="dark"] body .actions button.button.primary:hover:not(:disabled),html[data-bsa-theme="dark"] body form button.button.primary:hover:not(:disabled){background:#c1d5ff!important;border-color:#c1d5ff!important;color:#14243a!important}
+html[data-bsa-theme="dark"] body .button:focus-visible{outline-color:#c1d5ff!important}
+html[data-bsa-theme="dark"] body .doc-row.active-resume{color:#a4e2bd!important;border-color:#5a9b77!important}
+#continue:disabled,#back:disabled,#resume-upload button:disabled{opacity:1!important;cursor:not-allowed!important;transform:none!important;box-shadow:none!important;background:#e3e8ef!important;border-color:#8793a2!important;color:#304054!important}
+</style>"""
 
 router = APIRouter()
 MODEL = "qwen2.5:3b"
@@ -81,7 +102,7 @@ class ClosingConnection(sqlite3.Connection):
 
 
 def connect():
-    db = sqlite3.connect(DB, timeout=30, factory=ClosingConnection)
+    db = connect_database(database_path(DB), timeout=30, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     return db
 
@@ -100,7 +121,8 @@ def initialize():
         db.execute("INSERT OR IGNORE INTO application_authorization_history(user_id,version,settings_json,updated_at) VALUES(?,1,?,?)", (USER, encoded, stamp))
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 def get_authorization():
@@ -772,7 +794,9 @@ def draft_application_answer(payload: DraftRequest):
 @router.get("/onboarding", response_class=HTMLResponse)
 def onboarding_page():
     from onboarding import ONBOARDING_PAGE as WIZARD_PAGE
-    return HTMLResponse(apply_ui_theme(WIZARD_PAGE))
+    page=apply_ui_theme(WIZARD_PAGE)
+    page=page.replace("</head>",ONBOARDING_ACCESSIBILITY_STYLE+"</head>",1)
+    return HTMLResponse(page)
 
 
 @router.get("/application-settings", response_class=HTMLResponse)

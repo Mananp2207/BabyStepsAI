@@ -3,3 +3,7 @@ uvicorn>=0.30,<1
 python-multipart>=0.0.9,<1
 pypdf>=5,<7
 cryptography>=42,<47
+Authlib>=1.9,<2
+itsdangerous>=2.2,<3
+psycopg[binary,pool]>=3.2,<4
+requests>=2.32,<3

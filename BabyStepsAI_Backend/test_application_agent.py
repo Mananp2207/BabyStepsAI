@@ -281,7 +281,11 @@ class ApplicationAgentTests(unittest.TestCase):
                 "requested_application_url":url,"inspected_at":now,"form_fingerprint":"synthetic-form-v1",
                 "fields":[{"label":"LinkedIn URL","question":"LinkedIn URL","required":True},
                     {"label":"Country","question":"Country","required":True},
-                    {"label":"Work authorization","question":"Will you require sponsorship?","required":True}],
+                    {"label":"Work authorization","question":"Will you require sponsorship?","required":True},
+                    {"question_id":"exp-1","question":"Describe your full-time professional software engineering experience, excluding internships.","type":"textarea","required":True},
+                    {"question_id":"exp-2","question":"Tell us about your full time professional software engineering experience.","type":"textarea","required":True},
+                    {"question_id":"consent-1","question":"Do you consent to the AI interview assistant?","type":"textarea","required":True},
+                    {"question_id":"consent-2","question":"AI interview assistant consent","type":"textarea","required":True}],
                 "required_fields":["LinkedIn URL","Country","Will you require sponsorship?"],
                 "upload_control_details":[{"question":"Resume/CV","purpose":"resume","required":True,"supported":True}],
                 "human_actions_required":["CAPTCHA or human verification"],"submission_control_status":"detected_visible",
@@ -303,6 +307,15 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(result["form"]["submission_control_status"],"detected_visible")
         self.assertFalse(result["live_submission_enabled"])
         self.assertEqual(result["application"]["attempt_count"],0)
+        self.assertEqual(len([item for item in result["form"]["questions"] if "full-time professional software" in item["label"].lower()]),1)
+        experience=next(item for item in result["form"]["questions"] if "full-time professional software" in item["label"].lower())
+        self.assertEqual(experience["employer_field_ids"],["exp-1","exp-2"])
+        self.assertTrue(experience["required"])
+        self.assertFalse(any("AI interview assistant" in item["label"] for item in result["form"]["questions"]))
+        consent=[item for item in result["form"]["required_controls"] if "AI interview assistant" in item["label"]]
+        self.assertEqual(len(consent),1)
+        self.assertEqual(consent[0]["employer_field_ids"],["consent-1","consent-2"])
+        self.assertTrue(consent[0]["required"])
         with app_agent.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM applications WHERE user_id=? AND job_key=?",(USER,key)).fetchone()[0],0)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM application_attempts").fetchone()[0],0)
@@ -980,7 +993,13 @@ class ApplicationAgentTests(unittest.TestCase):
             "form":{"state":"needs_human_action","inspected_at":"2026-11-15T00:00:00Z","provider":"greenhouse",
                 "required_fields":["LinkedIn URL","Country","Resume"],
                 "questions":[{"label":"Describe a confirmed API project","required":True,"field_type":"textarea",
-                    "ordinary_text_question":True,"human_only":False}],
+                    "ordinary_text_question":True,"human_only":False},
+                    {"label":"Describe your full-time professional software engineering experience, excluding internships.","required":True,"field_type":"textarea",
+                    "employer_field_ids":["experience-1"],"ordinary_text_question":True,"human_only":False},
+                    {"label":"Tell us about your full time professional software engineering experience.","required":True,"field_type":"textarea",
+                    "employer_field_ids":["experience-2"],"ordinary_text_question":True,"human_only":False},
+                    {"label":"Do you consent to the AI interview assistant?","required":True,"field_type":"textarea",
+                    "employer_field_ids":["consent-1"],"ordinary_text_question":True,"human_only":True}],
                 "required_controls":[{"label":"LinkedIn URL","candidate_field":"linkedin","permission_current":False,"human_only":False},
                     {"label":"Country","candidate_field":"country","permission_current":False,"human_only":False}],
                 "required_uploads":[{"question":"Resume","purpose":"resume","supported":True,"permission_current":True}],
@@ -1044,6 +1063,8 @@ class ApplicationAgentTests(unittest.TestCase):
                 self.assertIn("Employment type: Unknown",page.locator("body").inner_text())
                 self.assertIn("This review does not create an application attempt",page.locator("body").inner_text())
                 self.assertTrue(page.get_by_role("button",name="Generate with Sarathi").count()>=1)
+                self.assertEqual(page.locator(".rv-answer").filter(has_text="Full-time professional software engineering experience").count(),1)
+                self.assertEqual(page.locator(".rv-answer").filter(has_text="AI interview assistant consent").count(),0)
                 self.assertEqual(page.locator("#bsa-sarathi-launcher").count(),0)
                 page.get_by_role("button",name="Generate with Sarathi").first.focus()
                 page.keyboard.press("Tab")
@@ -1061,6 +1082,9 @@ class ApplicationAgentTests(unittest.TestCase):
                 self.assertEqual(len(answer_rows),1)
                 self.assertTrue(answer_rows[0]["confirmed"])
                 self.assertEqual(answer_rows[0]["reuse_scope"],"none")
+                save_call=next(call for call in calls if call[0]=="PUT" and call[1].startswith("/api/application-answers/"))
+                self.assertRegex(save_call[1],r"^/api/application-answers/[A-Za-z0-9_-]{2,80}$")
+                self.assertEqual(save_call[2]["job_key"],"greenhouse:synthetic:5027")
                 page.locator("summary").get_by_text("Open Sarathi for this application").click()
                 page.frame_locator("#sarathi-review-frame").get_by_text("Synthetic Sarathi frame").wait_for(timeout=5000)
                 self.assertEqual(page.get_by_role("button",name="Submit application",exact=False).count(),0)

@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field
 import job_connectors as connectors
 from job_connectors import EmployerSource
 from job_search_agent import DB as JOB_DB, USER
+from tenant_context import database_path
+from database_adapter import connect_database, postgres_enabled
 
 DB=JOB_DB
 router=APIRouter()
@@ -40,7 +42,7 @@ class ClosingConnection(sqlite3.Connection):
 
 
 def connect():
-    db=sqlite3.connect(DB,timeout=30,factory=ClosingConnection);db.row_factory=sqlite3.Row;return db
+    db=connect_database(database_path(DB),timeout=30,factory=ClosingConnection);db.row_factory=sqlite3.Row if isinstance(db,sqlite3.Connection) else None;return db
 
 
 def initialize():
@@ -59,7 +61,8 @@ def initialize():
         db.execute("CREATE INDEX IF NOT EXISTS idx_description_retrieval_job ON job_description_retrievals(user_id,job_key,retrieved_at DESC)")
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 class _VisibleText(HTMLParser):

@@ -25,8 +25,11 @@ from application_answer_assistant import USER, get_authorization
 from candidate_verification import VerificationUpdate
 from ollama_runtime import OLLAMA_LOCK
 from provider_config import groq_api_key, groq_model_allowed
+from resume_profile_parser import extract_resume_profile
 from secure_data import EncryptionUnavailable, decrypt_text, encrypt_text
 from ui_theme import apply_ui_theme
+from tenant_context import database_path
+from database_adapter import connect_database, postgres_enabled
 
 router = APIRouter()
 ROOT = Path(__file__).resolve().parent
@@ -56,7 +59,7 @@ class ClosingConnection(sqlite3.Connection):
 
 
 def connect():
-    db = sqlite3.connect(DB, timeout=30, factory=ClosingConnection)
+    db = connect_database(database_path(DB), timeout=30, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     return db
@@ -89,7 +92,8 @@ def initialize():
         """)
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 def _expire_old_conversations(db):
@@ -383,7 +387,7 @@ def _read_only_context(query: str) -> dict:
     _, identifiers = _job_lookup_terms(q)
     context: dict = {"context_access": "enabled"}
     with closing(connect()) as db:
-        resume = db.execute("SELECT id FROM resumes WHERE user_id=? AND active=1 LIMIT 1", (USER,)).fetchone()
+        resume = db.execute("SELECT id,extracted_text FROM resumes WHERE user_id=? AND active=1 LIMIT 1", (USER,)).fetchone()
         resume_id = resume["id"] if resume else ""
         lookup = _resolve_openings(db, q, resume_id)
         if lookup:
@@ -425,13 +429,29 @@ def _read_only_context(query: str) -> dict:
             labels = {"linkedin": "LinkedIn", "github": "GitHub", "portfolio": "Portfolio",
                       "full_time_availability": "Full-time availability", "relocation_willingness": "Relocation willingness",
                       "technical_skills": "Technical skills"}
+            try:
+                current_suggestions=json.loads(resume_profile["profile_json"] or "{}") if resume_profile else {}
+            except (TypeError,json.JSONDecodeError):
+                current_suggestions={}
+            if resume:
+                deterministic=extract_resume_profile(resume["extracted_text"] or "")
+                for key,value in deterministic.items():
+                    if value and not current_suggestions.get(key): current_suggestions[key]=value
+            suggestion_aliases={"linkedin":"linkedin","github":"github","portfolio":"portfolio",
+                                "technical_skills":"technical_skills"}
+            context["resume_fields_available_for_review"]=[labels[key] for key,source_key in suggestion_aliases.items()
+                if current_suggestions.get(source_key)]
             context["missing_or_unconfirmed_fields"] = [label for key, label in labels.items()
-                                                        if not confirmed_flags.get(key) or not all_values.get(key)]
+                if (not confirmed_flags.get(key) or not all_values.get(key))
+                and not current_suggestions.get(suggestion_aliases.get(key,""))]
             if resume_profile:
                 try:
-                    suggestion = json.loads(resume_profile["profile_json"] or "{}")
+                    suggestion = dict(current_suggestions)
                     context["unverified_resume_suggestions"] = {key: suggestion.get(key)
-                        for key in ("education", "work_experience", "projects", "technical_skills") if suggestion.get(key)}
+                        for key in ("full_name", "email", "phone", "linkedin", "github", "portfolio",
+                                    "education", "work_experience", "internships", "projects",
+                                    "technical_skills", "professional_skills", "certifications")
+                        if suggestion.get(key)}
                 except (TypeError, json.JSONDecodeError):
                     context["unverified_resume_suggestions"] = {}
         if wants_apps:

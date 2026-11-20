@@ -14,6 +14,79 @@ from job_search_agent import USER
 
 
 class CandidateVerificationTests(unittest.TestCase):
+    def test_resume_suggestions_map_contact_education_and_internships_without_confirming(self):
+        mapped = profile._suggestions({
+            "full_name": "Avery Morgan", "email": "avery@example.test", "phone": "+1 555 0100",
+            "linkedin": "https://linkedin.com/in/avery", "github": "https://github.com/avery",
+            "education": [{"institution": "Example U", "degree": "B.S.", "major": "CS",
+                           "graduation_year": "2027", "gpa": "3.8", "coursework": ["Algorithms"]}],
+            "work_experience": [{"employer": "Example Co", "job_title": "Engineer", "start_year": "2024",
+                                 "description": "Built a Python service"}],
+            "internships": [{"employer": "Example Labs", "job_title": "Software Intern", "description": "Testing"}],
+            "projects": [{"name": "Planner", "description": "Built a planner", "technologies": ["React"]}],
+            "technical_skills": ["Python", "React"],
+        })
+        self.assertEqual(mapped["full_name"], "Avery Morgan")
+        self.assertEqual(mapped["email"], "avery@example.test")
+        self.assertEqual(mapped["education_entries"][0]["coursework"], ["Algorithms"])
+        self.assertEqual(mapped["education_entries"][0]["gpa"], "3.8")
+        self.assertNotIn("description", mapped["education_entries"][0])
+        self.assertEqual(mapped["experience_entries"][0]["employer"], "Example Co")
+        self.assertEqual(mapped["internship_entries"][0]["employer"], "Example Labs")
+        self.assertEqual(mapped["work_authorization"], "")
+        self.assertEqual(mapped["requires_sponsorship"], "")
+
+    def test_active_resume_text_hydrates_legacy_profile_suggestions_without_persisting(self):
+        sample="""Riley Sample\nriley@example.test | +1 555 010 2020\nEducation\nB.S. Computer Science, Sample University, GPA: 3.7\n"""
+        with profile.connect() as db:
+            db.execute("UPDATE resumes SET extracted_text=? WHERE id='r1'",(sample,))
+            before=db.execute("SELECT status,profile_json FROM resume_profiles WHERE resume_id='r1'").fetchone()
+        result=profile.get_verification()
+        fields={item["key"]:item for item in result["fields"]}
+        self.assertEqual(fields["full_name"]["value"],"Riley Sample")
+        self.assertEqual(fields["email"]["value"],"riley@example.test")
+        self.assertEqual(fields["phone"]["value"],"+1 555 010 2020")
+        self.assertEqual(fields["full_name"]["source"],"resume_suggestion")
+        self.assertFalse(fields["full_name"]["confirmed"])
+        with profile.connect() as db:
+            after=db.execute("SELECT status,profile_json FROM resume_profiles WHERE resume_id='r1'").fetchone()
+        self.assertEqual(tuple(before),tuple(after))
+
+    def test_current_confirmed_identity_wins_but_blank_saved_defaults_do_not_hide_resume_suggestions(self):
+        sample="Current Resume Name\ncurrent@example.test | +1 555 010 2020\n"
+        with profile.connect() as db:
+            db.execute("UPDATE resumes SET extracted_text=? WHERE id='r1'",(sample,))
+            db.execute("INSERT INTO candidate_verifications(user_id,resume_id,values_json,confirmed_json,updated_at) VALUES(?,?,?,?,?)",
+                (USER,"r1",json.dumps({"full_name":"Previously Confirmed Name","email":"","phone":""}),
+                 json.dumps({"full_name":True,"email":False,"phone":False}),"2026-02-01"))
+        fields={item["key"]:item for item in profile.get_verification()["fields"]}
+        self.assertEqual(fields["full_name"]["value"],"Previously Confirmed Name")
+        self.assertTrue(fields["full_name"]["confirmed"])
+        self.assertEqual(fields["full_name"]["source"],"user_confirmed")
+        self.assertEqual(fields["email"]["value"],"current@example.test")
+        self.assertFalse(fields["email"]["confirmed"])
+        self.assertEqual(fields["email"]["source"],"resume_suggestion")
+        self.assertEqual(fields["phone"]["value"],"+1 555 010 2020")
+        self.assertFalse(fields["phone"]["confirmed"])
+
+    def test_reconciliation_preview_is_read_only_and_marks_prior_identity_conflicts(self):
+        with profile.connect() as db:
+            db.execute("UPDATE resumes SET active=0 WHERE id='r1'")
+            db.execute("INSERT INTO resumes VALUES('r2',?,'r2.pdf','Correct.pdf','2026-02-01',1,'')", (USER,))
+            db.execute("INSERT INTO resume_profiles VALUES('r2','completed_unverified',?,'', '2026-02-01')",
+                       (json.dumps({"full_name":"Avery Morgan","email":"avery@example.test","technical_skills":["Python"]}),))
+            db.execute("INSERT INTO candidate_verifications(user_id,resume_id,values_json,confirmed_json,updated_at) VALUES(?,?,?,?,?)",
+                       (USER,"r1",json.dumps({"full_name":"Different Person","email":"old@example.test"}),
+                        json.dumps({"full_name":True,"email":True}),"2026-01-01"))
+            before=db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE resume_id='r1'").fetchone()
+        preview=profile.profile_reconciliation_preview()
+        conflicts={item["key"] for item in preview["fields"] if item["conflict"]}
+        self.assertEqual(conflicts,{"full_name","email"})
+        self.assertEqual(preview["previous_resume"],"Original.pdf")
+        with profile.connect() as db:
+            after=db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE resume_id='r1'").fetchone()
+        self.assertEqual(tuple(before),tuple(after))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.old_key_path = os.environ.get("BABYSTEPSAI_KEY_PATH")
@@ -142,6 +215,52 @@ class CandidateVerificationTests(unittest.TestCase):
         self.assertGreater(summary["counts"]["optional"],0)
         self.assertTrue(any(x["key"]=="email" and x["requiredness"]=="required" for x in summary["attention_items"]))
         self.assertGreater(len(summary["optional"]),0)
+
+    def test_partial_chapter_save_preserves_confirmed_identity_and_unconfirmed_education(self):
+        with profile.connect() as db:
+            db.execute("UPDATE resume_profiles SET profile_json=? WHERE resume_id='r1'",(json.dumps({
+                "full_name":"Resume Candidate","email":"candidate@example.test",
+                "education":[{"institution":"Example University","degree":"B.S.",
+                              "major":"Computer Science","graduation_year":"2027",
+                              "gpa":"3.8","description":"parser evidence kept in source"}]}),))
+        profile.update_verification(profile.VerificationUpdate(
+            values={"full_name":"Confirmed Candidate","email":"confirmed@example.test"},
+            confirmed_fields=["full_name","email"]))
+        profile.update_verification(profile.VerificationUpdate(
+            values={"phone":"+1 555 0100"},confirmed_fields=["phone"]))
+        fields={item["key"]:item for item in profile.get_verification()["fields"]}
+        self.assertEqual(fields["full_name"]["value"],"Confirmed Candidate")
+        self.assertTrue(fields["full_name"]["confirmed"])
+        self.assertEqual(fields["email"]["value"],"confirmed@example.test")
+        self.assertTrue(fields["email"]["confirmed"])
+        self.assertEqual(fields["phone"]["value"],"+1 555 0100")
+        self.assertTrue(fields["phone"]["confirmed"])
+        education=fields["education_entries"]["value"]
+        self.assertEqual(education[0]["institution"],"Example University")
+        self.assertEqual(education[0]["degree"],"B.S.")
+        self.assertFalse(fields["education_entries"]["entry_confirmed"][0])
+        with profile.connect() as db:
+            source=json.loads(db.execute("SELECT profile_json FROM resume_profiles WHERE resume_id='r1'").fetchone()[0])
+        self.assertEqual(source["education"][0]["description"],"parser evidence kept in source")
+
+    def test_resume_suggestion_object_shapes_pass_canonical_profile_validation(self):
+        parsed={
+            "education":[{"institution":"Example U","degree":"B.S.","major":"CS","graduation_year":"2027","description":"evidence"}],
+            "work_experience":[{"title":"Engineer","company":"Example Co","start_year":"2023","description":"Built services"}],
+            "internships":[{"title":"Intern","company":"Example Labs","start_year":"2024","description":"Tested tools"}],
+            "projects":[{"name":"Planner","description":"Built planner","start_year":"2024","technologies":["Python"]}],
+            "technical_skills":["Python"]}
+        suggestions=profile._suggestions(parsed)
+        result=profile.update_verification(profile.VerificationUpdate(values={
+            key:suggestions[key] for key in ("education_entries","experience_entries","internship_entries","project_entries","skills")},
+            confirmed_fields=[]))
+        self.assertTrue(result["saved"])
+        self.assertEqual(profile.get_verification()["fields"][0]["key"],"full_name")
+        by_key={item["key"]:item for item in profile.get_verification()["fields"]}
+        self.assertEqual(len(by_key["education_entries"]["value"]),1)
+        self.assertEqual(len(by_key["experience_entries"]["value"]),1)
+        self.assertEqual(len(by_key["internship_entries"]["value"]),1)
+        self.assertEqual(len(by_key["project_entries"]["value"]),1)
 
     def test_profile_save_rejects_invalid_value_without_claiming_or_persisting_success(self):
         from fastapi import HTTPException
@@ -406,7 +525,7 @@ class CandidateVerificationTests(unittest.TestCase):
         main.enqueue=lambda _resume_id:{"status":"queued"}
         try:
             with patch.object(main,"extract_pdf_text",return_value="A test resume with selectable content"):
-                result=asyncio.run(main.upload_resume(UploadFile(filename="replacement.pdf",file=BytesIO(b"%PDF test fixture"))))
+                result=asyncio.run(main.upload_resume(UploadFile(filename="replacement.pdf",file=BytesIO(b"%PDF-1.4 test fixture"))))
             self.assertTrue(old_file.exists())
             with main.connect() as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM resumes").fetchone()[0],2)

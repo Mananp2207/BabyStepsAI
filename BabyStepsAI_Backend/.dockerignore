@@ -1,0 +1,16 @@
+.env
+.env.*
+private_users/
+private_auth/
+private_resumes/
+private_documents/
+private_application_artifacts/
+*.db
+*.sqlite
+*.sqlite3
+*.pdf
+*.log
+__pycache__/
+.venv/
+playwright/
+browser_profiles/

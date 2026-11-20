@@ -14,8 +14,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from job_search_agent import USER
+from tenant_context import database_path
+from database_adapter import connect_database, postgres_enabled
+from private_storage import resolve_private_file
 from ui_theme import apply_ui_theme
 from secure_data import EncryptionUnavailable, decrypt_text, encrypt_text
+from resume_profile_parser import extract_resume_profile
 
 DB = Path(__file__).resolve().parent / "babysteps.db"
 router = APIRouter()
@@ -278,7 +282,7 @@ class ClosingConnection(sqlite3.Connection):
 
 
 def connect():
-    db = sqlite3.connect(DB, timeout=30, factory=ClosingConnection)
+    db = connect_database(database_path(DB), timeout=30, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     return db
 
@@ -333,7 +337,8 @@ def initialize():
         db.execute("CREATE INDEX IF NOT EXISTS idx_application_answer_history_key ON application_answer_history(user_id,resume_id,question_key,recorded_at)")
 
 
-initialize()
+if not postgres_enabled():
+    initialize()
 
 
 SENSITIVE_PROFILE_FIELDS = {key for key, (_, _, _, sensitive) in FIELDS.items() if sensitive}
@@ -416,12 +421,30 @@ def _answer_profile_version(db,resume_id):
 
 
 def _active(db):
-    row = db.execute("""SELECT r.id,r.stored_name,r.original_name,p.status,p.profile_json
+    row = db.execute("""SELECT r.id,r.stored_name,r.original_name,r.extracted_text,p.status,p.profile_json
         FROM resumes r LEFT JOIN resume_profiles p ON p.resume_id=r.id
         WHERE r.user_id=? AND r.active=1 ORDER BY r.created_at DESC LIMIT 1""", (USER,)).fetchone()
     if row is None:
         raise HTTPException(409, "Upload and activate a resume before verifying your profile.")
     return row
+
+
+def _current_resume_suggestions(resume):
+    """Augment legacy parser data from the active PDF text without persisting it."""
+    try:
+        profile=json.loads(resume["profile_json"] or "{}")
+    except (TypeError,json.JSONDecodeError):
+        profile={}
+    if not isinstance(profile,dict): profile={}
+    deterministic=extract_resume_profile(resume["extracted_text"] or "")
+    for key,value in deterministic.items():
+        existing=profile.get(key)
+        if not _has_profile_value(existing):
+            if _has_profile_value(value): profile[key]=value
+        elif key=="education" and isinstance(existing,list) and isinstance(value,list) and existing and value and isinstance(existing[0],dict) and isinstance(value[0],dict):
+            # Fill only absent subfields. Existing reviewed suggestions remain intact.
+            profile["education"][0]={**value[0],**existing[0]}
+    return profile
 
 
 def _suggestions(profile):
@@ -488,7 +511,7 @@ def _suggestions(profile):
             for alias in aliases:
                 if ed.get(alias):
                     result[key] = str(ed[alias]); break
-    # AI-extracted dates remain suggestions. Accept legacy month/year values,
+    # Extracted dates remain suggestions. Accept legacy month/year values,
     # year-month strings, and common month names without asserting a day.
     month = str(result.get("graduation_month") or "").strip()
     year = str(result.get("graduation_year") or "").strip()
@@ -771,11 +794,12 @@ def get_verification():
     with connect() as db:
         resume = _active(db)
         row = db.execute("SELECT values_json,confirmed_json,updated_at FROM candidate_verifications WHERE resume_id=?", (resume["id"],)).fetchone()
-        profile = json.loads(resume["profile_json"] or "{}")
+        profile = _current_resume_suggestions(resume)
         values = _suggestions(profile)
         suggestion_keys={key for key,value in values.items() if _has_profile_value(value)}
         confirmed = {key: False for key in FIELDS}
         saved_keys=set()
+        saved_value_keys=set()
         if row:
             try:
                 saved_values=json.loads(row["values_json"]); saved_flags=json.loads(row["confirmed_json"])
@@ -783,7 +807,14 @@ def get_verification():
                 if migrated:
                     db.execute("UPDATE candidate_verifications SET values_json=? WHERE resume_id=? AND user_id=?",
                                (json.dumps(encoded_values,ensure_ascii=False),resume["id"],USER))
-                saved_keys=set(saved_values); values.update(plain_values)
+                saved_keys=set(saved_values)
+                saved_value_keys={key for key,value in plain_values.items() if _has_profile_value(value)}
+                # Empty profile-editor defaults must not mask evidence from the
+                # active resume. Nonempty values, including confirmed identity,
+                # remain authoritative and are never overwritten by extraction.
+                for key,value in plain_values.items():
+                    if _has_profile_value(value) or key not in suggestion_keys:
+                        values[key]=value
                 confirmed.update(saved_flags)
             except (TypeError, json.JSONDecodeError):
                 raise HTTPException(500, "Saved verification data is invalid.")
@@ -847,12 +878,51 @@ def get_verification():
             "fields": [{"key": key, "section": section, "label": label, "kind": kind,
                         "sensitive": sensitive, "value": values.get(key, ""),
                         "confirmed": bool(confirmed.get(key, False)),
-                        "source": "user_confirmed" if confirmed.get(key) or (kind=="objects" and any(confirmed.get(f"{key}:{i}") for i,_ in enumerate(values.get(key,[])))) else ("user_provided" if key in saved_keys and _has_profile_value(values.get(key)) else ("resume_suggestion" if key in suggestion_keys or (key == "graduation_date" and values.get("graduation_date_suggestion")) else "missing")),
+                        "source": "user_confirmed" if confirmed.get(key) or (kind=="objects" and any(confirmed.get(f"{key}:{i}") for i,_ in enumerate(values.get(key,[])))) else ("user_provided" if key in saved_value_keys and _has_profile_value(values.get(key)) else ("resume_suggestion" if key in suggestion_keys or (key == "graduation_date" and values.get("graduation_date_suggestion")) else "missing")),
                         "suggestion": values.get("graduation_date_suggestion", "") if key == "graduation_date" else "",
                         "entry_confirmed": [bool(confirmed.get(f"{key}:{i}")) for i,_ in enumerate(values.get(key,[]))] if kind=="objects" else []}
                        for key, (section, label, kind, sensitive) in FIELDS.items()],
             "updated_at": row["updated_at"] if row else None,
         }
+
+
+@router.get("/api/candidate-profile/reconciliation")
+def profile_reconciliation_preview():
+    """Read-only comparison of the active resume suggestions to prior confirmed profile facts."""
+    with connect() as db:
+        active = _active(db)
+        current_profile = _current_resume_suggestions(active)
+        suggested = _suggestions(current_profile)
+        prior = db.execute("""SELECT r.original_name,v.values_json,v.confirmed_json
+            FROM resumes r JOIN candidate_verifications v ON v.resume_id=r.id
+            WHERE r.user_id=? AND r.active=0 AND r.id<>?
+            ORDER BY r.created_at DESC LIMIT 1""", (USER, active["id"])).fetchone()
+        if not prior:
+            return {"active_resume": active["original_name"], "previous_resume": None, "fields": []}
+        try:
+            old_values, _, _ = _decode_profile_values(json.loads(prior["values_json"] or "{}"))
+            old_confirmed = json.loads(prior["confirmed_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError, EncryptionUnavailable) as error:
+            raise HTTPException(503, "Previous profile facts could not be safely read for reconciliation.") from error
+        keys = ("full_name", "email", "phone", "linkedin", "github", "education_entries",
+                "experience_entries", "internship_entries", "project_entries", "skills")
+        preview=[]
+        for key in keys:
+            old=old_values.get(key)
+            new=suggested.get(key)
+            was_confirmed=bool(old_confirmed.get(key)) or (key.endswith("_entries") and any(
+                bool(old_confirmed.get(f"{key}:{i}")) for i,_ in enumerate(old if isinstance(old,list) else [])))
+            old_has=_has_profile_value(old)
+            new_has=_has_profile_value(new)
+            if not old_has and not new_has:
+                continue
+            conflict=old_has and new_has and json.dumps(old,ensure_ascii=False,sort_keys=True,default=str)!=json.dumps(new,ensure_ascii=False,sort_keys=True,default=str)
+            preview.append({"key":key,"label":FIELDS[key][1],"existing_value":old if was_confirmed else "",
+                "new_resume_value":new if new_has else "","existing_source":"confirmed from previous resume" if was_confirmed else "previous resume data not confirmed",
+                "new_source":"suggestion from active resume" if new_has else "not found in active resume",
+                "recommended_action":"review_conflict" if conflict else ("review_new_suggestion" if new_has else "review_previous_value"),
+                "conflict":bool(conflict)})
+        return {"active_resume":active["original_name"],"previous_resume":prior["original_name"],"fields":preview}
 
 
 class VerificationUpdate(BaseModel):
@@ -870,6 +940,8 @@ class AnswerUpdate(BaseModel):
     auto_reuse: bool = False
     reuse_scope: str = ""
     scope_job_key: str = Field(default="",max_length=300)
+    job_key: str = Field(default="",max_length=300)
+    employer_field_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
 def _validate_profile_url(value,label):
@@ -947,6 +1019,10 @@ def _entry_is_confirmable(key, entry):
 def save_application_answer(question_key: str, payload: AnswerUpdate):
     if not re.fullmatch(r"[a-zA-Z0-9_-]{2,80}", question_key):
         raise HTTPException(400, "Answer key must contain letters, digits, hyphens, or underscores.")
+    if payload.job_key:
+        with connect() as db:
+            opening=db.execute("SELECT 1 FROM discovered_openings WHERE user_id=? AND job_key=? LIMIT 1",(USER,payload.job_key)).fetchone()
+        if not opening:raise HTTPException(404,"The saved opening associated with this answer is no longer available.")
     if payload.answer_type not in {"factual","preference","generated","sensitive","source"}:
         raise HTTPException(400,"Unknown answer type.")
     if payload.sensitive and payload.answer_type not in {"sensitive","factual"}:
@@ -1050,7 +1126,7 @@ def save_application_answer(question_key: str, payload: AnswerUpdate):
             and bool(persisted["confirmed"])==bool(payload.confirmed and answer)
             and bool(persisted["auto_reuse"])==bool(reuse_scope!="none" and payload.confirmed and answer and not is_sensitive)
             and persisted["revoked_at"] is None)
-    return {"saved": True, "persisted_verified":persisted_verified,
+    return {"saved": True, "persisted_verified":persisted_verified,"job_key":payload.job_key,
             "confirmed": bool(payload.confirmed and payload.answer.strip()),
             "auto_reuse":bool(reuse_scope!="none" and payload.confirmed and payload.answer.strip() and not is_sensitive),
             "reuse_scope":reuse_scope,"canonical_category":category,"key":storage_key}
@@ -1168,22 +1244,43 @@ def update_verification(payload: VerificationUpdate):
     elif "graduation_date" in values:
         values["graduation_year"] = ""
         values["graduation_month"] = ""
-    confirmed = {key: key in payload.confirmed_fields for key in FIELDS}
-    confirmed.update({token: _entry_is_confirmable(token.rsplit(":",1)[0], values[token.rsplit(":",1)[0]][int(token.rsplit(":",1)[1])]) for token in entry_tokens})
-    for key,(_,_,kind,_) in FIELDS.items():
-        if kind=="objects": confirmed[key]=bool(values.get(key)) and all(confirmed.get(f"{key}:{i}",False) for i in range(len(values.get(key,[]))))
-        elif kind=="chips": confirmed[key]=key in payload.confirmed_fields and bool(values.get(key))
+    provided_keys=set(payload.values)
+    if (set(payload.confirmed_fields) & set(FIELDS)) - provided_keys:
+        raise HTTPException(400,"A field must be included in the save before it can be confirmed.")
     if "graduation_date" in payload.values:
-        confirmed["graduation_year"] = confirmed["graduation_month"] = "graduation_date" in payload.confirmed_fields and bool(date_value)
-    # Empty values cannot be confirmed. Sensitive questions require explicit confirmation.
-    for key in payload.confirmed_fields:
-        if key in FIELDS and not _profile_value_confirmable(key, values.get(key)):
-            confirmed[key] = False
+        provided_keys.update({"graduation_year","graduation_month"})
     stamp = now()
-    try:encoded_profile=json.dumps(_encode_profile_values(values),ensure_ascii=False)
-    except EncryptionUnavailable as error:raise HTTPException(503,str(error)) from error
     with connect() as db:
         resume = _active(db)
+        existing=db.execute("SELECT values_json,confirmed_json FROM candidate_verifications WHERE resume_id=? AND user_id=?",(resume["id"],USER)).fetchone()
+        old_values={}; old_confirmed={key:False for key in FIELDS}
+        if existing:
+            try:
+                old_values,_,_=_decode_profile_values(json.loads(existing["values_json"]))
+                old_confirmed.update(json.loads(existing["confirmed_json"]))
+            except (TypeError,json.JSONDecodeError):
+                raise HTTPException(500,"Saved verification data is invalid.")
+            except EncryptionUnavailable as error:
+                raise HTTPException(503,str(error)) from error
+        merged_values={**old_values,**values}
+        confirmed=dict(old_confirmed)
+        # A submitted collection replaces that collection and its entry-level
+        # confirmations. Other chapters retain their values and confirmations.
+        for key in provided_keys:
+            if FIELDS[key][2]=="objects":
+                for flag in list(confirmed):
+                    if flag.startswith(key+":"): confirmed.pop(flag,None)
+                for token in (x for x in entry_tokens if x.startswith(key+":")):
+                    idx=int(token.rsplit(":",1)[1])
+                    confirmed[token]=_entry_is_confirmable(key,values[key][idx])
+                confirmed[key]=bool(values[key]) and all(confirmed.get(f"{key}:{i}",False) for i in range(len(values[key])))
+            else:
+                confirmed[key]=key in payload.confirmed_fields and _profile_value_confirmable(key,values.get(key))
+        if "graduation_date" in payload.values:
+            confirmed["graduation_year"] = confirmed["graduation_month"] = bool(confirmed.get("graduation_date") and date_value)
+        values=merged_values
+        try:encoded_profile=json.dumps(_encode_profile_values(values),ensure_ascii=False)
+        except EncryptionUnavailable as error:raise HTTPException(503,str(error)) from error
         db.execute("""INSERT INTO candidate_verifications(resume_id,user_id,values_json,confirmed_json,updated_at)
             VALUES(?,?,?,?,?) ON CONFLICT(resume_id) DO UPDATE SET
             values_json=excluded.values_json,confirmed_json=excluded.confirmed_json,updated_at=excluded.updated_at""",
@@ -1196,7 +1293,7 @@ def update_verification(payload: VerificationUpdate):
                            (USER,resume["id"]))
         # Keep a reusable answer ledger. Changing or unchecking a field revokes its old answer.
         for key, (_, _, kind, sensitive) in FIELDS.items():
-            if kind=="objects": continue
+            if kind=="objects" or key not in provided_keys: continue
             value = values.get(key)
             answer = "\n".join(value) if isinstance(value, list) else str(value or "")
             if confirmed[key] and answer:
@@ -1250,7 +1347,10 @@ def profile_completeness():
                     review.append({"key":f"{key}:{index}","label":f"{item['label']} entry {index+1}","requiredness":"optional","reason":"Review and confirm this entry before using it as candidate evidence."})
     with connect() as db:
         active=_active(db)
-        resume_ok=(Path(__file__).resolve().parent/"private_resumes"/str(active["stored_name"])).is_file()
+        try:
+            resolve_private_file(Path(__file__).resolve().parent/"private_resumes",str(active["stored_name"]),user_id=str(USER))
+            resume_ok=True
+        except (FileNotFoundError,ValueError,RuntimeError):resume_ok=False
         job_specific=[]
         tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if {"job_match_results","discovered_openings"}.issubset(tables):
@@ -1331,7 +1431,7 @@ PROFILE_PAGE = r'''<!doctype html>
 <h1>Candidate profile</h1><p class="lead">Review resume suggestions, confirm only facts you have checked, and save progress at any time.</p><p id="resume" class="muted"></p>
 <section class="panel"><h2>Profile completeness</h2><p class="muted">Required fields support basic dry-run preparation. Other details are optional unless a specific job requires them. Demographic disclosures are always optional.</p><div id="completeness" class="summary" aria-live="polite"></div><p id="readiness" class="muted"></p><button type="button" id="review-missing">Review Missing Information</button><div id="job-specific" class="review-list"></div></section>
 <form id="profile"></form><div class="buttons"><button type="button" id="save" class="primary">Save profile</button></div>
-<section class="section"><h2>Reusable application answers</h2><p class="muted">Answers are tied to this resume version. Sensitive or legal answers require explicit confirmation.</p><button type="button" onclick="addAnswer()">Add an answer</button><div id="answer-list"></div></section><div id="status" class="status" role="status" aria-live="polite"></div></main>
+<section class="section" id="answers"><h2>Reusable application answers</h2><p class="muted">Answers are tied to this resume version. Sensitive or legal answers require explicit confirmation.</p><button type="button" onclick="addAnswer()">Add an answer</button><div id="answer-list"></div></section><div id="status" class="status" role="status" aria-live="polite"></div></main>
 <script>
 let fields=[],latestCompleteness=null;const hiddenLegacy=new Set(['graduation_month','graduation_year','graduation_date','university','degree','major','work_experience','internships','projects','technical_skills']);
 const schemas={education_entries:[['institution','Institution','text'],['degree','Degree','text'],['major','Major / field','text'],['graduation_date','Graduation month and year','month'],['coursework','Relevant coursework (optional)','list'],['gpa','GPA (optional)','text'],['gpa_scale','GPA scale (for example, 4.0)','text'],['currently_enrolled','Currently enrolled','bool']],experience_entries:[['job_title','Job title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],internship_entries:[['job_title','Internship title','text'],['employer','Employer','text'],['location','Location','text'],['employment_type','Employment type','text'],['start_date','Start month','month'],['end_date','End month','month'],['currently_working','Currently working','bool'],['responsibilities','Responsibilities','list'],['technologies','Technologies used','list']],project_entries:[['name','Project name','text'],['description','Description','textarea'],['technologies','Technologies','list'],['github_url','GitHub URL','url'],['demo_url','Live demo URL','url'],['start_date','Start month (optional)','month'],['end_date','End month (optional)','month'],['accomplishments','Key accomplishments','list']]};
