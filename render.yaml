@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: babystepsai-staging
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: feature/phase-11-workflow
+    dockerfilePath: ./BabyStepsAI_Backend/Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: BABYSTEPS_AUTH_MODE
+        value: oidc
+      - key: BABYSTEPS_OIDC_ISSUER
+        value: https://accounts.google.com
+      - key: BABYSTEPS_COOKIE_SECURE
+        value: "true"
+      - key: BABYSTEPS_SESSION_SECRET
+        generateValue: true
+      - key: BABYSTEPS_DB_POOL_SIZE
+        value: "4"
+      - key: BABYSTEPS_DB_POOL_TIMEOUT
+        value: "10"
+      - key: BABYSTEPS_DATA_ROOT
+        value: /tmp/babystepsai-private
+      - key: BABYSTEPS_STORAGE_BACKEND
+        value: supabase
+      - key: SUPABASE_PRIVATE_BUCKET
+        value: babystepsai-private
+      - key: BABYSTEPS_DATABASE_URL
+        sync: false
+      - key: BABYSTEPS_TENANT_DB_SECRET
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: BABYSTEPS_OIDC_CLIENT_ID
+        sync: false
+      - key: BABYSTEPS_OIDC_CLIENT_SECRET
+        sync: false
+      - key: BABYSTEPS_OIDC_REDIRECT_URI
+        sync: false
+      - key: BABYSTEPS_PUBLIC_ORIGIN
+        sync: false
